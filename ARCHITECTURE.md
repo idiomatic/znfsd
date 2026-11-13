@@ -2,7 +2,7 @@
 
 How znfsd is put together. [AGENTS.md](AGENTS.md) is the specification; [DEVELOPMENT.md](DEVELOPMENT.md) covers the workflow.
 
-No code exists yet; this describes the design.
+Only the build and command-line parsing exist yet; the rest describes the design.
 
 ## Components
 

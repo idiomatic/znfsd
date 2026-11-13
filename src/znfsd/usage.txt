@@ -1,0 +1,38 @@
+znfsd [--socket PATH] [--run-as USER] [--bind ADDR ...] [--db PATH]
+    serve [--{nfs,mount,stat,lock}-port PORT]
+          [--web [ADDR:]PORT]
+          [--no-portmap]
+          [--group GROUP:CLIENT[,CLIENT ...] ...]
+          [--map MAP:LOCAL=[REMOTE[,REMOTE ...]] ...]
+          [PATH[:OPTION[,OPTION ...][:CLIENT[,CLIENT ...]]] ...]
+    stop
+
+    export list [PATH]
+    export add  PATH CLIENT [OPTION ...]
+    export set  PATH CLIENT OPTION ...
+    export del  PATH [CLIENT]
+
+    group  list [GROUP]
+    group  add  GROUP CLIENT ...
+    group  del  GROUP [CLIENT ...]
+
+    map    list [MAP]
+    map    add  MAP LOCAL [REMOTE ...]         # no REMOTE: anon
+    map    del  MAP [REMOTE ...]
+
+    mount  list [PATH]
+    mount  del  HOST [PATH]                    # forgets mount records
+
+    lock   list [PATH]
+    lock   del  HOST [PATH]                    # releases locks
+
+    help
+
+Aliases  list: ls    del: delete, rm
+
+CLIENT   host | *.domain | CIDR | @GROUP | *
+OPTION   rw | ro                               # default rw
+         squash=root|all|none                  # default root
+         map=MAP
+LOCAL    [UID|USER][:GID|:GROUP]
+REMOTE   [UID][:GID]
