@@ -80,6 +80,66 @@ pub fn parse(arena: std.mem.Allocator, args: []const []const u8) Error!Invocatio
     };
 }
 
+pub const Serve = struct {
+    nfs_port: ?u16 = null,
+    mount_port: ?u16 = null,
+    stat_port: ?u16 = null,
+    lock_port: ?u16 = null,
+    web: ?[]const u8 = null,
+    no_portmap: bool = false,
+    /// `GROUP:CLIENT[,CLIENT ...]`, unparsed.
+    groups: []const []const u8 = &.{},
+    /// `MAP:LOCAL=[REMOTE[,REMOTE ...]]`, unparsed.
+    maps: []const []const u8 = &.{},
+    /// `PATH[:OPTIONS[:CLIENTS]]`, unparsed.
+    exports: []const []const u8 = &.{},
+};
+
+/// `serve` options that take a value.
+const ServeOption = enum { @"nfs-port", @"mount-port", @"stat-port", @"lock-port", web, group, map };
+
+pub const ServeError = error{ MissingValue, UnknownOption, BadPort, OutOfMemory };
+
+pub fn parseServe(arena: std.mem.Allocator, args: []const []const u8) ServeError!Serve {
+    var s: Serve = .{};
+    var groups: std.ArrayList([]const u8) = .empty;
+    var maps: std.ArrayList([]const u8) = .empty;
+    var exports: std.ArrayList([]const u8) = .empty;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (!std.mem.startsWith(u8, arg, "--")) {
+            try exports.append(arena, arg);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--no-portmap")) {
+            s.no_portmap = true;
+            continue;
+        }
+        const option = std.meta.stringToEnum(ServeOption, arg[2..]) orelse return error.UnknownOption;
+        i += 1;
+        if (i == args.len) return error.MissingValue;
+        const value = args[i];
+        switch (option) {
+            .@"nfs-port" => s.nfs_port = try parsePort(value),
+            .@"mount-port" => s.mount_port = try parsePort(value),
+            .@"stat-port" => s.stat_port = try parsePort(value),
+            .@"lock-port" => s.lock_port = try parsePort(value),
+            .web => s.web = value,
+            .group => try groups.append(arena, value),
+            .map => try maps.append(arena, value),
+        }
+    }
+    s.groups = groups.items;
+    s.maps = maps.items;
+    s.exports = exports.items;
+    return s;
+}
+
+fn parsePort(text: []const u8) error{BadPort}!u16 {
+    return std.fmt.parseInt(u16, text, 10) catch error.BadPort;
+}
+
 fn parseVerb(word: []const u8) ?Verb {
     const aliases = std.StaticStringMap(Verb).initComptime(.{
         .{ "list", .list },
@@ -138,6 +198,24 @@ test "verbs a noun doesn't take" {
     try testing.expectError(error.UnknownVerb, parseTest(&.{ "group", "set", "lab" }));
     try testing.expectError(error.UnknownVerb, parseTest(&.{ "lock", "add", "hal" }));
     try testing.expectError(error.MissingVerb, parseTest(&.{"map"}));
+}
+
+test "serve options, repeated groups and maps, and exports" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const s = try parseServe(arena.allocator(), &.{
+        "--nfs-port", "12049",           "--no-portmap", "/srv/media:ro",
+        "--group",    "lab:10.1.0.0/16", "--map",        "art:art=501,1000",
+        "--group",    "ops:fd00::/8",    "/srv/home",
+    });
+    try testing.expectEqual(12049, s.nfs_port.?);
+    try testing.expectEqual(null, s.mount_port);
+    try testing.expect(s.no_portmap);
+    try testing.expectEqual(2, s.groups.len);
+    try testing.expectEqualStrings("art:art=501,1000", s.maps[0]);
+    try testing.expectEqualStrings("/srv/home", s.exports[1]);
+    try testing.expectError(error.BadPort, parseServe(arena.allocator(), &.{ "--lock-port", "70000" }));
+    try testing.expectError(error.UnknownOption, parseServe(arena.allocator(), &.{"--skynet"}));
 }
 
 test "bad options and commands" {
