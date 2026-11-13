@@ -9,6 +9,10 @@ pub const rpc = @import("rpc.zig");
 pub const server = @import("server.zig");
 pub const portmap = @import("portmap.zig");
 pub const service = @import("service.zig");
+pub const exports = @import("exports.zig");
+pub const sys = @import("sys.zig");
+pub const fh = @import("fh.zig");
+pub const mount = @import("mount.zig");
 
 pub const version: std.SemanticVersion = .{ .major = 0, .minor = 0, .patch = 0 };
 

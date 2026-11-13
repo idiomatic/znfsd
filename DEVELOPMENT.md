@@ -2,7 +2,7 @@
 
 How to work on znfsd. [AGENTS.md](AGENTS.md) is the specification; [README.md](README.md) explains it for users, and [ARCHITECTURE.md](ARCHITECTURE.md) describes the design.
 
-The build and command-line parsing exist; the servers don't yet.
+So far, `serve` runs the portmapper logic and MOUNT, with ephemeral exports and groups, so clients can list exports (`showmount -e`) but not yet mount: NFS, NLM, NSM, maps, stored state, and the other commands are still to come.
 
 ## Requirements
 

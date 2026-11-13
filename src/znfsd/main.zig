@@ -6,6 +6,7 @@ const net = Io.net;
 const posix = std.posix;
 const libnfsd = @import("libnfsd");
 const cli = @import("cli.zig");
+const ephemeral = @import("ephemeral.zig");
 
 const usage = @embedFile("usage.txt");
 
@@ -70,6 +71,52 @@ fn serve(io: Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, invocation: c
         .portmap = if (options.no_portmap) .off else .auto,
     };
 
+    var table: libnfsd.exports.Table = .{};
+    defer table.groups.deinit(gpa);
+    if (options.maps.len > 0) {
+        try stderr.writeAll("znfsd: --map: maps aren't implemented yet\n");
+        return 2;
+    }
+    for (options.groups) |text| {
+        const group = ephemeral.parseGroup(arena, text) catch |err| {
+            try stderr.print("znfsd: --group {s}: {t}\n", .{ text, err });
+            return 2;
+        };
+        try table.groups.put(gpa, group.name, group.clients);
+    }
+    var rules: std.ArrayList(libnfsd.exports.Rule) = .empty;
+    for (options.exports) |text| {
+        const parsed = ephemeral.parseExport(arena, text) catch |err| {
+            try stderr.print("znfsd: {s}: {t}\n", .{ text, err });
+            return 2;
+        };
+        if (parsed.options.map != null) {
+            try stderr.print("znfsd: {s}: maps aren't implemented yet\n", .{text});
+            return 2;
+        }
+        const path_buf = try arena.create([libnfsd.sys.max_path]u8);
+        var path: []const u8 = undefined;
+        const e = libnfsd.sys.canonical(parsed.path, path_buf, &path);
+        if (e != .SUCCESS) {
+            try stderr.print("znfsd: {s}: {t}\n", .{ parsed.path, e });
+            return 2;
+        }
+        for (parsed.clients) |client| {
+            if (client == .group and !table.groups.contains(client.group)) {
+                try stderr.print("znfsd: {s}: no group {s}\n", .{ text, client.group });
+                return 2;
+            }
+            try rules.append(arena, .{ .path = path, .client = client, .options = parsed.options });
+        }
+    }
+    table.rules = rules.items;
+
+    var mount: libnfsd.mount.Mount = .init(gpa, &table);
+    defer mount.deinit();
+    const registrations = [_]libnfsd.service.Registration{
+        .{ .program = mount.program(), .service = .mount },
+    };
+
     // Signals are taken by `sigwait` below, so block them before any thread
     // starts; threads inherit the mask.
     var signals = posix.sigemptyset();
@@ -79,7 +126,7 @@ fn serve(io: Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, invocation: c
 
     var diag: libnfsd.service.Diagnostic = .{};
     var result: Outcome = .running;
-    var task = try io.concurrent(runService, .{ io, gpa, config, &diag, &result });
+    var task = try io.concurrent(runService, .{ io, gpa, config, &registrations, &diag, &result });
     var signal: c_int = 0;
     _ = std.c.sigwait(&signals, &signal);
     _ = task.cancel(io);
@@ -104,8 +151,15 @@ const Outcome = union(enum) {
 };
 
 /// Runs the service; if it stops on its own, wakes `serve`'s `sigwait`.
-fn runService(io: Io, gpa: std.mem.Allocator, config: libnfsd.service.Config, diag: *libnfsd.service.Diagnostic, result: *Outcome) void {
-    libnfsd.service.run(io, gpa, config, &.{}, diag) catch |err| {
+fn runService(
+    io: Io,
+    gpa: std.mem.Allocator,
+    config: libnfsd.service.Config,
+    registrations: []const libnfsd.service.Registration,
+    diag: *libnfsd.service.Diagnostic,
+    result: *Outcome,
+) void {
+    libnfsd.service.run(io, gpa, config, registrations, diag) catch |err| {
         result.* = if (err == error.Canceled) .canceled else .{ .failed = err };
         if (err != error.Canceled) _ = std.c.kill(std.c.getpid(), .TERM);
         return;
@@ -116,4 +170,5 @@ fn runService(io: Io, gpa: std.mem.Allocator, config: libnfsd.service.Config, di
 
 test {
     _ = cli;
+    _ = ephemeral;
 }

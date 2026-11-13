@@ -2,7 +2,7 @@
 
 How znfsd is put together. [AGENTS.md](AGENTS.md) is the specification; [DEVELOPMENT.md](DEVELOPMENT.md) covers the workflow.
 
-Only the build and command-line parsing exist yet; the rest describes the design.
+Built so far: XDR and RPC, UDP and TCP serving, the portmapper and registration, export rules, file handles, and MOUNT. The rest describes the design.
 
 ## Components
 
@@ -69,7 +69,9 @@ znfsd stores exports, groups, maps, file handles, mount records, the NSM monitor
 
 ## I/O
 
-All I/O goes through `std.Io`, so libnfsd runs on whatever implementation its embedder chooses. znfsd uses `std.Io.Threaded`, the only implementation in Zig 0.17 that can run a server: `std.Io.Evented` stubs TCP listen and accept on Linux (io_uring) and also UDP bind on macOS (Grand Central Dispatch). Switching later touches only znfsd's `main`.
+Network and basic file I/O go through `std.Io`; file-system calls it lacks (`fstatat`/`statx`, `realpath`, and later the `*at` calls, `open_by_handle_at`, and `fsgetpath`) go through libc in `sys.zig`, returning errno values for mapping to protocol statuses. Under `std.Io.Threaded`, these blocking calls run on worker threads like any other.
+
+All other I/O goes through `std.Io`, so libnfsd runs on whatever implementation its embedder chooses. znfsd uses `std.Io.Threaded`, the only implementation in Zig 0.17 that can run a server: `std.Io.Evented` stubs TCP listen and accept on Linux (io_uring) and also UDP bind on macOS (Grand Central Dispatch). Switching later touches only znfsd's `main`.
 
 ## Privileges
 
