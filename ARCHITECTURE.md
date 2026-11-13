@@ -2,7 +2,7 @@
 
 How znfsd is put together. [AGENTS.md](AGENTS.md) is the specification; [DEVELOPMENT.md](DEVELOPMENT.md) covers the workflow.
 
-Built so far: XDR and RPC, UDP and TCP serving, the portmapper and registration, export rules, file handles, and MOUNT. The rest describes the design.
+Built so far: XDR and RPC, UDP and TCP serving, the portmapper and registration, export rules, file handles, MOUNT, and NFS v3. The rest describes the design.
 
 ## Components
 
@@ -47,6 +47,8 @@ Each program listens on TCP and UDP at every `--bind` address. When both `0.0.0.
 
 Writes are always stable: data reaches storage before the reply, so COMMIT has nothing left to do.
 
+Files are reached through descriptors, never bare paths: a handle's cached path is opened refusing symbolic links in every component (`O_NOFOLLOW_ANY` on macOS, `openat2` with `RESOLVE_NO_SYMLINKS` on Linux) and its inode checked, then entries are changed relative to that descriptor (`openat`, `mkdirat`, `renameat`, and so on), so a client swapping a directory for a link can't redirect an operation outside its export. A renamed directory's cached descendants move with it.
+
 ## Export rules
 
 A rule is (path, client, options). Stored rules come from the hooks; ephemeral rules from `serve` arguments overlay them by (path, client), and ephemeral groups and maps overlay stored ones by name. For each request, the most specific matching client wins. Host and `*.domain` clients need the caller's name, found by forward-confirmed reverse DNS and cached.
@@ -57,7 +59,7 @@ A rule is (path, client, options). Stored rules come from the hooks; ephemeral r
 version │ export ID │ filesystem ID │ inode │ generation
 ```
 
-Handles name a file without its path, so they survive renames. To resolve one, libnfsd opens by handle on Linux (`open_by_handle_at`), asks the filesystem for the path on macOS (`fsgetpath`), and otherwise falls back to the last-known path, accepting it only if the inode still matches. Each handle's last-known path is stored and updated on NFS renames.
+Handles name a file without its path, so they survive renames. Built so far: resolution through the last-known path, cached in memory by MNT, LOOKUP, and READDIRPLUS, with export roots always recognized, so root handles survive restarts. Planned: libnfsd opens by handle on Linux (`open_by_handle_at`), asks the filesystem for the path on macOS (`fsgetpath`), and otherwise falls back to the last-known path, accepting it only if the inode still matches. Each handle's last-known path is stored and updated on NFS renames.
 
 ## Locks and recovery
 
@@ -75,4 +77,4 @@ All other I/O goes through `std.Io`, so libnfsd runs on whatever implementation 
 
 ## Privileges
 
-When root, znfsd binds its ports, then with `--run-as USER` drops to that user and accesses files as them; maps are disabled because acting as other users needs root. Opening files by handle on Linux needs `CAP_DAC_READ_SEARCH`, so an unprivileged znfsd relies on stored paths.
+When root, znfsd binds its ports, then with `--run-as USER` drops to that user and accesses files as them; maps are disabled because acting as other users needs root. Opening files by handle on Linux needs `CAP_DAC_READ_SEARCH`, so an unprivileged znfsd relies on stored paths. Unprivileged, znfsd also can't set owners or write files whose mode denies its own user, even when the client may, so a root client's `cp -a` loses ownership, and writes into files it created read-only fail. As root, new files and directories are given to their creators; switching to each caller's identity for every operation is still to come.

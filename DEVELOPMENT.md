@@ -2,7 +2,7 @@
 
 How to work on znfsd. [AGENTS.md](AGENTS.md) is the specification; [README.md](README.md) explains it for users, and [ARCHITECTURE.md](ARCHITECTURE.md) describes the design.
 
-So far, `serve` runs the portmapper logic and MOUNT, with ephemeral exports and groups, so clients can list exports (`showmount -e`) but not yet mount: NFS, NLM, NSM, maps, stored state, and the other commands are still to come.
+So far, `serve` runs the portmapper logic, MOUNT, and all of NFS v3, with ephemeral exports and groups; Linux 6.18 has mounted it read-write. NLM, NSM, maps, stored state, and the other commands are still to come.
 
 ## Requirements
 

@@ -113,8 +113,14 @@ fn serve(io: Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, invocation: c
 
     var mount: libnfsd.mount.Mount = .init(gpa, &table);
     defer mount.deinit();
+    var files: libnfsd.files.Files = .init(gpa);
+    defer files.deinit();
+    var verifier: [8]u8 = undefined;
+    std.mem.writeInt(i64, &verifier, @truncate(Io.Clock.real.now(io).nanoseconds), .big);
+    var nfs: libnfsd.nfs.Nfs = .init(gpa, &table, &files, verifier);
     const registrations = [_]libnfsd.service.Registration{
         .{ .program = mount.program(), .service = .mount },
+        .{ .program = nfs.program(), .service = .nfs },
     };
 
     // Signals are taken by `sigwait` below, so block them before any thread

@@ -2,7 +2,7 @@
 
 znfsd is an NFS v3 server for Linux and macOS hosts, serving macOS, Linux, and Windows clients. One process provides everything a v3 client needs: NFS, mountd, statd, lockd, and, when no portmapper is running, a portmapper too. It has few options, and its defaults are sensible.
 
-[AGENTS.md](AGENTS.md) is the authoritative specification; this page explains and illustrates it. The protocol specifications znfsd relies on are collected in [docs/specifications](docs/specifications/README.md). znfsd is under construction. So far, `serve` runs the portmapper logic and MOUNT, with ephemeral exports and groups, so clients can list exports (`showmount -e`) but not yet mount: NFS, NLM, NSM, maps, stored state, and the other commands are still to come.
+[AGENTS.md](AGENTS.md) is the authoritative specification; this page explains and illustrates it. The protocol specifications znfsd relies on are collected in [docs/specifications](docs/specifications/README.md). znfsd is under construction. So far, `serve` runs the portmapper logic, MOUNT, and all of NFS v3, with ephemeral exports and groups; Linux 6.18 has mounted it read-write. NLM, NSM, maps, stored state, and the other commands are still to come.
 
 ## Why
 
