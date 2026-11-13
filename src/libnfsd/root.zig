@@ -4,6 +4,9 @@
 
 const std = @import("std");
 
+pub const xdr = @import("xdr.zig");
+pub const rpc = @import("rpc.zig");
+
 pub const version: std.SemanticVersion = .{ .major = 0, .minor = 0, .patch = 0 };
 
 /// Fixed default ports.
