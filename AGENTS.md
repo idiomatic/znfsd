@@ -102,6 +102,7 @@ REMOTE   [UID][:GID]
 * NFS v4.0, v4.1, and v4.2
 * Retro clients: macOS 10.15.7+
 * Admin users and passwords, stored hashed
+* Pluggable file-system backends in libnfsd, the local file system being one
 
 ## Unresolved
 

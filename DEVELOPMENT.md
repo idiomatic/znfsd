@@ -50,6 +50,15 @@ If a VM gets only a `169.254.x` address, the host's DHCP isn't answering; give i
 
 Test against each supported client: macOS 15.8+, Linux 6.12+, and Windows 10+. Boot install media from `~/Developer/Images` read-only, run VMs without audio, and save prepared clients as new layers rather than changing shared ones.
 
+## File-system backends
+
+Deferred. File-system calls already pass through one narrow layer, `sys.zig` (about 30 operations: stat, safe open, the `*at` calls, directory reading, reads and writes, sync, capacity, and identity switching), which is where a `libnfsd.Fs` interface would go, letting embedders serve synthesized file systems (in memory for tests, SQLite or object stores, generated content, overlays). `std.Io` isn't the place: libnfsd uses it only for networking, and its file model lacks owners, modes, inodes, links, devices, and file-system IDs.
+
+* The backend supplies file identity (file-system ID, inode, generation) and resolves handles; the path cache and the no-links `*at` rules become the local backend's own.
+* Calls take the caller's credentials: the local backend acts as the caller, a virtual one checks access its own way.
+* NFS's procedures, MOUNT's root lookup, and NLM's handle lookup move behind the interface; RPC, protocol logic, locking, maps, and squashing stay as they are.
+* An in-memory backend comes with it, to prove the interface and speed up tests.
+
 ## Web admin
 
 The activity monitor is a znfsd module (`web.zig`, `activity.zig`) in the daemon's process; libnfsd only offers the observer hook it feeds on. That suits today's monitor: read-only, loopback only, GET only, small.
