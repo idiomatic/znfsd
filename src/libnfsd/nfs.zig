@@ -158,7 +158,7 @@ pub const Nfs = struct {
     files: *Files,
     nobody: @TypeOf(sys.nobody()),
     /// Changes whenever the server restarts, so clients know to resend
-    /// unstable writes; every write here is stable anyway.
+    /// unstable writes not yet committed.
     verifier: [8]u8,
     /// As root, each request acts as its caller, so the OS checks access
     /// with the caller's own credentials.
@@ -244,6 +244,9 @@ const Request = struct {
     table: *const exports.Table,
     /// The map of the rule covering the last file found, if any.
     map: ?exports.Map = null,
+    /// The device of the export root covering the last file found, if
+    /// it could be read.
+    root_dev: ?u64 = null,
     /// Supplementary GIDs after mapping.
     gid_buf: [rpc.AuthSys.max_gids]u32 = undefined,
     ctx: server.Context,
@@ -281,13 +284,26 @@ const Request = struct {
         }
     }
 
-    /// Attributes as the client sees them: owners mapped back to its IDs.
-    fn outward(r: *const Request, a: sys.Attr) sys.Attr {
-        const m = r.map orelse return a;
+    /// Attributes as the client sees them: owners mapped back to its IDs,
+    /// and the fileid made unique across file systems.
+    fn outward(r: *const Request, a: sys.Attr) Outward {
         var out = a;
-        out.uid = m.remoteUid(a.uid);
-        out.gid = m.remoteGid(a.gid);
-        return out;
+        out.ino = r.fileid(a.dev, a.ino);
+        if (r.map) |m| {
+            out.uid = m.remoteUid(a.uid);
+            out.gid = m.remoteGid(a.gid);
+        }
+        return .{ .attr = out };
+    }
+
+    /// A file's fileid: its inode on the export root's own file system;
+    /// elsewhere (crossmnt), its inode with bits of the file system's ID
+    /// folded in, since clients report one device for the whole mount.
+    fn fileid(r: *const Request, dev: u64, ino: u64) u64 {
+        const root = r.root_dev orelse return ino;
+        if (dev == root) return ino;
+        const salt = std.hash.Wyhash.hash(0, std.mem.asBytes(&dev)) << 40 | 1 << 63;
+        return ino ^ salt;
     }
 
     fn fattrOut(r: *Request, a: sys.Attr) Error!void {
@@ -355,6 +371,7 @@ const Request = struct {
         };
         const match = r.table.match(path, r.ctx.from, null) orelse return .{ .failed = .acces };
         r.map = r.mapOf(match.rule);
+        r.root_dev = rootDev(match.path);
         if (r.n.root) {
             const c = r.creds(match.rule);
             if (sys.become(.{ .uid = c.uid, .gid = c.gid, .gids = c.gids }) != .SUCCESS) return .{ .failed = .serverfault };
@@ -388,7 +405,7 @@ const Request = struct {
         const fail = struct {
             fn f(req: *Request, s: Status, attr: sys.Attr) Error!void {
                 try req.status(s);
-                try postOpAttr(req.e, attr);
+                try req.postOp(attr);
             }
         }.f;
         if (ftype(dir.attr.mode) != .dir) return fail(r, .notdir, dir.attr);
@@ -575,7 +592,7 @@ const Request = struct {
             }
             dir_used += base;
             try r.e.boolean(true);
-            try r.e.u64_(entry.ino);
+            try r.e.u64_(r.fileid(dir.attr.dev, entry.ino));
             try r.e.string(entry.name);
             try r.e.u64_(index);
             if (plus) {
@@ -780,7 +797,8 @@ const Request = struct {
         const found = try r.find(&r.path_buf);
         const offset = try r.d.u64_();
         const count = try r.d.u32_();
-        _ = try r.d.u32_(); // stable_how: every write here is FILE_SYNC
+        // stable_how: UNSTABLE waits for COMMIT; the others are FILE_SYNC.
+        const unstable = try r.d.u32_() == 0;
         const data = try r.d.opaque_(max_transfer);
         const f = switch (found) {
             .found => |f| f,
@@ -809,7 +827,7 @@ const Request = struct {
         var e = sys.openOwned(f.path, .{ .ACCMODE = .WRONLY }, f.handle.inode, &fd, &post);
         if (e == .SUCCESS) {
             e = sys.writeAt(fd, offset, data[0..n]);
-            if (e == .SUCCESS) e = sys.sync(fd);
+            if (e == .SUCCESS and !unstable) e = sys.sync(fd);
             _ = sys.fstat(fd, &post);
             sys.closeFd(fd);
         }
@@ -817,7 +835,7 @@ const Request = struct {
         try r.wccData(f.attr, if (e == .SUCCESS) post else null);
         if (e != .SUCCESS) return;
         try r.e.u32_(@intCast(n));
-        try r.e.u32_(2); // FILE_SYNC
+        try r.e.u32_(if (unstable) 0 else 2); // UNSTABLE or FILE_SYNC
         try r.e.fixedOpaque(&r.n.verifier);
     }
 
@@ -832,7 +850,7 @@ const Request = struct {
                 return r.emptyWcc();
             },
         };
-        // Writes are already on disk; sync anyway for writes made locally.
+        // The whole file, whatever the range: fsync has no finer grain.
         var fd: sys.Fd = undefined;
         var post: sys.Attr = undefined;
         if (ftype(f.attr.mode) == .reg and sys.openOwned(f.path, .{}, f.handle.inode, &fd, &post) == .SUCCESS) {
@@ -1214,8 +1232,12 @@ fn decodeTime(d: *xdr.Decoder) xdr.DecodeError!sys.Timespec {
     return .{ .sec = try d.u32_(), .nsec = try d.u32_() };
 }
 
+/// Attributes ready for a reply, made only by `Request.outward`, so none
+/// goes out with host owners or fileids.
+const Outward = struct { attr: sys.Attr };
+
 /// wcc_data: attributes before (size and times) and after a change.
-fn wcc(e: xdr.Encoder, pre: ?sys.Attr, post: ?sys.Attr) Error!void {
+fn wcc(e: xdr.Encoder, pre: ?sys.Attr, post: ?Outward) Error!void {
     try e.boolean(pre != null);
     if (pre) |a| {
         try e.u64_(a.size);
@@ -1223,6 +1245,14 @@ fn wcc(e: xdr.Encoder, pre: ?sys.Attr, post: ?sys.Attr) Error!void {
         try time(e, a.ctime);
     }
     try postOpAttr(e, post);
+}
+
+/// The device of an export's root, as the server sees it.
+fn rootDev(path: []const u8) ?u64 {
+    var buf: [sys.max_path + 1]u8 = undefined;
+    var attr: sys.Attr = undefined;
+    if (path.len > sys.max_path or sys.lstat(copyZ(&buf, path), &attr) != .SUCCESS) return null;
+    return attr.dev;
 }
 
 /// The path of the export whose root `h` is, so root handles always
@@ -1269,7 +1299,8 @@ fn time(e: xdr.Encoder, t: sys.Timespec) Error!void {
 }
 
 /// fattr3: 84 bytes.
-fn fattr(e: xdr.Encoder, a: sys.Attr) Error!void {
+fn fattr(e: xdr.Encoder, out: Outward) Error!void {
+    const a = out.attr;
     try e.enumeration(ftype(a.mode));
     try e.u32_(a.mode & 0o7777);
     try e.u32_(a.nlink);
@@ -1292,7 +1323,7 @@ fn devParts(rdev: u64) struct { u32, u32 } {
     return .{ @truncate(rdev >> 32), @truncate(rdev) };
 }
 
-fn postOpAttr(e: xdr.Encoder, attr: ?sys.Attr) Error!void {
+fn postOpAttr(e: xdr.Encoder, attr: ?Outward) Error!void {
     try e.boolean(attr != null);
     if (attr) |a| try fattr(e, a);
 }
@@ -1551,7 +1582,7 @@ test "create, write, set attributes, rename, link, and remove" {
     e = a.start(art);
     try e.u64_(2);
     try e.u32_(5);
-    try e.u32_(0); // UNSTABLE, answered FILE_SYNC
+    try e.u32_(0); // UNSTABLE
     try e.opaque_("perihelion");
     var d = try expectStatus(.ok, try f.call(nfs, @backingInt(Proc.write), a.bytes()));
     _ = try d.boolean();
@@ -1559,7 +1590,23 @@ test "create, write, set attributes, rename, link, and remove" {
     try testing.expect(try d.boolean());
     _ = try d.fixedOpaque(84);
     try testing.expectEqual(5, try d.u32_());
+    try testing.expectEqual(0, try d.u32_());
+    try testing.expectEqualSlices(u8, "znfsd-t\x00", try d.fixedOpaque(8));
+
+    // DATA_SYNC is answered FILE_SYNC; COMMIT returns the same verifier.
+    e = a.start(art);
+    try e.u64_(2);
+    try e.u32_(5);
+    try e.u32_(1);
+    try e.opaque_("perihelion");
+    d = try expectStatus(.ok, try f.call(nfs, @backingInt(Proc.write), a.bytes()));
+    _ = try d.fixedOpaque(4 + 24 + 4 + 84 + 4);
     try testing.expectEqual(2, try d.u32_());
+    e = a.start(art);
+    try e.u64_(0);
+    try e.u32_(0);
+    d = try expectStatus(.ok, try f.call(nfs, @backingInt(Proc.commit), a.bytes()));
+    _ = try d.fixedOpaque(4 + 24 + 4 + 84);
     try testing.expectEqualSlices(u8, "znfsd-t\x00", try d.fixedOpaque(8));
 
     var content: [16]u8 = undefined;
@@ -1703,6 +1750,149 @@ test "maps translate callers and owners" {
     try e.u32_(0);
     try sattrMode(e, null);
     _ = try expectStatus(.acces, try f.call(f.nfs.program(), @backingInt(Proc.create), a.bytes()));
+}
+
+/// How many attribute sets in `results` show owner 4000:4001.
+fn mappedOwners(results: []const u8) usize {
+    const want = "\x00\x00\x0f\xa0\x00\x00\x0f\xa1";
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i + want.len <= results.len) : (i += 4) {
+        if (std.mem.eql(u8, results[i..][0..want.len], want)) count += 1;
+    }
+    return count;
+}
+
+test "every reply maps owners, failures too" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    // The client sees the files' owner, whoever runs the tests, as 4000:4001.
+    var root_attr: sys.Attr = undefined;
+    var root_buf: [sys.max_path + 1]u8 = undefined;
+    try testing.expectEqual(sys.E.SUCCESS, sys.lstat(copyZ(&root_buf, f.root), &root_attr));
+    const entries = [_]exports.MapEntry{.{
+        .local = .{ .uid = root_attr.uid, .gid = root_attr.gid },
+        .remote = .{ .uid = 4000, .gid = 4001 },
+    }};
+    try f.table.maps.put(testing.allocator, "m", .{ .entries = &entries });
+    defer f.table.maps.deinit(testing.allocator);
+    f.rules[0].options.map = "m";
+    f.uid = 4000;
+    f.gid = 4001;
+    const nfs = f.nfs.program();
+    const root = try f.rootHandle();
+    const hal = (try f.lookup(root, "hal")).ok;
+    const link = (try f.lookup(root, "link")).ok;
+    var a: Args = .{};
+
+    const Case = struct { proc: Proc, sets: usize };
+    const check = struct {
+        fn run(fx: *Fixture, p: server.Program, c: Case, args: []const u8) !void {
+            const got = mappedOwners(try fx.call(p, @backingInt(c.proc), args));
+            if (got != c.sets) {
+                std.debug.print("{t}: {d} mapped attribute sets, want {d}\n", .{ c.proc, got, c.sets });
+                return error.TestUnexpectedResult;
+            }
+        }
+    }.run;
+
+    _ = a.start(root);
+    try check(&f, nfs, .{ .proc = .getattr, .sets = 1 }, a.bytes());
+    for ([_]struct { [fh.size]u8, []const u8, usize }{
+        .{ root, "hal", 2 },
+        .{ root, "skynet", 1 }, // missing: the directory's attributes
+        .{ hal, "x", 1 }, // not a directory
+    }) |l| {
+        var e = a.start(l[0]);
+        try e.string(l[1]);
+        try check(&f, nfs, .{ .proc = .lookup, .sets = l[2] }, a.bytes());
+    }
+    var e = a.start(hal);
+    try e.u32_(0x3f);
+    try check(&f, nfs, .{ .proc = .access, .sets = 1 }, a.bytes());
+    _ = a.start(link);
+    try check(&f, nfs, .{ .proc = .readlink, .sets = 1 }, a.bytes());
+    e = a.start(hal);
+    try e.u64_(0);
+    try e.u32_(4);
+    try check(&f, nfs, .{ .proc = .read, .sets = 1 }, a.bytes());
+    e = a.start(hal);
+    try e.u64_(0);
+    try e.u32_(1);
+    try e.u32_(0);
+    try e.opaque_("I");
+    try check(&f, nfs, .{ .proc = .write, .sets = 1 }, a.bytes());
+    e = a.start(hal);
+    try sattrMode(e, null);
+    try e.boolean(false);
+    try check(&f, nfs, .{ .proc = .setattr, .sets = 1 }, a.bytes());
+    e = a.start(hal);
+    try e.u64_(0);
+    try e.u32_(0);
+    try check(&f, nfs, .{ .proc = .commit, .sets = 1 }, a.bytes());
+
+    // CREATE, then again GUARDED (exists: the directory's wcc).
+    for ([_]struct { u32, usize }{ .{ 0, 2 }, .{ 1, 1 } }) |c| {
+        e = a.start(root);
+        try e.string("art");
+        try e.u32_(c[0]);
+        try sattrMode(e, null);
+        try check(&f, nfs, .{ .proc = .create, .sets = c[1] }, a.bytes());
+    }
+    e = a.start(root);
+    try e.string("box");
+    try sattrMode(e, null);
+    try check(&f, nfs, .{ .proc = .mkdir, .sets = 2 }, a.bytes());
+    e = a.start(root);
+    try e.string("soft");
+    try sattrMode(e, null);
+    try e.string("hal");
+    try check(&f, nfs, .{ .proc = .symlink, .sets = 2 }, a.bytes());
+    e = a.start(hal);
+    try e.opaque_(&root);
+    try e.string("hard");
+    try check(&f, nfs, .{ .proc = .link, .sets = 2 }, a.bytes());
+    e = a.start(root);
+    try e.string("art");
+    try e.opaque_(&root);
+    try e.string("art2");
+    try check(&f, nfs, .{ .proc = .rename, .sets = 2 }, a.bytes());
+    for ([_]struct { Proc, []const u8 }{ .{ .remove, "skynet" }, .{ .remove, "hard" }, .{ .rmdir, "box" } }) |c| {
+        e = a.start(root);
+        try e.string(c[1]);
+        try check(&f, nfs, .{ .proc = c[0], .sets = 1 }, a.bytes());
+    }
+
+    e = a.start(root);
+    try e.u64_(0);
+    try e.fixedOpaque(&@as([8]u8, @splat(0)));
+    try e.u32_(8192);
+    try check(&f, nfs, .{ .proc = .readdir, .sets = 1 }, a.bytes());
+    e = a.start(root);
+    try e.u64_(0);
+    try e.fixedOpaque(&@as([8]u8, @splat(0)));
+    try e.u32_(8192);
+    try e.u32_(32768);
+    // The directory, then hal, dir, link, art2, and soft.
+    try check(&f, nfs, .{ .proc = .readdirplus, .sets = 6 }, a.bytes());
+    for ([_]Proc{ .fsstat, .fsinfo, .pathconf }) |p| {
+        _ = a.start(root);
+        try check(&f, nfs, .{ .proc = p, .sets = 1 }, a.bytes());
+    }
+}
+
+test "fileids stay inodes on the export root's file system, and differ elsewhere" {
+    var r: Request = undefined;
+    r.root_dev = 5;
+    try testing.expectEqual(2, r.fileid(5, 2));
+    const b = r.fileid(6, 2);
+    const c = r.fileid(7, 2);
+    try testing.expect(b != 2 and c != 2 and b != c);
+    // Distinct inodes on one other file system stay distinct.
+    try testing.expect(r.fileid(6, 3) != b);
+    r.root_dev = null;
+    try testing.expectEqual(2, r.fileid(6, 2));
 }
 
 test "read-only exports refuse writes" {

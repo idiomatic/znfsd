@@ -18,6 +18,8 @@ NFS v3 server daemon with few options and sensible defaults.
 * `--no-portmap`: neither register nor start a portmapper; clients must name ports, and NLM and NSM are off
 * Host NFS services (e.g., macOS `nfsd`, Linux kernel `nfsd`/`lockd`): fail on any port or RPC registration collision
 * Exports: always sync, crossmnt, no subtree check, AUTH_SYS
+* Writes: UNSTABLE ones reach storage by COMMIT, others before the reply
+* fileid: the inode on the export root's file system; elsewhere, the inode with the filesystem ID folded in
 * Commands: `add` is idempotent and merges options into an existing rule, `set` replaces a rule's options, and changes apply immediately; they go through the control socket when the daemon runs, else operate on the database directly
 * Database: WAL mode with a busy timeout
 * `lock` commands: need the daemon; without it, `list` is empty and `del` fails

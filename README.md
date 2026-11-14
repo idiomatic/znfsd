@@ -41,8 +41,10 @@ While the daemon runs, commands reach it through its control socket and take eff
 macOS:
 
 ```sh
-sudo mount -t nfs -o vers=3 hal:/srv/projects /Volumes/projects
+sudo mount -t nfs -o vers=3,rsize=1048576,wsize=1048576 hal:/srv/projects /Volumes/projects
 ```
+
+macOS reads and writes 32 KiB at a time unless told otherwise, whatever the server offers, so ask for 1 MiB; `nfsstat -m` shows what the client settled on.
 
 Linux:
 
@@ -122,7 +124,9 @@ If the host's own NFS server or kernel lock manager already holds a port or RPC 
 
 znfsd keeps exports, groups, maps, file handles, mount records, and statd's monitor list in SQLite. Locks live only in memory: after a restart, znfsd notifies its clients, which reclaim their locks during a grace period of about 90 seconds. Locks coordinate NFS clients with each other; processes on the server itself don't see them.
 
-File handles identify a file by filesystem and inode rather than path, so they survive renames, including ones made directly on the host.
+File handles identify a file by filesystem and inode rather than path, so they survive renames, including ones made directly on the host. Exports cross into file systems mounted inside them; since a client sees the whole mount as one device, files there get inode numbers with their file system's ID folded in, so tools that spot hard links by device and inode (`tar`, `rsync -H`, backups) don't mistake files in two file systems for one.
+
+Writes reach storage before the reply, except those a client sends as unstable, which reach it by the client's next COMMIT (on `fsync` or close), as Linux's kernel server does for `sync` exports. If znfsd restarts in between, clients see that and send those writes again.
 
 ## Activity monitor
 

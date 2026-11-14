@@ -173,7 +173,7 @@ Without hooks, file handles go stale and mounts and monitors are forgotten when 
 | `mount.Store` | `Mount.store` | `mounted` and `unmounted`; at start, `Mount.restore` re-adds records without storing them again |
 | `nsm.Store` | `Nsm.store` | `monitor` and `unmonitor` |
 
-File handles are 36 bytes: format version, export ID (a hash of the export path), file-system ID (the device number), inode, and generation. A handle resolves to its file's last-known path, from memory or else `files.Store`, while that path's device and inode still match; otherwise it's stale, except for export roots. MNT, LOOKUP, READDIRPLUS, and creation record paths, and renames move them.
+File handles are 36 bytes: format version, export ID (a hash of the export path), file-system ID (the device number), inode, and generation. A handle resolves to its file's last-known path, from memory or else `files.Store`, while that path's device and inode still match; otherwise it's stale, except for export roots. MNT, LOOKUP, READDIRPLUS, and creation record paths, and renames move them. Fileids are inodes on the export root's own file system; elsewhere, inodes with the file system's ID folded in, since clients see one device per mount.
 
 ## Other transports
 
@@ -181,7 +181,7 @@ File handles are 36 bytes: format version, export ID (a hash of the export path)
 
 ## Limits
 
-* Reads and writes: up to 1 MiB; every write is `FILE_SYNC`.
+* Reads and writes: up to 1 MiB. UNSTABLE writes reach storage at COMMIT, others before the reply; pass `Nfs.init` a verifier that changes at each start, so clients resend what a restart lost.
 * UDP replies: 65,535 bytes, so large reads need TCP.
 * Callers' supplementary groups: 16, as AUTH_SYS carries.
 

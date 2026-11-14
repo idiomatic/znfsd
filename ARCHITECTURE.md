@@ -47,7 +47,9 @@ Embedders can also adopt connections they accepted themselves (vsock, say): `ser
 3. AUTH_SYS credentials pass through squash and the matching rule's map, yielding host IDs.
 4. The handler resolves file handles, checks access against the export rule, performs the operation, and encodes the reply, mapping host IDs back to client IDs.
 
-Writes are always stable: data reaches storage before the reply, so COMMIT has nothing left to do.
+Writes asked for as FILE_SYNC or DATA_SYNC reach storage (`fsync`) before the reply; UNSTABLE ones are left to COMMIT, which syncs the whole file, as Linux's kernel server does for `sync` exports. The write verifier changes at each start, so clients resend whatever a restart may have lost.
+
+Every attribute in a reply goes through one function that maps owners back to client IDs and folds the file system into the fileid; the encoders accept nothing else, so no reply, failure or not, can carry host owners.
 
 Files are reached through descriptors, never bare paths: a handle's cached path is opened refusing symbolic links in every component (`O_NOFOLLOW_ANY` on macOS, `openat2` with `RESOLVE_NO_SYMLINKS` on Linux) and its inode checked, then entries are changed relative to that descriptor (`openat`, `mkdirat`, `renameat`, and so on), so a client swapping a directory for a link can't redirect an operation outside its export. A renamed directory's cached descendants move with it.
 
@@ -65,7 +67,7 @@ A rule is (path, client, options). Stored rules come from the hooks; ephemeral r
 version │ export ID │ filesystem ID │ inode │ generation
 ```
 
-Handles name a file without its path, so they survive renames. Built so far: resolution through the last-known path, cached by MNT, LOOKUP, READDIRPLUS, and creation, and kept in the database through libnfsd's `files.Store` hook, so handles survive restarts (locks are reclaimed by handle); export roots are always recognized. Only new or changed paths are written, and a READDIRPLUS reply's entries go together, in one transaction. Planned: libnfsd opens by handle on Linux (`open_by_handle_at`), asks the filesystem for the path on macOS (`fsgetpath`), and otherwise falls back to the last-known path, accepting it only if the inode still matches. Each handle's last-known path is stored and updated on NFS renames.
+Handles name a file without its path, so they survive renames. They're distinct across file systems an export crosses into, but clients see one device per mount, so fileids are too: the inode on the export root's own file system, and elsewhere the inode XORed with bits from a hash of the file system's ID (its top bit set, so they can't meet the root's). Built so far: resolution through the last-known path, cached by MNT, LOOKUP, READDIRPLUS, and creation, and kept in the database through libnfsd's `files.Store` hook, so handles survive restarts (locks are reclaimed by handle); export roots are always recognized. Only new or changed paths are written, and a READDIRPLUS reply's entries go together, in one transaction. Planned: libnfsd opens by handle on Linux (`open_by_handle_at`), asks the filesystem for the path on macOS (`fsgetpath`), and otherwise falls back to the last-known path, accepting it only if the inode still matches. Each handle's last-known path is stored and updated on NFS renames.
 
 ## Locks and recovery
 
