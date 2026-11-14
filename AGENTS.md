@@ -44,6 +44,7 @@ NFS v3 server daemon with few options and sensible defaults.
 
 * Zig 0.17+
 * I/O: through `std.Io`; libnfsd takes an `Io` from its embedder
+* libc: linked; file-system calls `std.Io` lacks go through `std.c` and `std.posix`
 * znfsd: `std.Io.Threaded`; revisit `std.Io.Evented` once it supports TCP listen and UDP bind
 
 ## Docs

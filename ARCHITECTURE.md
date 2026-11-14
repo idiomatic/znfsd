@@ -71,7 +71,7 @@ znfsd stores exports, groups, maps, file handles, mount records, the NSM monitor
 
 ## I/O
 
-Network and basic file I/O go through `std.Io`; file-system calls it lacks (`fstatat`/`statx`, `realpath`, and later the `*at` calls, `open_by_handle_at`, and `fsgetpath`) go through libc in `sys.zig`, returning errno values for mapping to protocol statuses. Under `std.Io.Threaded`, these blocking calls run on worker threads like any other.
+Network and basic file I/O go through `std.Io`; file-system calls it lacks (`fstatat`/`statx`, `realpath`, and later the `*at` calls, `open_by_handle_at`, and `fsgetpath`) go through libc in `sys.zig`, returning errno values for mapping to protocol statuses. `realpath`, which Zig discourages ([#19353](https://github.com/ziglang/zig/issues/19353)), is used only where a path must be resolved as a client named it: export paths once at startup, and MNT's requested path, which must then lie inside an export. Under `std.Io.Threaded`, these blocking calls run on worker threads like any other.
 
 All other I/O goes through `std.Io`, so libnfsd runs on whatever implementation its embedder chooses. znfsd uses `std.Io.Threaded`, the only implementation in Zig 0.17 that can run a server: `std.Io.Evented` stubs TCP listen and accept on Linux (io_uring) and also UDP bind on macOS (Grand Central Dispatch). Switching later touches only znfsd's `main`.
 
