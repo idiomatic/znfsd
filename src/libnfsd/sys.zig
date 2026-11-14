@@ -292,6 +292,96 @@ pub fn makeDev(major: u32, minor: u32) u64 {
         (minor & 0xff) | (@as(u64, minor & ~@as(u32, 0xff)) << 12);
 }
 
+/// A caller's identity, for acting as them in file-system calls.
+pub const Identity = struct {
+    uid: u32,
+    gid: u32,
+    /// Supplementary groups; on macOS, the host's own membership for `uid`
+    /// applies instead.
+    gids: []const u32 = &.{},
+};
+
+const max_groups = 32;
+
+/// The identity this thread is acting as, if any; per thread.
+threadlocal var acting: ?struct { uid: u32, gid: u32, gids: [max_groups]u32, n: u8 } = null;
+
+/// The server's supplementary groups, restored after acting as a caller.
+var server_groups: [max_groups]u32 = undefined;
+var server_groups_len: usize = 0;
+/// 0: not saved; 1: saving; 2: saved.
+var server_groups_state: std.atomic.Value(u8) = .init(0);
+
+fn saveServerGroups() void {
+    if (server_groups_state.load(.acquire) == 2) return;
+    if (server_groups_state.cmpxchgStrong(0, 1, .acquire, .acquire) == null) {
+        const n = std.os.linux.getgroups(max_groups, @ptrCast(&server_groups));
+        server_groups_len = if (std.os.linux.errno(n) == .SUCCESS) n else 0;
+        server_groups_state.store(2, .release);
+        return;
+    }
+    while (server_groups_state.load(.acquire) != 2) std.atomic.spinLoopHint();
+}
+
+extern "c" fn pthread_setugid_np(uid: c.uid_t, gid: c.gid_t) c_int;
+/// KAUTH_UID_NONE and KAUTH_GID_NONE: back to the process's identity.
+const kauth_none: u32 = std.math.maxInt(u32) - 100;
+
+/// Makes this thread's file-system calls act as `id`, until `revert`.
+/// Only root can; per thread, so other requests are unaffected.
+pub fn become(id: Identity) E {
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        saveServerGroups();
+        const n = @min(id.gids.len, max_groups);
+        const rc = linux.syscall2(.setgroups, n, @intFromPtr(id.gids.ptr));
+        if (linux.errno(rc) != .SUCCESS) return linux.errno(rc);
+        // setfsuid and setfsgid report the previous ID, never an error, so
+        // a second call checks the first took.
+        _ = linux.syscall1(.setfsgid, id.gid);
+        if (linux.syscall1(.setfsgid, id.gid) != id.gid) return .PERM;
+        _ = linux.syscall1(.setfsuid, id.uid);
+        if (linux.syscall1(.setfsuid, id.uid) != id.uid) return .PERM;
+    } else if (builtin.os.tag.isDarwin()) {
+        // From another identity, return to the process's first.
+        if (acting != null) _ = pthread_setugid_np(kauth_none, kauth_none);
+        if (pthread_setugid_np(id.uid, id.gid) != 0) return errno();
+    } else return .NOSYS;
+    var saved: @TypeOf(acting.?) = .{ .uid = id.uid, .gid = id.gid, .gids = undefined, .n = @intCast(@min(id.gids.len, max_groups)) };
+    @memcpy(saved.gids[0..saved.n], id.gids[0..saved.n]);
+    acting = saved;
+    return .SUCCESS;
+}
+
+/// Returns this thread to the server's own identity.
+pub fn revert() void {
+    if (acting == null) return;
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        _ = linux.syscall1(.setfsuid, 0);
+        _ = linux.syscall1(.setfsgid, 0);
+        _ = linux.syscall2(.setgroups, server_groups_len, @intFromPtr(&server_groups));
+    } else if (builtin.os.tag.isDarwin()) {
+        _ = pthread_setugid_np(kauth_none, kauth_none);
+    }
+    acting = null;
+}
+
+/// Suspends acting as a caller, for the server's own files (its database),
+/// returning what to `resume`.
+pub fn pause() ?Identity {
+    const a = acting orelse return null;
+    revert();
+    paused_gids = a.gids;
+    return .{ .uid = a.uid, .gid = a.gid, .gids = paused_gids[0..a.n] };
+}
+
+threadlocal var paused_gids: [max_groups]u32 = undefined;
+
+pub fn @"resume"(id: ?Identity) void {
+    if (id) |i| _ = become(i);
+}
+
 pub fn isRoot() bool {
     return switch (builtin.os.tag) {
         .linux => std.os.linux.geteuid() == 0,
@@ -488,6 +578,41 @@ test "safe opens refuse links in any component; descriptor-relative calls" {
     try testing.expectEqual(E.NOTEMPTY, unlinkIn(dir, "sub", true));
     try testing.expectEqual(E.SUCCESS, unlinkIn(dir, "sub/hal3", false));
     try testing.expectEqual(E.SUCCESS, unlinkIn(dir, "sub", true));
+}
+
+test "act as another user, then revert" {
+    if (!isRoot()) return error.SkipZigTest;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [max_path]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(io, &buf)];
+    var dir: Fd = undefined;
+    var z: [max_path + 1]u8 = undefined;
+    try testing.expectEqual(E.SUCCESS, openSafe(try std.fmt.bufPrintSentinel(&z, "{s}", .{root}, 0), .{ .DIRECTORY = true }, 0, &dir));
+    defer closeFd(dir);
+    try testing.expectEqual(E.SUCCESS, chmodFd(dir, 0o777));
+
+    try testing.expectEqual(E.SUCCESS, become(.{ .uid = 4242, .gid = 4242 }));
+    defer revert();
+    var fd: Fd = undefined;
+    try testing.expectEqual(E.SUCCESS, createIn(dir, "theirs", true, 0o600, &fd));
+    closeFd(fd);
+    // Acting as 4242, root's directory isn't theirs to change.
+    try testing.expectEqual(E.PERM, chmodFd(dir, 0o755));
+    const paused = pause();
+    try testing.expectEqual(E.SUCCESS, createIn(dir, "server", true, 0o600, &fd));
+    closeFd(fd);
+    @"resume"(paused);
+    // Root's override is gone: root's private file can't be opened.
+    try testing.expectEqual(E.ACCES, createIn(dir, "server", false, 0o600, &fd));
+    revert();
+
+    var attr: Attr = undefined;
+    try testing.expectEqual(E.SUCCESS, statIn(dir, "theirs", &attr));
+    try testing.expectEqual(4242, attr.uid);
+    try testing.expectEqual(E.SUCCESS, statIn(dir, "server", &attr));
+    try testing.expectEqual(0, attr.uid);
 }
 
 test "lstat a directory and a missing path" {

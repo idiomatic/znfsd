@@ -1,6 +1,7 @@
 //! NFS version 3 (RFC 1813).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const posix = std.posix;
 const rpc = @import("rpc.zig");
@@ -159,7 +160,8 @@ pub const Nfs = struct {
     /// Changes whenever the server restarts, so clients know to resend
     /// unstable writes; every write here is stable anyway.
     verifier: [8]u8,
-    /// As root, new files are given to their creators.
+    /// As root, each request acts as its caller, so the OS checks access
+    /// with the caller's own credentials.
     root: bool,
 
     pub fn init(gpa: std.mem.Allocator, table: *const exports.Table, files: *Files, verifier: [8]u8) Nfs {
@@ -216,6 +218,7 @@ pub const Nfs = struct {
             .e = .init(results),
             .results = results,
         };
+        defer if (n.root) sys.revert();
         r.dispatch(@fromBackingInt(@intCast(call.proc))) catch |err| return switch (err) {
             error.Truncated, error.TooLong, error.Invalid => .garbage_args,
             error.WriteFailed, error.OutOfMemory, error.Canceled => .system_err,
@@ -352,6 +355,10 @@ const Request = struct {
         };
         const match = r.table.match(path, r.ctx.from, null) orelse return .{ .failed = .acces };
         r.map = r.mapOf(match.rule);
+        if (r.n.root) {
+            const c = r.creds(match.rule);
+            if (sys.become(.{ .uid = c.uid, .gid = c.gid, .gids = c.gids }) != .SUCCESS) return .{ .failed = .serverfault };
+        }
         return .{ .found = .{ .handle = h, .path = path, .attr = attr, .match = match } };
     }
 
@@ -902,16 +909,18 @@ const Request = struct {
         return .{ .ok = w.* };
     }
 
-    /// Gives a new entry to its creator, when running as root, and sets
-    /// any mode asked for exactly, without the umask.
+    /// Sets any mode asked for exactly, without the umask, and any owner
+    /// asked for. Acting as the caller, a new entry is already theirs; on
+    /// macOS, whose new entries take their directory's group, the caller's
+    /// group is set too, where the host allows it.
     fn settle(r: *Request, w: *const Where, s: Sattr, kind: Ftype) sys.E {
         if (s.mode) |mode| if (kind != .lnk) {
             const e = sys.chmodIn(w.fd, w.name, mode & 0o7777);
             if (e != .SUCCESS) return e;
         };
-        if (r.n.root) {
-            const c = r.creds(w.dir.match.rule);
-            return sys.chownIn(w.fd, w.name, s.uid orelse c.uid, s.gid orelse c.gid);
+        if (s.uid != null or s.gid != null) return sys.chownIn(w.fd, w.name, s.uid, s.gid);
+        if (r.n.root and builtin.os.tag.isDarwin()) {
+            _ = sys.chownIn(w.fd, w.name, null, r.creds(w.dir.match.rule).gid);
         }
         return .SUCCESS;
     }

@@ -50,7 +50,12 @@ pub const Files = struct {
             f.paths.removeByPtr(gop.key_ptr);
             return err;
         };
-        if (f.store) |s| s.remember(s.ptr, h.fsid, h.inode, path);
+        if (f.store) |s| {
+            // The store is the server's own: never touched as a caller.
+            const caller = sys.pause();
+            defer sys.@"resume"(caller);
+            s.remember(s.ptr, h.fsid, h.inode, path);
+        }
     }
 
     pub fn forget(f: *Files, io: Io, h: fh.Handle) Io.Cancelable!void {
@@ -72,7 +77,11 @@ pub const Files = struct {
             f.gpa.free(path);
             p.* = moved;
         }
-        if (f.store) |s| s.renamePrefix(s.ptr, old, new);
+        if (f.store) |s| {
+            const caller = sys.pause();
+            defer sys.@"resume"(caller);
+            s.renamePrefix(s.ptr, old, new);
+        }
     }
 
     /// The last-known path of a file, copied into `arena`.
@@ -98,10 +107,11 @@ pub const Files = struct {
         };
         const len = if (cached)
             std.mem.indexOfScalar(u8, out, 0).?
-        else if (f.store) |s|
-            s.lookup(s.ptr, h.fsid, h.inode, out[0..sys.max_path]) orelse return error.Stale
-        else
-            return error.Stale;
+        else if (f.store) |s| lookup: {
+            const caller = sys.pause();
+            defer sys.@"resume"(caller);
+            break :lookup s.lookup(s.ptr, h.fsid, h.inode, out[0..sys.max_path]) orelse return error.Stale;
+        } else return error.Stale;
         out[len] = 0;
         const path = out[0..len :0];
         if (sys.lstat(path, attr) != .SUCCESS) return error.Stale;
