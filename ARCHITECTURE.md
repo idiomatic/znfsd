@@ -2,7 +2,7 @@
 
 How znfsd is put together. [AGENTS.md](AGENTS.md) is the specification; [DEVELOPMENT.md](DEVELOPMENT.md) covers the workflow.
 
-Built so far: XDR and RPC, UDP and TCP serving, the portmapper and registration, export rules, file handles, MOUNT, and NFS v3. The rest describes the design.
+Built so far: XDR and RPC, UDP and TCP serving (with concurrent calls per connection), adopted connections, the portmapper and registration, export rules, file handles, MOUNT, and NFS v3. The rest describes the design.
 
 ## Components
 
@@ -38,9 +38,11 @@ Built so far: XDR and RPC, UDP and TCP serving, the portmapper and registration,
 
 Each program listens on TCP and UDP at every `--bind` address. When both `0.0.0.0` and `::` are requested, as by default, znfsd binds one dual-stack `::` socket instead, which also serves IPv4: Zig 0.17 can't make a TCP listener IPv6-only, and on Linux the two would collide. At startup, znfsd probes port 111; on macOS, it first connects to `/var/run/portmap.socket`, which makes launchd start the on-demand `rpcbind`, and retries for up to 15 seconds: launchd waits 10 seconds before relaunching a daemon that recently ran, and until `rpcbind` binds, pings fail at once rather than time out. It exits when idle, but stays while it holds registrations. If a portmapper answers, znfsd registers with it; otherwise it serves its own when root, or exits. With `--no-portmap`, it skips the portmapper entirely and serves only NFS and MOUNT on their fixed ports. Any existing registration or bound port that znfsd needs is fatal, which keeps it from silently sharing duties with the host's own NFS services.
 
+Embedders can also adopt connections they accepted themselves (vsock, say): `server.serveConnection` serves each with every program given, dispatched by program number, with no listener or portmapper.
+
 ## Requests
 
-1. A record arrives: a datagram, or a record-marked TCP fragment sequence.
+1. A record arrives: a datagram, or a record-marked TCP fragment sequence. A TCP connection's reader takes one of 16 slots per record and answers it in a task of its own, so a slow call doesn't hold up the rest; each reply is written whole, under a lock, as its call finishes, so replies may go out of order, matched by XID. With every slot busy, the reader waits.
 2. XDR decodes the RPC call header; the program, version, and procedure select a handler.
 3. AUTH_SYS credentials pass through squash and the matching rule's map, yielding host IDs.
 4. The handler resolves file handles, checks access against the export rule, performs the operation, and encodes the reply, mapping host IDs back to client IDs.

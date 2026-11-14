@@ -80,6 +80,7 @@ pub fn main(init: std.process.Init) !void {
 | `ports` | nfs 2049, mount 20048, stat 32765, lock 32803 | per service |
 | `portmap` | `.auto` | `.auto`: register with a portmapper that answers, else start one when root, else fail with `error.NoPortmapper`; `.off`: neither |
 | `max_record` | 1 MiB + 4 KiB | largest TCP record |
+| `max_calls` | 16 | calls answered at once on one TCP connection |
 | `after_bind` | | runs once every port is bound and registered, before any request; return false (with `diag` set) to stop |
 | `observer` | | told of every call answered, for activity monitoring |
 
@@ -87,9 +88,40 @@ Each `Registration` pairs a program with the service whose port it uses: `mount.
 
 On macOS, the probe for a portmapper first wakes launchd's on-demand `rpcbind`.
 
+## Adopted connections
+
+To serve connections you accept yourself, over any stream socket (vsock, say, relayed from a host), skip `service.run` (no listeners or portmapper) and run `server.serveConnection` for each, in an `Io.Group` of your own:
+
+```zig
+const programs = [_]libnfsd.server.Program{
+    mount.program(),
+    nfs.program(),
+};
+var connections: std.Io.Group = .init;
+defer connections.cancel(io);
+
+// For each connection accepted:
+const stream: std.Io.net.Stream = .{ .socket = .{
+    .handle = fd,
+    .address = .{ .ip4 = .unspecified(0) },
+} };
+connections.concurrent(io, libnfsd.server.serveConnection, .{
+    io, gpa, &programs, stream, .{},
+}) catch stream.close(io);
+```
+
+* **Programs:** each connection carries every program you pass, told apart by program number, so one port serves MOUNT and NFS (macOS: `mount_nfs -o vers=3,tcp,port=P,mountport=P,locallocks`). Without a portmapper, NLM's callbacks can't reach clients, so leave locking to them.
+* **Lifetime:** `serveConnection` serves until the peer closes the stream or the task is canceled, then closes it.
+* **Trust:** AUTH_SYS credentials are taken as given, so whoever hands over the connection authorizes it.
+* **Peer:** `stream.socket.address` stands for the peer in export rules, logs, and the observer. For other address families, give a placeholder such as `0.0.0.0` and export to `*`.
+* **Options:** `server.ConnectionOptions` has `max_record`, `max_calls`, and `observer`, with `service.Config`'s defaults.
+
+The test "a connection the embedder accepted carries MOUNT and NFS" in `server.zig` does this over a `socketpair`.
+
 ## Concurrency and identity
 
 * **Threads:** each UDP socket is served in a loop and each TCP connection concurrently, through the `Io` you supply (znfsd uses `std.Io.Threaded`). Every type here is safe to share among requests; the allocator must be thread-safe.
+* **Calls per connection:** a TCP connection, accepted or adopted, answers up to `max_calls` calls at once, each in a task of its own, and replies as each finishes, so replies may go out of order, matched by XID. Without a task to spare, a call is answered before the next is read. Each call in flight can hold up to two `max_record` buffers, kept for the connection's life.
 * **Acting as callers:** as root, each NFS request switches its thread's identity to the caller's (after squashing and maps), so the OS checks access and new files get the caller's owner. `Nfs.root` records this at `init`.
 * **Dropping root:** to bind low ports as root and then serve as a user, drop privileges in `after_bind` and set `nfs.root = false` there. Unprivileged, files are reached as that user, maps can't apply, and NFS clients can't set owners.
 * **Owner override:** a file's owner may open it whatever its mode, as the Linux kernel server allows.

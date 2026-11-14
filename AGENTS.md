@@ -9,6 +9,7 @@ NFS v3 server daemon with few options and sensible defaults.
 * Clients: macOS 15.8+, Linux 6.12+, Windows 10+
 * `libnfsd`: embeddable implementation with state-storage hooks
 * `znfsd`: CLI daemon built on `libnfsd`
+* `libnfsd` adopted connections: `server.serveConnection` serves a stream the embedder accepted (any address family), every given program on it, until the peer closes it or the task is canceled, then closes it; AUTH_SYS taken as given
 
 ## Behavior
 
@@ -25,6 +26,7 @@ NFS v3 server daemon with few options and sensible defaults.
 * Host and `*.domain` matching: forward-confirmed reverse DNS, cached, resolved asynchronously
 * `--bind`: repeatable; default `0.0.0.0` and `::`
 * Ports: fixed; nfs 2049, mount 20048, stat 32765, lock 32803
+* TCP connections: up to 16 calls at once each; replies in any order, matched by XID
 * `--socket` default: root `/var/run/znfsd.sock`; else `$XDG_RUNTIME_DIR/znfsd.sock` (Linux), `$TMPDIR/znfsd.sock` (macOS)
 * `--db` default: root `/var/lib/znfsd/znfsd.db` (Linux), `/var/db/znfsd/znfsd.db` (macOS); else `~/.local/state/znfsd/znfsd.db` (Linux), `~/Library/Application Support/znfsd/znfsd.db` (macOS)
 * `--run-as USER`: drops root after binding low ports, then accesses the host as USER; disables maps

@@ -37,6 +37,8 @@ pub const Config = struct {
     portmap_port: u16 = portmap.port,
     /// Largest TCP record accepted.
     max_record: usize = 1024 * 1024 + 4096,
+    /// Calls answered at once on one TCP connection.
+    max_calls: usize = 16,
     /// Runs once every port is bound and registered, before any request is
     /// served, as for dropping root.
     after_bind: ?AfterBind = null,
@@ -144,7 +146,11 @@ pub fn run(io: Io, gpa: std.mem.Allocator, config: Config, registrations: []cons
     defer group.cancel(io);
     for (listeners.items) |*l| {
         try group.concurrent(io, server.serveUdp, .{ io, gpa, l.programs, l.udp, config.observer });
-        try group.concurrent(io, server.serveTcp, .{ io, gpa, l.programs, &l.tcp, config.max_record, config.observer });
+        try group.concurrent(io, server.serveTcp, .{ io, gpa, l.programs, &l.tcp, .{
+            .max_record = config.max_record,
+            .max_calls = config.max_calls,
+            .observer = config.observer,
+        } });
     }
     try group.await(io);
 }

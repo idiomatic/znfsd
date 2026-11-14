@@ -2,7 +2,7 @@
 
 How to work on znfsd. [AGENTS.md](AGENTS.md) is the specification; [README.md](README.md) explains it for users, and [ARCHITECTURE.md](ARCHITECTURE.md) describes the design.
 
-So far, `serve` runs the portmapper logic, MOUNT, all of NFS v3, and locking (NLM and NSM, with restart recovery), with stored and ephemeral exports and groups; Linux 6.18 has mounted it read-write and locked, blocked, and reclaimed after a restart. Maps and `--run-as` work too. The `export`, `group`, `map`, `mount`, `lock`, and `stop` commands work, through the control socket when the daemon runs, so changes apply at once. Running as root, each request acts as its caller. macOS 27.2 and Windows 11 have mounted it too, read-write and locking. The activity monitor serves at `127.0.0.1:8049`.
+So far, `serve` runs the portmapper logic, MOUNT, all of NFS v3, and locking (NLM and NSM, with restart recovery), with stored and ephemeral exports and groups; Linux 6.18 has mounted it read-write and locked, blocked, and reclaimed after a restart. Maps and `--run-as` work too. The `export`, `group`, `map`, `mount`, `lock`, and `stop` commands work, through the control socket when the daemon runs, so changes apply at once. Running as root, each request acts as its caller. macOS 27.2 and Windows 11 have mounted it too, read-write and locking. The activity monitor serves at `127.0.0.1:8049`. Each TCP connection answers up to 16 calls at once, and embedders can hand libnfsd connections they accepted themselves, such as vsock.
 
 ## Requirements
 
@@ -70,7 +70,6 @@ Test against each supported client: macOS 15.8+, Linux 6.12+, and Windows 10+. B
 * Code review: libnfsd and znfsd, for correctness, clarity, and conformance to [AGENTS.md](AGENTS.md) and the [specifications](docs/specifications/README.md)
 * Host-name matching: forward-confirmed reverse DNS, cached and resolved asynchronously, for `host` and `*.domain` clients
 * Handle resolution: `open_by_handle_at` (Linux) and `fsgetpath` (macOS) before the last-known path; volume UUIDs as file-system IDs
-* Concurrent requests per TCP connection: each connection now answers one call at a time, and macOS clients use one connection per mount; replies may go out of order, matched by XID
 * Security review: untrusted AUTH_SYS clients, export confinement and symbolic-link races, identity switching and `--run-as`, the control socket, and the web monitor
 
 ## File-system backends
