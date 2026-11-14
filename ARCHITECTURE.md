@@ -69,6 +69,10 @@ NLM locks live only in memory. NSM records which clients hold state, and that li
 
 znfsd stores exports, groups, maps, file handles, mount records, the NSM monitor list, and the NSM state number in SQLite, using WAL mode and a busy timeout. Built so far: export rules (path, client, and every option written out, defaults included), group members, and mount records, which MOUNT keeps through libnfsd's `mount.Store` hook and restores at startup. `serve` lays its ephemeral rules over the stored ones by path and client, and its groups by name. While the daemon runs, commands reach it through the control socket and it writes the database; otherwise commands open the database themselves.
 
+## Control socket
+
+A Unix socket, mode 0600, at `--socket` or the default path. Each connection carries one request, a command's words (a count, then each word's length and bytes), and one reply: the exit status, the output, and the error text, each length-prefixed, all integers big-endian u32s. The daemon runs the same command code as the CLI against its database, then applies the change: export and group changes rebuild the export table, swapped into MOUNT and NFS atomically, and `mount del` also forgets the record in memory. Replaced tables are kept until exit, since requests may still be reading them. A socket file nobody answers on is stale and replaced; one that answers means another daemon is running.
+
 ## I/O
 
 Network and basic file I/O go through `std.Io`; file-system calls it lacks (`fstatat`/`statx`, `realpath`, and later the `*at` calls, `open_by_handle_at`, and `fsgetpath`) go through libc in `sys.zig`, returning errno values for mapping to protocol statuses. `realpath`, which Zig discourages ([#19353](https://github.com/ziglang/zig/issues/19353)), is used only where a path must be resolved as a client named it: export paths once at startup, and MNT's requested path, which must then lie inside an export. Under `std.Io.Threaded`, these blocking calls run on worker threads like any other.

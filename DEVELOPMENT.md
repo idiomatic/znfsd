@@ -2,7 +2,7 @@
 
 How to work on znfsd. [AGENTS.md](AGENTS.md) is the specification; [README.md](README.md) explains it for users, and [ARCHITECTURE.md](ARCHITECTURE.md) describes the design.
 
-So far, `serve` runs the portmapper logic, MOUNT, and all of NFS v3, with stored and ephemeral exports and groups; Linux 6.18 has mounted it read-write. The `export`, `group`, and `mount` commands work on the database, but a running daemon reads it only at startup until the control socket exists. NLM, NSM, maps, `stop`, `lock`, and the activity monitor are still to come.
+So far, `serve` runs the portmapper logic, MOUNT, and all of NFS v3, with stored and ephemeral exports and groups; Linux 6.18 has mounted it read-write. The `export`, `group`, `mount`, and `stop` commands work, through the control socket when the daemon runs, so changes apply at once. NLM, NSM, maps, the `lock` commands' locks, and the activity monitor are still to come.
 
 ## Requirements
 
@@ -16,7 +16,7 @@ SQLite is vendored as its C amalgamation in [vendor/sqlite](vendor/sqlite/README
 | Path | Contents |
 | --- | --- |
 | `src/libnfsd/` | Embeddable server: RPC, XDR, NFS v3, MOUNT, NLM, NSM, portmapper, and state-storage hooks |
-| `src/znfsd/` | CLI daemon: arguments (`cli.zig`), ephemeral exports (`ephemeral.zig`), SQLite storage (`db.zig`), commands (`commands.zig`); later the control socket and admin web server |
+| `src/znfsd/` | CLI daemon: arguments (`cli.zig`), ephemeral exports (`ephemeral.zig`), SQLite storage (`db.zig`), commands (`commands.zig`), the control socket (`control.zig`), and the daemon (`daemon.zig`); later the admin web server |
 | `vendor/sqlite/` | The SQLite amalgamation; see its [README.md](vendor/sqlite/README.md) |
 | `src/znfsd/usage.txt` | `help` output; a copy of the Usage block in [AGENTS.md](AGENTS.md), kept identical |
 | `docs/specifications/` | Copies of the external specifications, indexed in its [README.md](docs/specifications/README.md) |

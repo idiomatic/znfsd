@@ -25,6 +25,9 @@ pub const Command = struct {
 pub const Invocation = struct {
     globals: Globals,
     command: Command,
+    /// The command's words as given, from its noun on, for sending to a
+    /// running daemon.
+    words: []const []const u8 = &.{},
 };
 
 pub const Error = error{
@@ -62,12 +65,14 @@ pub fn parse(arena: std.mem.Allocator, args: []const []const u8) Error!Invocatio
     globals.binds = binds.items;
 
     if (i == args.len) return .{ .globals = globals, .command = .{ .noun = .help } };
+    const words = args[i..];
     const noun = std.meta.stringToEnum(Noun, args[i]) orelse return error.UnknownCommand;
     i += 1;
     switch (noun) {
         .serve, .stop, .help => return .{
             .globals = globals,
             .command = .{ .noun = noun, .args = args[i..] },
+            .words = words,
         },
         else => {},
     }
@@ -77,6 +82,7 @@ pub fn parse(arena: std.mem.Allocator, args: []const []const u8) Error!Invocatio
     return .{
         .globals = globals,
         .command = .{ .noun = noun, .verb = verb, .args = args[i + 1 ..] },
+        .words = words,
     };
 }
 

@@ -166,6 +166,12 @@ pub const Nfs = struct {
         return .{ .gpa = gpa, .table = table, .files = files, .nobody = sys.nobody(), .verifier = verifier, .root = sys.isRoot() };
     }
 
+    /// Replaces the export table while serving. The old table must outlive
+    /// any request still using it.
+    pub fn setTable(n: *Nfs, table: *const exports.Table) void {
+        @atomicStore(*const exports.Table, &n.table, table, .release);
+    }
+
     pub fn program(n: *Nfs) server.Program {
         return .{ .prog = prog, .low = vers, .high = vers, .ptr = n, .handle = handle };
     }
@@ -175,7 +181,15 @@ pub const Nfs = struct {
         if (call.proc == @backingInt(Proc.null)) return .success;
         if (call.cred.flavor != .sys) return .{ .auth_error = .tooweak };
         const auth = rpc.AuthSys.decode(call.cred.body) catch return .{ .auth_error = .badcred };
-        var r: Request = .{ .n = n, .ctx = ctx, .auth = auth, .d = .init(call.args), .e = .init(results), .results = results };
+        var r: Request = .{
+            .n = n,
+            .table = @atomicLoad(*const exports.Table, &n.table, .acquire),
+            .ctx = ctx,
+            .auth = auth,
+            .d = .init(call.args),
+            .e = .init(results),
+            .results = results,
+        };
         r.dispatch(@fromBackingInt(@intCast(call.proc))) catch |err| return switch (err) {
             error.Truncated, error.TooLong, error.Invalid => .garbage_args,
             error.WriteFailed, error.OutOfMemory, error.Canceled => .system_err,
@@ -197,6 +211,8 @@ const Error = xdr.DecodeError || Io.Writer.Error || std.mem.Allocator.Error || I
 
 const Request = struct {
     n: *Nfs,
+    /// The export table when the request arrived.
+    table: *const exports.Table,
     ctx: server.Context,
     auth: rpc.AuthSys,
     d: xdr.Decoder,
@@ -261,14 +277,14 @@ const Request = struct {
             error.Stale => r.exportRoot(h, &attr, buf) orelse return .{ .failed = .stale },
             error.Canceled => return error.Canceled,
         };
-        const match = r.n.table.match(path, r.ctx.from, null) orelse return .{ .failed = .acces };
+        const match = r.table.match(path, r.ctx.from, null) orelse return .{ .failed = .acces };
         return .{ .found = .{ .handle = h, .path = path, .attr = attr, .match = match } };
     }
 
     /// The path of the export whose root `h` is, so root handles always
     /// resolve, even before any lookup and across restarts.
     fn exportRoot(r: *Request, h: fh.Handle, attr: *sys.Attr, buf: *[sys.max_path + 1]u8) ?[:0]const u8 {
-        for (r.n.table.rules) |rule| {
+        for (r.table.rules) |rule| {
             if (exportId(rule.path) != h.export_id or rule.path.len > sys.max_path) continue;
             const path = copyZ(buf, rule.path);
             if (sys.lstat(path, attr) != .SUCCESS) continue;

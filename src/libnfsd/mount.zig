@@ -71,6 +71,22 @@ pub const Mount = struct {
         return .{ .gpa = gpa, .table = table };
     }
 
+    /// Replaces the export table while serving. The old table must outlive
+    /// any request still using it.
+    pub fn setTable(m: *Mount, table: *const exports.Table) void {
+        @atomicStore(*const exports.Table, &m.table, table, .release);
+    }
+
+    fn currentTable(m: *Mount) *const exports.Table {
+        return @atomicLoad(*const exports.Table, &m.table, .acquire);
+    }
+
+    /// Forgets `host`'s mount of `path`, or of everything when null, as
+    /// UMNT and UMNTALL do.
+    pub fn unmount(m: *Mount, io: Io, host: []const u8, path: ?[]const u8) !void {
+        try m.forget(io, host, path);
+    }
+
     pub fn deinit(m: *Mount) void {
         for (m.records.items) |r| m.freeRecord(r);
         m.records.deinit(m.gpa);
@@ -133,10 +149,11 @@ pub const Mount = struct {
             .@"export" => {
                 var arena_state: std.heap.ArenaAllocator = .init(m.gpa);
                 defer arena_state.deinit();
-                for (try m.table.paths(arena_state.allocator())) |path| {
+                const table = m.currentTable();
+                for (try table.paths(arena_state.allocator())) |path| {
                     try e.boolean(true);
                     try e.string(path);
-                    for (m.table.rules) |r| {
+                    for (table.rules) |r| {
                         if (!std.mem.eql(u8, r.path, path)) continue;
                         var buf: [max_name]u8 = undefined;
                         var w: Io.Writer = .fixed(&buf);
@@ -165,7 +182,7 @@ pub const Mount = struct {
             .ACCES => return .acces,
             else => return .io,
         }
-        const match = m.table.match(canonical, ctx.from, null) orelse return .acces;
+        const match = m.currentTable().match(canonical, ctx.from, null) orelse return .acces;
 
         var attr: sys.Attr = undefined;
         var z: [sys.max_path + 1]u8 = undefined;
