@@ -15,7 +15,7 @@ SQLite is vendored as its C amalgamation in [vendor/sqlite](vendor/sqlite/README
 
 | Path | Contents |
 | --- | --- |
-| `src/libnfsd/` | Embeddable server: RPC, XDR, NFS v3, MOUNT, NLM, NSM, portmapper, and state-storage hooks |
+| `src/libnfsd/` | Embeddable server: RPC, XDR, NFS v3, MOUNT, NLM, NSM, portmapper, and state-storage hooks; [guide](src/libnfsd/README.md) |
 | `src/znfsd/` | CLI daemon: arguments (`cli.zig`), ephemeral exports (`ephemeral.zig`), SQLite storage (`db.zig`), commands (`commands.zig`), the control socket (`control.zig`), the daemon (`daemon.zig`), and the activity monitor (`activity.zig`, `web.zig`, and its page in `web/`) |
 | `vendor/sqlite/` | The SQLite amalgamation; see its [README.md](vendor/sqlite/README.md) |
 | `src/znfsd/usage.txt` | `help` output; a copy of the Usage block in [AGENTS.md](AGENTS.md), kept identical |
@@ -68,6 +68,9 @@ Test against each supported client: macOS 15.8+, Linux 6.12+, and Windows 10+. B
 ## To do
 
 * Code review: libnfsd and znfsd, for correctness, clarity, and conformance to [AGENTS.md](AGENTS.md) and the [specifications](docs/specifications/README.md)
+* Host-name matching: forward-confirmed reverse DNS, cached and resolved asynchronously, for `host` and `*.domain` clients
+* Handle resolution: `open_by_handle_at` (Linux) and `fsgetpath` (macOS) before the last-known path; volume UUIDs as file-system IDs
+* Concurrent requests per TCP connection: each connection now answers one call at a time, and macOS clients use one connection per mount; replies may go out of order, matched by XID
 * Security review: untrusted AUTH_SYS clients, export confinement and symbolic-link races, identity switching and `--run-as`, the control socket, and the web monitor
 
 ## File-system backends

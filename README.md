@@ -16,7 +16,7 @@ znfsd is an NFS v3 server for Linux and macOS hosts, serving macOS, Linux, and W
 
 The NFS servers that ship with Linux and macOS spread one service across a kernel module, several daemons, `/etc/exports`, and an `exportfs` or `nfsd` reload step, each with its own syntax and quirks. znfsd is a single user-space process, configured from its command line, with changes taking effect immediately.
 
-It's built on `libnfsd`, so other programs can embed the same server and plug in their own state storage.
+It's built on `libnfsd`, so other programs can embed the same server and plug in their own state storage; see [its guide](src/libnfsd/README.md).
 
 ## Quick start
 
@@ -61,7 +61,7 @@ mount -o anon \\hal\srv\projects P:
 An export rule pairs a path with a client and options:
 
 * Clients are a host name, a `*.domain` wildcard, a CIDR, a `@group`, or `*`. When several rules match, the most specific wins outright: an exact host beats a CIDR, a longer CIDR beats a shorter one, and so on down to `*`. The winning rule's options aren't merged with others.
-* Host names are checked with forward-confirmed reverse DNS, so a forged PTR record alone can't claim a name.
+* Host names will be checked with forward-confirmed reverse DNS, so a forged PTR record alone can't claim a name. That isn't built yet: for now, host and `*.domain` rules match no one, so use addresses or CIDRs.
 * `rw` is the default; `ro` makes the export read-only.
 * `squash=root` (the default) treats the client's root as an anonymous user; `squash=all` does so for every user; `squash=none` trusts client IDs as sent.
 

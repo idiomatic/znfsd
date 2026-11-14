@@ -55,7 +55,7 @@ A map is a list of entries, each a host ID (`[UID][:GID]`) and the client IDs th
 
 ## Export rules
 
-A rule is (path, client, options). Stored rules come from the hooks; ephemeral rules from `serve` arguments overlay them by (path, client), and ephemeral groups and maps overlay stored ones by name. For each request, the most specific matching client wins. Host and `*.domain` clients need the caller's name, found by forward-confirmed reverse DNS and cached.
+A rule is (path, client, options). Stored rules come from the hooks; ephemeral rules from `serve` arguments overlay them by (path, client), and ephemeral groups and maps overlay stored ones by name. For each request, the most specific matching client wins. Host and `*.domain` clients need the caller's name, to be found by forward-confirmed reverse DNS and cached; until that's built, no caller has a name, so those rules match no one.
 
 ## File handles
 
