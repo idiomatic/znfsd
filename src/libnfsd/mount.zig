@@ -87,6 +87,15 @@ pub const Mount = struct {
         try m.forget(io, host, path);
     }
 
+    /// A copy of the mount records, in `arena`.
+    pub fn snapshot(m: *Mount, io: Io, arena: std.mem.Allocator) ![]Record {
+        try m.mutex.lock(io);
+        defer m.mutex.unlock(io);
+        const out = try arena.alloc(Record, m.records.items.len);
+        for (m.records.items, out) |r, *o| o.* = .{ .host = try arena.dupe(u8, r.host), .path = try arena.dupe(u8, r.path) };
+        return out;
+    }
+
     pub fn deinit(m: *Mount) void {
         for (m.records.items) |r| m.freeRecord(r);
         m.records.deinit(m.gpa);

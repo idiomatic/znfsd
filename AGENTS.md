@@ -39,6 +39,7 @@ NFS v3 server daemon with few options and sensible defaults.
 * Handle resolution: `open_by_handle_at` (Linux), `fsgetpath` (macOS), else the stored last-known path if its inode matches; else `NFS3ERR_STALE`; NFS renames update stored paths
 * Control: Unix socket at `--socket`, mode 0600
 * Admin web server: `--web`, default `127.0.0.1:8049`; live activity monitor only, no auth
+* `activity`: the monitor's snapshot as JSON, from the running daemon
 
 ## Code
 
@@ -63,6 +64,7 @@ znfsd [--socket PATH] [--run-as USER] [--bind ADDR ...] [--db PATH]
           [--map MAP:LOCAL=[REMOTE[,REMOTE ...]] ...]
           [PATH[:OPTION[,OPTION ...][:CLIENT[,CLIENT ...]]] ...]
     stop
+    activity                                   # the monitor's JSON snapshot
 
     export list [PATH]
     export add  PATH CLIENT [OPTION ...]

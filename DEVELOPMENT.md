@@ -2,7 +2,7 @@
 
 How to work on znfsd. [AGENTS.md](AGENTS.md) is the specification; [README.md](README.md) explains it for users, and [ARCHITECTURE.md](ARCHITECTURE.md) describes the design.
 
-So far, `serve` runs the portmapper logic, MOUNT, all of NFS v3, and locking (NLM and NSM, with restart recovery), with stored and ephemeral exports and groups; Linux 6.18 has mounted it read-write and locked, blocked, and reclaimed after a restart. Maps and `--run-as` work too. The `export`, `group`, `map`, `mount`, `lock`, and `stop` commands work, through the control socket when the daemon runs, so changes apply at once. Running as root, each request acts as its caller. macOS 27.2 and Windows 11 have mounted it too, read-write and locking. Still to come: the activity monitor.
+So far, `serve` runs the portmapper logic, MOUNT, all of NFS v3, and locking (NLM and NSM, with restart recovery), with stored and ephemeral exports and groups; Linux 6.18 has mounted it read-write and locked, blocked, and reclaimed after a restart. Maps and `--run-as` work too. The `export`, `group`, `map`, `mount`, `lock`, and `stop` commands work, through the control socket when the daemon runs, so changes apply at once. Running as root, each request acts as its caller. macOS 27.2 and Windows 11 have mounted it too, read-write and locking. The activity monitor serves at `127.0.0.1:8049`.
 
 ## Requirements
 
@@ -16,7 +16,7 @@ SQLite is vendored as its C amalgamation in [vendor/sqlite](vendor/sqlite/README
 | Path | Contents |
 | --- | --- |
 | `src/libnfsd/` | Embeddable server: RPC, XDR, NFS v3, MOUNT, NLM, NSM, portmapper, and state-storage hooks |
-| `src/znfsd/` | CLI daemon: arguments (`cli.zig`), ephemeral exports (`ephemeral.zig`), SQLite storage (`db.zig`), commands (`commands.zig`), the control socket (`control.zig`), and the daemon (`daemon.zig`); later the admin web server |
+| `src/znfsd/` | CLI daemon: arguments (`cli.zig`), ephemeral exports (`ephemeral.zig`), SQLite storage (`db.zig`), commands (`commands.zig`), the control socket (`control.zig`), the daemon (`daemon.zig`), and the activity monitor (`activity.zig`, `web.zig`, and its page in `web/`) |
 | `vendor/sqlite/` | The SQLite amalgamation; see its [README.md](vendor/sqlite/README.md) |
 | `src/znfsd/usage.txt` | `help` output; a copy of the Usage block in [AGENTS.md](AGENTS.md), kept identical |
 | `docs/specifications/` | Copies of the external specifications, indexed in its [README.md](docs/specifications/README.md) |
@@ -49,6 +49,17 @@ Windows needs the Client for NFS feature (`Enable-WindowsOptionalFeature -Online
 If a VM gets only a `169.254.x` address, the host's DHCP isn't answering; give it a static address on `192.168.64.0/24` with gateway `192.168.64.1` and DNS `1.1.1.1`.
 
 Test against each supported client: macOS 15.8+, Linux 6.12+, and Windows 10+. Boot install media from `~/Developer/Images` read-only, run VMs without audio, and save prepared clients as new layers rather than changing shared ones.
+
+## Web admin
+
+The activity monitor is a znfsd module (`web.zig`, `activity.zig`) in the daemon's process; libnfsd only offers the observer hook it feeds on. That suits today's monitor: read-only, loopback only, GET only, small.
+
+The deferred admin features (users and passwords, changes from the web, perhaps TLS or non-loopback access) should move it into its own process, so HTTP parsing, password checks, and sessions never run in the NFS daemon, possibly as root:
+
+* The snapshot is already a control-socket request (`znfsd activity`), so a separate web process needs nothing new.
+* `serve` starts `znfsd web` as a child, unprivileged, and gives it one end of a socket pair: no file permissions involved, and the daemon answers only what that channel allows (read-only until admin features exist).
+* Admin changes are the CLI's commands over that channel, so the web side never reimplements them.
+* Live updates: polling the snapshot each second, or a streaming `watch` request.
 
 ## Documentation
 

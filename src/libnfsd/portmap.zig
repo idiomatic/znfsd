@@ -275,7 +275,7 @@ test "serve and use a portmapper on loopback" {
     defer udp.close(io);
     var group: Io.Group = .init;
     defer group.cancel(io);
-    try group.concurrent(io, server.serveUdp, .{ io, testing.allocator, &programs, udp });
+    try group.concurrent(io, server.serveUdp, .{ io, testing.allocator, &programs, udp, null });
 
     var client: Client = try .init(io, udp.address, .{ .raw = .fromSeconds(2), .clock = .awake });
     defer client.deinit();

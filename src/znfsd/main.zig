@@ -65,7 +65,7 @@ fn run(
         return reply.status;
     }
     switch (c.noun) {
-        .stop => {
+        .stop, .activity => {
             try stderr.print("znfsd: no daemon answers at {s}\n", .{socket});
             return 1;
         },
@@ -113,4 +113,6 @@ test {
     _ = commands;
     _ = control;
     _ = daemon;
+    _ = @import("activity.zig");
+    _ = @import("web.zig");
 }

@@ -13,6 +13,8 @@ const ephemeral = @import("ephemeral.zig");
 const dbm = @import("db.zig");
 const commands = @import("commands.zig");
 const control = @import("control.zig");
+const activity_ = @import("activity.zig");
+const web = @import("web.zig");
 
 pub fn serve(
     io: Io,
@@ -109,9 +111,13 @@ pub fn serve(
         .files = undefined,
         .nlm = undefined,
         .nsm = undefined,
+        .table = undefined,
+        .activity = .init(gpa, io),
     };
+    defer d.activity.deinit();
     defer d.tables.deinit();
     const table = d.build(stderr) catch return 1;
+    d.table = table;
     for (rules.items) |r| if (r.client == .group and !table.groups.contains(r.client.group)) {
         try stderr.print("znfsd: {s}: no group {s}\n", .{ r.path, r.client.group });
         return 2;
@@ -190,13 +196,31 @@ pub fn serve(
         dr.nfs = &nfs;
         config.after_bind = dr.hook();
     }
+    config.observer = d.activity.observer();
+
+    // The activity monitor: wanted, not needed, so a taken port only warns.
+    const web_address = web.parseAddress(options.web orelse "127.0.0.1:8049") catch {
+        try stderr.print("znfsd: --web {s}: not [ADDR:]PORT\n", .{options.web.?});
+        return 2;
+    };
+    var web_server: ?net.Server = web_address.listen(io, .{ .reuse_address = true }) catch |err| blk: {
+        try stderr.print("znfsd: activity monitor: {f}: {t}\n", .{ web_address, err });
+        try stderr.flush();
+        break :blk null;
+    };
+    defer if (web_server) |*w| w.deinit(io);
     var diag: libnfsd.service.Diagnostic = .{};
     var result: Outcome = .running;
     var service = try io.concurrent(runService, .{ io, gpa, config, registrations.items, &diag, &result });
     var controller = try io.concurrent(control.serve, .{ io, gpa, &socket, d.handler() });
     var notifier = try io.concurrent(notifyRestart, .{ io, if (locking) previous else &.{}, state });
+    var monitor: ?Io.Future(Io.Cancelable!void) = if (web_server) |*w|
+        try io.concurrent(web.serve, .{ io, gpa, w, d.provider() })
+    else
+        null;
     var signal: c_int = 0;
     _ = std.c.sigwait(&signals, &signal);
+    if (monitor) |*m| m.cancel(io) catch {};
     notifier.cancel(io);
     _ = controller.cancel(io) catch {};
     _ = service.cancel(io);
@@ -231,6 +255,9 @@ const Daemon = struct {
     files: *libnfsd.files.Files,
     nlm: *libnfsd.nlm.Nlm,
     nsm: *libnfsd.nsm.Nsm,
+    /// The table in force, for the activity monitor.
+    table: *const exports.Table,
+    activity: activity_.Activity,
 
     /// Builds the table: stored rules and groups, with ephemeral ones laid
     /// over them by path and client, and by name.
@@ -266,6 +293,44 @@ const Daemon = struct {
         return table;
     }
 
+    fn provider(d: *Daemon) web.Provider {
+        return .{ .ptr = d, .write = writeSnapshot };
+    }
+
+    /// The activity monitor's snapshot: activity, exports, mounts, and locks.
+    fn writeSnapshot(ptr: *anyopaque, arena: std.mem.Allocator, w: *Io.Writer) anyerror!void {
+        const d: *Daemon = @ptrCast(@alignCast(ptr));
+        const Row3 = struct { path: []const u8, client: []const u8, options: []const u8 };
+        const LockRow = struct { host: []const u8, path: []const u8, range: []const u8, kind: []const u8 };
+        const table = @atomicLoad(*const exports.Table, &d.table, .acquire);
+        var export_rows: std.ArrayList(Row3) = .empty;
+        for (table.rules) |r| {
+            var cw: Io.Writer.Allocating = .init(arena);
+            try r.client.format(&cw.writer);
+            var ow: Io.Writer.Allocating = .init(arena);
+            try dbm.formatOptions(r.options, &ow.writer);
+            try export_rows.append(arena, .{ .path = r.path, .client = cw.written(), .options = ow.written() });
+        }
+        var lock_rows: std.ArrayList(LockRow) = .empty;
+        for (try d.nlm.locks.snapshot(d.io, arena)) |l| {
+            try lock_rows.append(arena, .{
+                .host = l.owner.host,
+                .path = try d.files.pathOf(d.io, arena, l.file.fsid, l.file.inode) orelse try std.fmt.allocPrint(arena, "inode {d}", .{l.file.inode}),
+                .range = if (l.range.end == libnfsd.locks.Range.eof)
+                    try std.fmt.allocPrint(arena, "{d}-", .{l.range.start})
+                else
+                    try std.fmt.allocPrint(arena, "{d}-{d}", .{ l.range.start, l.range.end - 1 }),
+                .kind = if (l.exclusive) "exclusive" else "shared",
+            });
+        }
+        try std.json.Stringify.value(.{
+            .activity = try d.activity.snapshot(d.io, arena),
+            .exports = export_rows.items,
+            .mounts = try d.mount.snapshot(d.io, arena),
+            .locks = lock_rows.items,
+        }, .{}, w);
+    }
+
     fn handler(d: *Daemon) control.Handler {
         return .{ .ptr = d, .handle = handle };
     }
@@ -291,6 +356,12 @@ const Daemon = struct {
                 _ = std.c.kill(std.c.getpid(), .TERM);
                 return 0;
             },
+            .activity => {
+                if (c.args.len > 0) return usage(err, "activity");
+                try writeSnapshot(d, arena, out);
+                try out.writeByte('\n');
+                return 0;
+            },
             .lock => return d.lockCommand(arena, c.verb.?, c.args, out, err),
             .@"export", .group, .mount, .map => {
                 const ctx: commands.Context = .{ .db = d.db, .arena = arena, .out = out, .err = err };
@@ -305,6 +376,7 @@ const Daemon = struct {
                         const table = d.build(err) catch return 1;
                         d.mount.setTable(table);
                         d.nfs.setTable(table);
+                        @atomicStore(*const exports.Table, &d.table, table, .release);
                     },
                 }
                 return 0;

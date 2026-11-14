@@ -17,6 +17,26 @@ pub const Context = struct {
     io: Io,
     from: net.IpAddress,
     protocol: net.Protocol,
+    /// Told of every call answered, as for an activity monitor.
+    observer: ?*const Observer = null,
+};
+
+/// One answered call, for an observer.
+pub const Observed = struct {
+    from: net.IpAddress,
+    protocol: net.Protocol,
+    prog: u32,
+    vers: u32,
+    proc: u32,
+    reply: std.meta.Tag(rpc.Reply),
+    /// Bytes of results.
+    bytes: usize,
+    nanoseconds: u64,
+};
+
+pub const Observer = struct {
+    ptr: *anyopaque,
+    observe: *const fn (ptr: *anyopaque, io: Io, call: Observed) void,
 };
 
 /// An RPC program: its number, supported versions, and handler.
@@ -50,7 +70,18 @@ pub fn dispatch(programs: []const Program, ctx: Context, message: []const u8, ou
             }
             var results: Io.Writer = .fixed(out[success_header..]);
             log.debug("{f} {t}: prog {d} vers {d} proc {d}: arrived", .{ ctx.from, ctx.protocol, call.prog, call.vers, call.proc });
+            const started = if (ctx.observer != null) Io.Clock.awake.now(ctx.io) else undefined;
             const reply = program.handle(program.ptr, ctx, call, &results);
+            if (ctx.observer) |o| o.observe(o.ptr, ctx.io, .{
+                .from = ctx.from,
+                .protocol = ctx.protocol,
+                .prog = call.prog,
+                .vers = call.vers,
+                .proc = call.proc,
+                .reply = reply,
+                .bytes = results.end,
+                .nanoseconds = @intCast(@max(0, started.durationTo(Io.Clock.awake.now(ctx.io)).nanoseconds)),
+            });
             log.debug("{f} {t}: prog {d} vers {d} proc {d}: {t}, {d} bytes", .{
                 ctx.from, ctx.protocol, call.prog, call.vers, call.proc, reply, results.end,
             });
@@ -74,7 +105,7 @@ fn encodeStatus(out: []u8, xid: u32, reply: rpc.Reply) []const u8 {
 }
 
 /// Serves RPC over UDP on `socket` until canceled.
-pub fn serveUdp(io: Io, gpa: std.mem.Allocator, programs: []const Program, socket: net.Socket) Io.Cancelable!void {
+pub fn serveUdp(io: Io, gpa: std.mem.Allocator, programs: []const Program, socket: net.Socket, observer: ?*const Observer) Io.Cancelable!void {
     const buf = gpa.alloc(u8, 2 * max_datagram) catch {
         log.err("udp: out of memory", .{});
         return;
@@ -91,7 +122,7 @@ pub fn serveUdp(io: Io, gpa: std.mem.Allocator, programs: []const Program, socke
             },
         };
         if (message.flags.trunc) continue;
-        const ctx: Context = .{ .io = io, .from = message.from, .protocol = .udp };
+        const ctx: Context = .{ .io = io, .from = message.from, .protocol = .udp, .observer = observer };
         const reply = dispatch(programs, ctx, message.data, out) orelse continue;
         socket.send(io, &message.from, reply) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
@@ -107,6 +138,7 @@ pub fn serveTcp(
     programs: []const Program,
     listener: *net.Server,
     max_record: usize,
+    observer: ?*const Observer,
 ) Io.Cancelable!void {
     var connections: Io.Group = .init;
     defer connections.cancel(io);
@@ -118,7 +150,7 @@ pub fn serveTcp(
                 continue;
             },
         };
-        connections.concurrent(io, serveConnection, .{ io, gpa, programs, stream, max_record }) catch |err| {
+        connections.concurrent(io, serveConnection, .{ io, gpa, programs, stream, max_record, observer }) catch |err| {
             log.warn("tcp connection: {t}", .{err});
             stream.close(io);
         };
@@ -131,6 +163,7 @@ fn serveConnection(
     programs: []const Program,
     stream: net.Stream,
     max_record: usize,
+    observer: ?*const Observer,
 ) Io.Cancelable!void {
     defer stream.close(io);
     const out = gpa.alloc(u8, max_record) catch return;
@@ -141,7 +174,7 @@ fn serveConnection(
     var write_buf: [16 * 1024]u8 = undefined;
     var reader = stream.reader(io, &read_buf);
     var writer = stream.writer(io, &write_buf);
-    const ctx: Context = .{ .io = io, .from = stream.socket.address, .protocol = .tcp };
+    const ctx: Context = .{ .io = io, .from = stream.socket.address, .protocol = .tcp, .observer = observer };
 
     while (true) {
         rpc.record.read(&reader.interface, gpa, &message, max_record) catch |err| {
@@ -225,6 +258,33 @@ test "dispatch to programs, versions, and procedures" {
     try testing.expectEqual(3, echo.calls);
 }
 
+test "an observer sees each answered call" {
+    var echo: Echo = .{};
+    const programs = [_]Program{echo.program()};
+    const Seen = struct {
+        calls: usize = 0,
+        last: Observed = undefined,
+        fn observe(ptr: *anyopaque, _: Io, call: Observed) void {
+            const s: *@This() = @ptrCast(@alignCast(ptr));
+            s.calls += 1;
+            s.last = call;
+        }
+    };
+    var seen: Seen = .{};
+    const observer: Observer = .{ .ptr = &seen, .observe = Seen.observe };
+    const ctx: Context = .{ .io = testing.io, .from = .{ .ip4 = .loopback(0) }, .protocol = .udp, .observer = &observer };
+    var call_buf: [64]u8 = undefined;
+    var out: [64]u8 = undefined;
+    _ = dispatch(&programs, ctx, encodeCall(&call_buf, 400000, 1, 1, "art\x00"), &out).?;
+    _ = dispatch(&programs, ctx, encodeCall(&call_buf, 400000, 1, 7, ""), &out).?;
+    try testing.expectEqual(2, seen.calls);
+    try testing.expectEqual(.proc_unavail, seen.last.reply);
+    try testing.expectEqual(7, seen.last.proc);
+    // Programs that don't exist never reach a handler, so aren't observed.
+    _ = dispatch(&programs, ctx, encodeCall(&call_buf, 400001, 1, 0, ""), &out).?;
+    try testing.expectEqual(2, seen.calls);
+}
+
 test "serve over UDP and TCP on loopback" {
     const io = testing.io;
     var echo: Echo = .{};
@@ -238,8 +298,8 @@ test "serve over UDP and TCP on loopback" {
 
     var group: Io.Group = .init;
     defer group.cancel(io);
-    try group.concurrent(io, serveUdp, .{ io, testing.allocator, &programs, udp });
-    try group.concurrent(io, serveTcp, .{ io, testing.allocator, &programs, &tcp, 4096 });
+    try group.concurrent(io, serveUdp, .{ io, testing.allocator, &programs, udp, null });
+    try group.concurrent(io, serveTcp, .{ io, testing.allocator, &programs, &tcp, 4096, null });
 
     var call_buf: [64]u8 = undefined;
     const call = encodeCall(&call_buf, 400000, 1, 1, "art\x00");

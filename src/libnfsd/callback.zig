@@ -103,7 +103,7 @@ test "call a program registered with a host's portmapper" {
     defer udp.close(io);
     var group: Io.Group = .init;
     defer group.cancel(io);
-    try group.concurrent(io, server.serveUdp, .{ io, testing.allocator, &programs, udp });
+    try group.concurrent(io, server.serveUdp, .{ io, testing.allocator, &programs, udp, null });
 
     const mapping: portmap.Mapping = .{ .prog = 0x20000777, .vers = 1, .prot = .udp, .port = udp.address.getPort() };
     if (!try probe.set(mapping)) return error.SkipZigTest;

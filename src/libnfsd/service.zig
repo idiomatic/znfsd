@@ -40,6 +40,8 @@ pub const Config = struct {
     /// Runs once every port is bound and registered, before any request is
     /// served, as for dropping root.
     after_bind: ?AfterBind = null,
+    /// Told of every call answered.
+    observer: ?*const server.Observer = null,
 };
 
 pub const AfterBind = struct {
@@ -141,8 +143,8 @@ pub fn run(io: Io, gpa: std.mem.Allocator, config: Config, registrations: []cons
     var group: Io.Group = .init;
     defer group.cancel(io);
     for (listeners.items) |*l| {
-        try group.concurrent(io, server.serveUdp, .{ io, gpa, l.programs, l.udp });
-        try group.concurrent(io, server.serveTcp, .{ io, gpa, l.programs, &l.tcp, config.max_record });
+        try group.concurrent(io, server.serveUdp, .{ io, gpa, l.programs, l.udp, config.observer });
+        try group.concurrent(io, server.serveTcp, .{ io, gpa, l.programs, &l.tcp, config.max_record, config.observer });
     }
     try group.await(io);
 }
@@ -286,7 +288,7 @@ test "register with an existing portmapper, serve, and unregister" {
     defer pmap_udp.close(io);
     var pmap_group: Io.Group = .init;
     defer pmap_group.cancel(io);
-    try pmap_group.concurrent(io, server.serveUdp, .{ io, testing.allocator, &pmap_programs, pmap_udp });
+    try pmap_group.concurrent(io, server.serveUdp, .{ io, testing.allocator, &pmap_programs, pmap_udp, null });
 
     var dummy: u8 = 0;
     const registrations = [_]Registration{.{

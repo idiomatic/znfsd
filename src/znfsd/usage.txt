@@ -6,6 +6,7 @@ znfsd [--socket PATH] [--run-as USER] [--bind ADDR ...] [--db PATH]
           [--map MAP:LOCAL=[REMOTE[,REMOTE ...]] ...]
           [PATH[:OPTION[,OPTION ...][:CLIENT[,CLIENT ...]]] ...]
     stop
+    activity                                   # the monitor's JSON snapshot
 
     export list [PATH]
     export add  PATH CLIENT [OPTION ...]

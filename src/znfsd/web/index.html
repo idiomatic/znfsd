@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>znfsd activity</title>
+<link rel="stylesheet" href="/style.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<header>
+  <h1>znfsd</h1>
+  <dl class="summary">
+    <div><dt>Up</dt><dd id="uptime">–</dd></div>
+    <div><dt>Calls</dt><dd id="total">–</dd></div>
+    <div><dt>Calls/s</dt><dd id="rate">–</dd></div>
+    <div><dt>Status</dt><dd id="status">connecting</dd></div>
+  </dl>
+</header>
+<main>
+  <section>
+    <h2>Clients</h2>
+    <table id="clients"><thead><tr><th>Address</th><th class="n">Calls</th><th class="n">Bytes out</th><th>Last seen</th></tr></thead><tbody></tbody></table>
+  </section>
+  <section>
+    <h2>Procedures</h2>
+    <table id="procedures"><thead><tr><th>Program</th><th>Procedure</th><th class="n">Calls</th><th class="n">Errors</th><th class="n">Average µs</th><th class="n">Bytes out</th></tr></thead><tbody></tbody></table>
+  </section>
+  <section>
+    <h2>Exports</h2>
+    <table id="exports"><thead><tr><th>Path</th><th>Client</th><th>Options</th></tr></thead><tbody></tbody></table>
+  </section>
+  <section>
+    <h2>Mounts</h2>
+    <table id="mounts"><thead><tr><th>Host</th><th>Path</th></tr></thead><tbody></tbody></table>
+  </section>
+  <section>
+    <h2>Locks</h2>
+    <table id="locks"><thead><tr><th>Host</th><th>Path</th><th>Range</th><th>Kind</th></tr></thead><tbody></tbody></table>
+  </section>
+  <section class="wide">
+    <h2>Recent calls</h2>
+    <table id="recent"><thead><tr><th>Time</th><th>Client</th><th>Program</th><th>Procedure</th><th>Outcome</th><th class="n">Bytes out</th><th class="n">µs</th></tr></thead><tbody></tbody></table>
+  </section>
+</main>
+</body>
+</html>

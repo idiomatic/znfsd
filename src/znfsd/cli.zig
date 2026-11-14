@@ -10,7 +10,7 @@ pub const Globals = struct {
     binds: []const []const u8 = &.{},
 };
 
-pub const Noun = enum { serve, stop, help, @"export", group, map, mount, lock };
+pub const Noun = enum { serve, stop, activity, help, @"export", group, map, mount, lock };
 
 pub const Verb = enum { list, add, set, del };
 
@@ -69,7 +69,7 @@ pub fn parse(arena: std.mem.Allocator, args: []const []const u8) Error!Invocatio
     const noun = std.meta.stringToEnum(Noun, args[i]) orelse return error.UnknownCommand;
     i += 1;
     switch (noun) {
-        .serve, .stop, .help => return .{
+        .serve, .stop, .activity, .help => return .{
             .globals = globals,
             .command = .{ .noun = noun, .args = args[i..] },
             .words = words,
@@ -164,7 +164,7 @@ fn allows(noun: Noun, verb: Verb) bool {
         .@"export" => true,
         .group, .map => verb != .set,
         .mount, .lock => verb == .list or verb == .del,
-        .serve, .stop, .help => false,
+        .serve, .stop, .activity, .help => false,
     };
 }
 
@@ -222,6 +222,13 @@ test "serve options, repeated groups and maps, and exports" {
     try testing.expectEqualStrings("/srv/home", s.exports[1]);
     try testing.expectError(error.BadPort, parseServe(arena.allocator(), &.{ "--lock-port", "70000" }));
     try testing.expectError(error.UnknownOption, parseServe(arena.allocator(), &.{"--skynet"}));
+}
+
+test "activity takes no verb" {
+    const inv = try parseTest(&.{"activity"});
+    try testing.expectEqual(Noun.activity, inv.command.noun);
+    try testing.expectEqual(null, inv.command.verb);
+    try testing.expectEqualStrings("activity", inv.words[0]);
 }
 
 test "bad options and commands" {

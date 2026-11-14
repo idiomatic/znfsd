@@ -2,7 +2,7 @@
 
 znfsd is an NFS v3 server for Linux and macOS hosts, serving macOS, Linux, and Windows clients. One process provides everything a v3 client needs: NFS, mountd, statd, lockd, and, when no portmapper is running, a portmapper too. It has few options, and its defaults are sensible.
 
-[AGENTS.md](AGENTS.md) is the authoritative specification; this page explains and illustrates it. The protocol specifications znfsd relies on are collected in [docs/specifications](docs/specifications/README.md). znfsd is under construction. So far, `serve` runs the portmapper logic, MOUNT, all of NFS v3, and locking (NLM and NSM, with restart recovery), with stored and ephemeral exports and groups; Linux 6.18 has mounted it read-write and locked, blocked, and reclaimed after a restart. Maps and `--run-as` work too. The `export`, `group`, `map`, `mount`, `lock`, and `stop` commands work, through the control socket when the daemon runs, so changes apply at once. Running as root, each request acts as its caller. macOS 27.2 and Windows 11 have mounted it too, read-write and locking. Still to come: the activity monitor.
+[AGENTS.md](AGENTS.md) is the authoritative specification; this page explains and illustrates it. The protocol specifications znfsd relies on are collected in [docs/specifications](docs/specifications/README.md). znfsd is under construction. So far, `serve` runs the portmapper logic, MOUNT, all of NFS v3, and locking (NLM and NSM, with restart recovery), with stored and ephemeral exports and groups; Linux 6.18 has mounted it read-write and locked, blocked, and reclaimed after a restart. Maps and `--run-as` work too. The `export`, `group`, `map`, `mount`, `lock`, and `stop` commands work, through the control socket when the daemon runs, so changes apply at once. Running as root, each request acts as its caller. macOS 27.2 and Windows 11 have mounted it too, read-write and locking. The activity monitor serves at `127.0.0.1:8049`.
 
 ## Why
 
@@ -118,7 +118,7 @@ File handles identify a file by filesystem and inode rather than path, so they s
 
 ## Activity monitor
 
-While serving, znfsd shows live activity at <http://127.0.0.1:8049>; `--web` moves it.
+While serving, znfsd shows live activity at <http://127.0.0.1:8049>: clients, calls by procedure with their timing, exports, mounts, locks, and the latest calls, refreshed each second. `--web [ADDR:]PORT` moves it, and `znfsd activity` prints the same snapshot as JSON, for scripts. There's no login, so it answers only on loopback by default, and there only to requests naming a loopback host.
 
 ## How it was made
 
