@@ -65,6 +65,11 @@ If a VM gets only a `169.254.x` address, the host's DHCP isn't answering; give i
 
 Test against each supported client: macOS 15.8+, Linux 6.12+, and Windows 10+. Boot install media from `~/Developer/Images` read-only, run VMs without audio, and save prepared clients as new layers rather than changing shared ones.
 
+## To do
+
+* Code review: libnfsd and znfsd, for correctness, clarity, and conformance to [AGENTS.md](AGENTS.md) and the [specifications](docs/specifications/README.md)
+* Security review: untrusted AUTH_SYS clients, export confinement and symbolic-link races, identity switching and `--run-as`, the control socket, and the web monitor
+
 ## File-system backends
 
 Deferred. File-system calls already pass through one narrow layer, `sys.zig` (about 30 operations: stat, safe open, the `*at` calls, directory reading, reads and writes, sync, capacity, and identity switching), which is where a `libnfsd.Fs` interface would go, letting embedders serve synthesized file systems (in memory for tests, SQLite or object stores, generated content, overlays). `std.Io` isn't the place: libnfsd uses it only for networking, and its file model lacks owners, modes, inodes, links, devices, and file-system IDs.
