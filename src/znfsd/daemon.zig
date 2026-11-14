@@ -40,16 +40,35 @@ pub fn serve(
     if (options.mount_port) |p| ports.mount = p;
     if (options.stat_port) |p| ports.stat = p;
     if (options.lock_port) |p| ports.lock = p;
-    const config: libnfsd.service.Config = .{
+    var config: libnfsd.service.Config = .{
         .binds = binds.items,
         .ports = ports,
         .portmap = if (options.no_portmap) .off else .auto,
     };
 
-    // Ephemeral groups and exports, checked once.
-    if (options.maps.len > 0) {
-        try stderr.writeAll("znfsd: --map: maps aren't implemented yet\n");
-        return 2;
+    // --run-as: resolved now, applied once every port is bound.
+    var drop: ?Drop = null;
+    if (invocation.globals.run_as) |user| {
+        if (!libnfsd.sys.isRoot()) {
+            try stderr.writeAll("znfsd: --run-as needs root\n");
+            return 2;
+        }
+        drop = Drop.init(arena, user, db.path, socket_path) catch {
+            try stderr.print("znfsd: --run-as {s}: no such user\n", .{user});
+            return 2;
+        };
+    }
+
+    // Ephemeral groups, maps, and exports, checked once.
+    var maps: std.StringArrayHashMapUnmanaged(std.ArrayList(exports.MapEntry)) = .empty;
+    for (options.maps) |text| {
+        const m = ephemeral.parseMap(arena, text) catch |err| {
+            try stderr.print("znfsd: --map {s}: {t}\n", .{ text, err });
+            return 2;
+        };
+        const gop = try maps.getOrPut(arena, m.name);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.appendSlice(arena, m.entries);
     }
     var groups: std.ArrayList(ephemeral.Group) = .empty;
     for (options.groups) |text| {
@@ -64,10 +83,6 @@ pub fn serve(
             try stderr.print("znfsd: {s}: {t}\n", .{ text, err });
             return 2;
         };
-        if (parsed.options.map != null) {
-            try stderr.print("znfsd: {s}: maps aren't implemented yet\n", .{text});
-            return 2;
-        }
         const path_buf = try arena.create([libnfsd.sys.max_path]u8);
         var path: []const u8 = undefined;
         const e = libnfsd.sys.canonical(parsed.path, path_buf, &path);
@@ -87,6 +102,8 @@ pub fn serve(
         .tables = .init(gpa),
         .ephemeral_rules = rules.items,
         .ephemeral_groups = groups.items,
+        .ephemeral_maps = &maps,
+        .maps_enabled = drop == null,
         .mount = undefined,
         .nfs = undefined,
         .files = undefined,
@@ -98,6 +115,14 @@ pub fn serve(
     for (rules.items) |r| if (r.client == .group and !table.groups.contains(r.client.group)) {
         try stderr.print("znfsd: {s}: no group {s}\n", .{ r.path, r.client.group });
         return 2;
+    };
+    for (table.rules) |r| if (r.options.map) |m| {
+        if (drop != null) {
+            try stderr.print("znfsd: {s}: map={s} is ignored: --run-as disables maps\n", .{ r.path, m });
+        } else if (!table.maps.contains(m)) {
+            try stderr.print("znfsd: {s}: no map {s}\n", .{ r.path, m });
+            return 2;
+        }
     };
 
     var mount: libnfsd.mount.Mount = .init(gpa, table);
@@ -161,6 +186,10 @@ pub fn serve(
     posix.sigaddset(&signals, .TERM);
     posix.sigprocmask(posix.SIG.BLOCK, &signals, null);
 
+    if (drop) |*dr| {
+        dr.nfs = &nfs;
+        config.after_bind = dr.hook();
+    }
     var diag: libnfsd.service.Diagnostic = .{};
     var result: Outcome = .running;
     var service = try io.concurrent(runService, .{ io, gpa, config, registrations.items, &diag, &result });
@@ -194,6 +223,9 @@ const Daemon = struct {
     tables: std.heap.ArenaAllocator,
     ephemeral_rules: []const exports.Rule,
     ephemeral_groups: []const ephemeral.Group,
+    ephemeral_maps: *const std.StringArrayHashMapUnmanaged(std.ArrayList(exports.MapEntry)),
+    /// False under --run-as, which can't act as other users.
+    maps_enabled: bool,
     mount: *libnfsd.mount.Mount,
     nfs: *libnfsd.nfs.Nfs,
     files: *libnfsd.files.Files,
@@ -210,15 +242,17 @@ const Daemon = struct {
             } else err.print("znfsd: database: a stored rule is invalid: {t}\n", .{e}) catch {};
             return e;
         };
-        for (stored.rules.items) |r| if (r.options.map != null) {
-            err.print("znfsd: stored rule for {s}: maps aren't implemented yet\n", .{r.path}) catch {};
-            return error.MapsUnimplemented;
-        };
         const table = try arena.create(exports.Table);
         table.* = .{};
         var it = stored.groups.iterator();
         while (it.next()) |g| try table.groups.put(arena, g.key_ptr.*, g.value_ptr.items);
         for (d.ephemeral_groups) |g| try table.groups.put(arena, g.name, g.clients);
+        if (d.maps_enabled) {
+            var maps = stored.maps.iterator();
+            while (maps.next()) |m| try table.maps.put(arena, m.key_ptr.*, .{ .entries = m.value_ptr.items });
+            var ephemeral_maps = d.ephemeral_maps.iterator();
+            while (ephemeral_maps.next()) |m| try table.maps.put(arena, m.key_ptr.*, .{ .entries = m.value_ptr.items });
+        }
 
         var rules: std.ArrayList(exports.Rule) = .empty;
         try rules.appendSlice(arena, d.ephemeral_rules);
@@ -258,7 +292,7 @@ const Daemon = struct {
                 return 0;
             },
             .lock => return d.lockCommand(arena, c.verb.?, c.args, out, err),
-            .@"export", .group, .mount => {
+            .@"export", .group, .mount, .map => {
                 const ctx: commands.Context = .{ .db = d.db, .arena = arena, .out = out, .err = err };
                 const status = try commands.run(ctx, c.noun, c.verb.?, c.args);
                 if (status != 0 or c.verb.? == .list) return status;
@@ -275,7 +309,7 @@ const Daemon = struct {
                 }
                 return 0;
             },
-            .serve, .help, .map => {
+            .serve, .help => {
                 try err.print("znfsd: {t}: not a command for the daemon\n", .{c.noun});
                 return 2;
             },
@@ -319,6 +353,53 @@ const Daemon = struct {
         }
     }
 };
+
+/// Dropping root for --run-as: the user, and what must become theirs first.
+const Drop = struct {
+    name: [:0]const u8,
+    uid: u32,
+    gid: u32,
+    db_path: []const u8,
+    socket_path: []const u8,
+    nfs: ?*libnfsd.nfs.Nfs = null,
+
+    fn init(arena: std.mem.Allocator, user: []const u8, db_path: []const u8, socket_path: []const u8) !Drop {
+        const name = try arena.dupeSentinel(u8, user, 0);
+        const pw = std.c.getpwnam(name) orelse return error.NoSuchUser;
+        return .{ .name = name, .uid = pw.uid, .gid = pw.gid, .db_path = db_path, .socket_path = socket_path };
+    }
+
+    fn hook(d: *Drop) libnfsd.service.AfterBind {
+        return .{ .ptr = d, .call = call };
+    }
+
+    fn call(ptr: *anyopaque, diag: *libnfsd.service.Diagnostic) bool {
+        const d: *Drop = @ptrCast(@alignCast(ptr));
+        // The database's directory and files, and the control socket.
+        var buf: [libnfsd.sys.max_path + 8]u8 = undefined;
+        if (std.fs.path.dirname(d.db_path)) |dir| chown(&buf, dir, "", d);
+        for ([_][]const u8{ "", "-wal", "-shm" }) |suffix| chown(&buf, d.db_path, suffix, d);
+        chown(&buf, d.socket_path, "", d);
+        if (initgroups(d.name, @bitCast(d.gid)) != 0 or std.c.setgid(d.gid) != 0 or std.c.setuid(d.uid) != 0) {
+            diag.set("--run-as {s}: can't drop root", .{d.name});
+            return false;
+        }
+        if (std.c.setuid(0) == 0) {
+            diag.set("--run-as {s}: root wasn't dropped", .{d.name});
+            return false;
+        }
+        // Files are now reached as the user, who can't give them to others.
+        if (d.nfs) |n| n.root = false;
+        return true;
+    }
+
+    fn chown(buf: []u8, path: []const u8, suffix: []const u8, d: *const Drop) void {
+        const z = std.fmt.bufPrintSentinel(buf, "{s}{s}", .{ path, suffix }, 0) catch return;
+        _ = std.c.fchownat(std.c.AT.FDCWD, z, d.uid, d.gid, 0);
+    }
+};
+
+extern "c" fn initgroups(user: [*:0]const u8, group: c_int) c_int;
 
 fn usage(err: *Io.Writer, text: []const u8) !u8 {
     try err.print("znfsd: usage: znfsd {s}\n", .{text});

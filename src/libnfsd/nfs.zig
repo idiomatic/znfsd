@@ -239,6 +239,10 @@ const Request = struct {
     n: *Nfs,
     /// The export table when the request arrived.
     table: *const exports.Table,
+    /// The map of the rule covering the last file found, if any.
+    map: ?exports.Map = null,
+    /// Supplementary GIDs after mapping.
+    gid_buf: [rpc.AuthSys.max_gids]u32 = undefined,
     ctx: server.Context,
     auth: rpc.AuthSys,
     d: xdr.Decoder,
@@ -274,6 +278,34 @@ const Request = struct {
         }
     }
 
+    /// Attributes as the client sees them: owners mapped back to its IDs.
+    fn outward(r: *const Request, a: sys.Attr) sys.Attr {
+        const m = r.map orelse return a;
+        var out = a;
+        out.uid = m.remoteUid(a.uid);
+        out.gid = m.remoteGid(a.gid);
+        return out;
+    }
+
+    fn fattrOut(r: *Request, a: sys.Attr) Error!void {
+        try fattr(r.e, r.outward(a));
+    }
+
+    fn postOp(r: *Request, a: ?sys.Attr) Error!void {
+        try postOpAttr(r.e, if (a) |x| r.outward(x) else null);
+    }
+
+    fn wccData(r: *Request, pre: ?sys.Attr, post: ?sys.Attr) Error!void {
+        try wcc(r.e, pre, if (post) |x| r.outward(x) else null);
+    }
+
+    /// Owners a client asks to set, as host IDs.
+    fn inward(r: *const Request, s: *Sattr) void {
+        const m = r.map orelse return;
+        if (s.uid) |u| s.uid = m.localUid(u);
+        if (s.gid) |g| s.gid = m.localGid(g);
+    }
+
     fn status(r: *Request, s: Status) Error!void {
         try r.e.enumeration(s);
     }
@@ -283,14 +315,29 @@ const Request = struct {
         try r.e.boolean(false);
     }
 
-    /// The caller's credentials under `rule`'s squashing.
-    fn creds(r: *const Request, rule: *const exports.Rule) Creds {
-        const anon: Creds = .{ .uid = r.n.nobody.uid, .gid = r.n.nobody.gid, .gids = &.{} };
-        return switch (rule.options.squash) {
-            .all => anon,
-            .root => if (r.auth.uid == 0) anon else .{ .uid = r.auth.uid, .gid = r.auth.gid, .gids = r.auth.gids() },
-            .none => .{ .uid = r.auth.uid, .gid = r.auth.gid, .gids = r.auth.gids() },
+    /// The caller's credentials under `rule`'s squashing and map: squashed
+    /// callers act as the map's anon, else the host's `nobody`.
+    fn creds(r: *Request, rule: *const exports.Rule) Creds {
+        const m = r.mapOf(rule);
+        const anon: Creds = .{
+            .uid = if (m) |x| x.anonUid() orelse r.n.nobody.uid else r.n.nobody.uid,
+            .gid = if (m) |x| x.anonGid() orelse r.n.nobody.gid else r.n.nobody.gid,
+            .gids = &.{},
         };
+        switch (rule.options.squash) {
+            .all => return anon,
+            .root => if (r.auth.uid == 0) return anon,
+            .none => {},
+        }
+        const x = m orelse return .{ .uid = r.auth.uid, .gid = r.auth.gid, .gids = r.auth.gids() };
+        const gids = r.auth.gids();
+        for (gids, r.gid_buf[0..gids.len]) |g, *out| out.* = x.localGid(g);
+        return .{ .uid = x.localUid(r.auth.uid), .gid = x.localGid(r.auth.gid), .gids = r.gid_buf[0..gids.len] };
+    }
+
+    fn mapOf(r: *const Request, rule: *const exports.Rule) ?exports.Map {
+        const name = rule.options.map orelse return null;
+        return r.table.maps.get(name);
     }
 
     /// Decodes a handle and finds its file, keeping its path in `buf`, or
@@ -304,6 +351,7 @@ const Request = struct {
             error.Canceled => return error.Canceled,
         };
         const match = r.table.match(path, r.ctx.from, null) orelse return .{ .failed = .acces };
+        r.map = r.mapOf(match.rule);
         return .{ .found = .{ .handle = h, .path = path, .attr = attr, .match = match } };
     }
 
@@ -317,7 +365,7 @@ const Request = struct {
             .failed => |s| return r.status(s),
         };
         try r.status(.ok);
-        try fattr(r.e, f.attr);
+        try r.fattrOut(f.attr);
     }
 
     fn lookup(r: *Request) Error!void {
@@ -326,7 +374,7 @@ const Request = struct {
             .failed => |s| {
                 _ = try r.d.string(max_path);
                 try r.status(s);
-                return postOpAttr(r.e, null);
+                return r.postOp(null);
             },
         };
         const name = try r.d.string(max_path);
@@ -358,8 +406,8 @@ const Request = struct {
         try r.n.files.remember(r.ctx.io, h, target);
         try r.status(.ok);
         try r.e.opaque_(&h.encode());
-        try postOpAttr(r.e, attr);
-        try postOpAttr(r.e, dir.attr);
+        try r.postOp(attr);
+        try r.postOp(dir.attr);
     }
 
     fn access(r: *Request) Error!void {
@@ -368,7 +416,7 @@ const Request = struct {
             .failed => |s| {
                 _ = try r.d.u32_();
                 try r.status(s);
-                return postOpAttr(r.e, null);
+                return r.postOp(null);
             },
         };
         const wanted = try r.d.u32_();
@@ -387,7 +435,7 @@ const Request = struct {
         }
         if (f.match.rule.options.read_only) granted &= ~(Access.modify | Access.extend | Access.delete);
         try r.status(.ok);
-        try postOpAttr(r.e, f.attr);
+        try r.postOp(f.attr);
         try r.e.u32_(granted & wanted);
     }
 
@@ -396,18 +444,18 @@ const Request = struct {
             .found => |f| f,
             .failed => |s| {
                 try r.status(s);
-                return postOpAttr(r.e, null);
+                return r.postOp(null);
             },
         };
         if (ftype(f.attr.mode) != .lnk) {
             try r.status(.inval);
-            return postOpAttr(r.e, f.attr);
+            return r.postOp(f.attr);
         }
         var buf: [max_path]u8 = undefined;
         var target: []const u8 = undefined;
         const e = sys.readLink(f.path, &buf, &target);
         try r.status(.fromErrno(e));
-        try postOpAttr(r.e, f.attr);
+        try r.postOp(f.attr);
         if (e == .SUCCESS) try r.e.string(target);
     }
 
@@ -419,7 +467,7 @@ const Request = struct {
             .found => |f| f,
             .failed => |s| {
                 try r.status(s);
-                return postOpAttr(r.e, null);
+                return r.postOp(null);
             },
         };
         const fail = switch (ftype(f.attr.mode)) {
@@ -429,7 +477,7 @@ const Request = struct {
         };
         if (fail) |s| {
             try r.status(s);
-            return postOpAttr(r.e, f.attr);
+            return r.postOp(f.attr);
         }
         // Fit the reply: status, attributes, count, eof, and length take
         // under 128 bytes.
@@ -446,7 +494,7 @@ const Request = struct {
             sys.closeFd(fd);
         }
         try r.status(.fromErrno(e));
-        try postOpAttr(r.e, f.attr);
+        try r.postOp(f.attr);
         if (e != .SUCCESS) return;
         try r.e.u32_(@intCast(got));
         try r.e.boolean(offset + got >= f.attr.size);
@@ -463,20 +511,20 @@ const Request = struct {
             .found => |f| f,
             .failed => |s| {
                 try r.status(s);
-                return postOpAttr(r.e, null);
+                return r.postOp(null);
             },
         };
         if (ftype(dir.attr.mode) != .dir) {
             try r.status(.notdir);
-            return postOpAttr(r.e, dir.attr);
+            return r.postOp(dir.attr);
         }
         if (!r.creds(dir.match.rule).allows(dir.attr, 4)) {
             try r.status(.acces);
-            return postOpAttr(r.e, dir.attr);
+            return r.postOp(dir.attr);
         }
         if (maxcount < 256) {
             try r.status(.toosmall);
-            return postOpAttr(r.e, dir.attr);
+            return r.postOp(dir.attr);
         }
         var reader: sys.DirReader = undefined;
         var dir_fd: sys.Fd = undefined;
@@ -485,12 +533,12 @@ const Request = struct {
         if (e == .SUCCESS) e = sys.DirReader.fromFd(dir_fd, &reader);
         if (e != .SUCCESS) {
             try r.status(.fromErrno(e));
-            return postOpAttr(r.e, dir.attr);
+            return r.postOp(dir.attr);
         }
         defer reader.close();
 
         try r.status(.ok);
-        try postOpAttr(r.e, dir.attr);
+        try r.postOp(dir.attr);
         var verf: [8]u8 = undefined;
         std.mem.writeInt(u32, verf[0..4], @truncate(@as(u64, @bitCast(dir.attr.mtime.sec))), .big);
         std.mem.writeInt(u32, verf[4..8], dir.attr.mtime.nsec, .big);
@@ -527,7 +575,7 @@ const Request = struct {
                 if (path != null and sys.lstat(path.?, &attr) == .SUCCESS) {
                     const h: fh.Handle = .fromAttr(export_id, attr);
                     try r.n.files.remember(r.ctx.io, h, path.?);
-                    try postOpAttr(r.e, attr);
+                    try r.postOp(attr);
                     try r.e.boolean(true);
                     try r.e.opaque_(&h.encode());
                 } else {
@@ -545,13 +593,13 @@ const Request = struct {
             .found => |f| f,
             .failed => |s| {
                 try r.status(s);
-                return postOpAttr(r.e, null);
+                return r.postOp(null);
             },
         };
         var s: sys.FsStat = undefined;
         const e = sys.fsStat(f.path, &s);
         try r.status(.fromErrno(e));
-        try postOpAttr(r.e, f.attr);
+        try r.postOp(f.attr);
         if (e != .SUCCESS) return;
         try r.e.u64_(s.blocks * s.block_size);
         try r.e.u64_(s.blocks_free * s.block_size);
@@ -567,11 +615,11 @@ const Request = struct {
             .found => |f| f,
             .failed => |s| {
                 try r.status(s);
-                return postOpAttr(r.e, null);
+                return r.postOp(null);
             },
         };
         try r.status(.ok);
-        try postOpAttr(r.e, f.attr);
+        try r.postOp(f.attr);
         try r.e.u32_(max_transfer); // rtmax
         try r.e.u32_(max_transfer); // rtpref
         try r.e.u32_(4096); // rtmult
@@ -591,11 +639,11 @@ const Request = struct {
             .found => |f| f,
             .failed => |s| {
                 try r.status(s);
-                return postOpAttr(r.e, null);
+                return r.postOp(null);
             },
         };
         try r.status(.ok);
-        try postOpAttr(r.e, f.attr);
+        try r.postOp(f.attr);
         try r.e.u32_(32767); // linkmax
         try r.e.u32_(max_name);
         try r.e.boolean(true); // no_trunc
@@ -618,11 +666,13 @@ const Request = struct {
                 return r.emptyWcc();
             },
         };
-        const st = r.applySattr(f, s, guard);
+        var mapped = s;
+        r.inward(&mapped);
+        const st = r.applySattr(f, mapped, guard);
         var post: sys.Attr = undefined;
         const have_post = sys.lstat(f.path, &post) == .SUCCESS;
         try r.status(st);
-        try wcc(r.e, f.attr, if (have_post) post else null);
+        try r.wccData(f.attr, if (have_post) post else null);
     }
 
     /// Checks and applies `s` to `f`'s file.
@@ -750,7 +800,7 @@ const Request = struct {
         };
         if (fail) |st| {
             try r.status(st);
-            return wcc(r.e, f.attr, f.attr);
+            return r.wccData(f.attr, f.attr);
         }
         const n = @min(count, data.len);
         var fd: sys.Fd = undefined;
@@ -763,7 +813,7 @@ const Request = struct {
             sys.closeFd(fd);
         }
         try r.status(.fromErrno(e));
-        try wcc(r.e, f.attr, if (e == .SUCCESS) post else null);
+        try r.wccData(f.attr, if (e == .SUCCESS) post else null);
         if (e != .SUCCESS) return;
         try r.e.u32_(@intCast(n));
         try r.e.u32_(2); // FILE_SYNC
@@ -789,7 +839,7 @@ const Request = struct {
             sys.closeFd(fd);
         }
         try r.status(.ok);
-        try wcc(r.e, f.attr, f.attr);
+        try r.wccData(f.attr, f.attr);
         try r.e.fixedOpaque(&r.n.verifier);
     }
 
@@ -877,17 +927,17 @@ const Request = struct {
             if (w.path(&buf)) |p| try r.n.files.remember(r.ctx.io, h, p);
             try r.e.boolean(true);
             try r.e.opaque_(&h.encode());
-            try postOpAttr(r.e, attr);
+            try r.postOp(attr);
         } else {
             try r.e.boolean(false);
-            try postOpAttr(r.e, null);
+            try r.postOp(null);
         }
-        try wcc(r.e, w.dir.attr, w.post());
+        try r.wccData(w.dir.attr, w.post());
     }
 
     fn whereFailed(r: *Request, failed: anytype) Error!void {
         try r.status(failed.status);
-        try wcc(r.e, failed.attr, failed.attr);
+        try r.wccData(failed.attr, failed.attr);
     }
 
     fn create(r: *Request) Error!void {
@@ -906,6 +956,7 @@ const Request = struct {
             .ok => {},
         }
         defer w.close();
+        r.inward(&s);
 
         // EXCLUSIVE keeps its verifier in the file's times, so a retransmitted
         // CREATE finds its own file and succeeds.
@@ -923,7 +974,7 @@ const Request = struct {
         }
         if (e != .SUCCESS) {
             try r.status(.fromErrno(e));
-            return wcc(r.e, w.dir.attr, w.post());
+            return r.wccData(w.dir.attr, w.post());
         }
         defer sys.closeFd(fd);
         if (how == 2) {
@@ -935,7 +986,7 @@ const Request = struct {
         if (e == .SUCCESS and how != 2 and (s.atime != .omit or s.mtime != .omit)) e = sys.setTimesFd(fd, s.atime, s.mtime);
         if (e != .SUCCESS) {
             try r.status(.fromErrno(e));
-            return wcc(r.e, w.dir.attr, w.post());
+            return r.wccData(w.dir.attr, w.post());
         }
         return r.created(&w);
     }
@@ -978,9 +1029,10 @@ const Request = struct {
             .ok => {},
         }
         defer w.close();
+        r.inward(&s);
         if (bad_type) {
             try r.status(.badtype);
-            return wcc(r.e, w.dir.attr, w.post());
+            return r.wccData(w.dir.attr, w.post());
         }
         var e: sys.E = switch (kind) {
             .dir => sys.mkdirIn(w.fd, w.name, s.mode orelse 0o755),
@@ -995,7 +1047,7 @@ const Request = struct {
         if (e == .SUCCESS) e = r.settle(&w, s, if (kind == .lnk) .lnk else kind);
         if (e != .SUCCESS) {
             try r.status(.fromErrno(e));
-            return wcc(r.e, w.dir.attr, w.post());
+            return r.wccData(w.dir.attr, w.post());
         }
         return r.created(&w);
     }
@@ -1032,7 +1084,7 @@ const Request = struct {
             break :st .fromErrno(e);
         };
         try r.status(st);
-        try wcc(r.e, w.dir.attr, w.post());
+        try r.wccData(w.dir.attr, w.post());
     }
 
     fn rename(r: *Request) Error!void {
@@ -1047,8 +1099,8 @@ const Request = struct {
             try r.status(st);
             const fa = if (from_result == .failed) from_result.failed.attr else from.dir.attr;
             const ta = if (to_result == .failed) to_result.failed.attr else to.dir.attr;
-            try wcc(r.e, fa, fa);
-            return wcc(r.e, ta, ta);
+            try r.wccData(fa, fa);
+            return r.wccData(ta, ta);
         }
         defer from.close();
         defer to.close();
@@ -1077,8 +1129,8 @@ const Request = struct {
             };
         }
         try r.status(st);
-        try wcc(r.e, from.dir.attr, from.post());
-        try wcc(r.e, to.dir.attr, to.post());
+        try r.wccData(from.dir.attr, from.post());
+        try r.wccData(to.dir.attr, to.post());
     }
 
     fn link(r: *Request) Error!void {
@@ -1090,15 +1142,15 @@ const Request = struct {
             .failed => |st| {
                 if (result == .ok) w.close();
                 try r.status(st);
-                try postOpAttr(r.e, null);
-                return wcc(r.e, null, null);
+                try r.postOp(null);
+                return r.wccData(null, null);
             },
         };
         switch (result) {
             .failed => |failed| {
                 try r.status(failed.status);
-                try postOpAttr(r.e, f.attr);
-                return wcc(r.e, failed.attr, failed.attr);
+                try r.postOp(f.attr);
+                return r.wccData(failed.attr, failed.attr);
             },
             .ok => {},
         }
@@ -1120,8 +1172,8 @@ const Request = struct {
         var post: sys.Attr = undefined;
         const have = sys.statIn(w.fd, w.name, &post) == .SUCCESS and post.ino == f.handle.inode;
         try r.status(st);
-        try postOpAttr(r.e, if (have) post else f.attr);
-        try wcc(r.e, w.dir.attr, w.post());
+        try r.postOp(if (have) post else f.attr);
+        try r.wccData(w.dir.attr, w.post());
     }
 };
 
@@ -1256,6 +1308,9 @@ const Fixture = struct {
     mount: mount.Mount,
     out: [70000]u8 = undefined,
     from: net.IpAddress,
+    /// The client's UID and GID; by default, those running the tests.
+    uid: u32 = 0,
+    gid: u32 = 0,
 
     fn init(f: *Fixture) !void {
         const io = testing.io;
@@ -1273,6 +1328,8 @@ const Fixture = struct {
         f.nfs = .init(testing.allocator, &f.table, &f.files, "znfsd-t\x00".*);
         f.mount = .init(testing.allocator, &f.table);
         f.from = try .parse("10.1.2.3", 800);
+        f.uid = std.c.getuid();
+        f.gid = std.c.getgid();
     }
 
     fn deinit(f: *Fixture) void {
@@ -1287,7 +1344,7 @@ const Fixture = struct {
     fn call(f: *Fixture, p: server.Program, proc: u32, args: []const u8) ![]const u8 {
         var cred_buf: [64]u8 = undefined;
         var cw: Io.Writer = .fixed(&cred_buf);
-        const auth: rpc.AuthSys = .{ .stamp = 0, .machine_name = "perihelion", .uid = std.c.getuid(), .gid = std.c.getgid() };
+        const auth: rpc.AuthSys = .{ .stamp = 0, .machine_name = "perihelion", .uid = f.uid, .gid = f.gid };
         try auth.encode(.init(&cw));
         var buf: [2048]u8 = undefined;
         var w: Io.Writer = .fixed(&buf);
@@ -1601,6 +1658,49 @@ test "create, write, set attributes, rename, link, and remove" {
     try e.string("..");
     try sattrMode(e, null);
     _ = try expectStatus(.exist, try f.call(nfs, @backingInt(Proc.mkdir), a.bytes()));
+}
+
+test "maps translate callers and owners" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const me = std.c.getuid();
+    const entries = [_]exports.MapEntry{
+        .{ .local = .{ .uid = me }, .remote = .{ .uid = 1000 } },
+        .{ .local = .{ .uid = 65534 }, .remote = null },
+    };
+    try f.table.maps.put(testing.allocator, "m", .{ .entries = &entries });
+    defer f.table.maps.deinit(testing.allocator);
+    f.rules[0].options.map = "m";
+    f.uid = 1000;
+    const root = try f.rootHandle();
+    var a: Args = .{};
+
+    // Client UID 1000 acts as the test user: it may create here, and sees
+    // the new file as its own.
+    var e = a.start(root);
+    try e.string("art");
+    try e.u32_(0);
+    try sattrMode(e, 0o644);
+    var d = try expectStatus(.ok, try f.call(f.nfs.program(), @backingInt(Proc.create), a.bytes()));
+    try testing.expect(try d.boolean());
+    _ = try d.opaque_(64);
+    try testing.expect(try d.boolean());
+    _ = try d.fixedOpaque(12); // type, mode, nlink
+    try testing.expectEqual(1000, try d.u32_());
+    var attr: sys.Attr = undefined;
+    const path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/art", .{f.root}, 0);
+    defer testing.allocator.free(path);
+    try testing.expectEqual(sys.E.SUCCESS, sys.lstat(path, &attr));
+    try testing.expectEqual(me, attr.uid);
+
+    // An unmapped client acts as the anon, who may not.
+    f.uid = 4242;
+    e = a.start(root);
+    try e.string("skynet");
+    try e.u32_(0);
+    try sattrMode(e, null);
+    _ = try expectStatus(.acces, try f.call(f.nfs.program(), @backingInt(Proc.create), a.bytes()));
 }
 
 test "read-only exports refuse writes" {

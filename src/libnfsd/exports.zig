@@ -172,10 +172,81 @@ pub const Rule = struct {
 
 pub const Groups = std.StringHashMapUnmanaged([]const Client);
 
-/// Export rules and the groups they name.
+/// A UID, a GID, or both, as written `[UID][:GID]`.
+pub const Ids = struct {
+    uid: ?u32 = null,
+    gid: ?u32 = null,
+
+    pub fn parse(text: []const u8) error{BadId}!Ids {
+        const colon = std.mem.indexOfScalar(u8, text, ':');
+        const uid_text = text[0 .. colon orelse text.len];
+        const gid_text = if (colon) |c| text[c + 1 ..] else "";
+        const ids: Ids = .{
+            .uid = if (uid_text.len > 0) std.fmt.parseInt(u32, uid_text, 10) catch return error.BadId else null,
+            .gid = if (gid_text.len > 0) std.fmt.parseInt(u32, gid_text, 10) catch return error.BadId else null,
+        };
+        if (ids.uid == null and ids.gid == null) return error.BadId;
+        return ids;
+    }
+
+    pub fn format(ids: Ids, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        if (ids.uid) |u| try w.print("{d}", .{u});
+        if (ids.gid) |g| try w.print(":{d}", .{g});
+    }
+};
+
+/// One map entry: client IDs that act as a host ID, or, with no remote
+/// IDs, the map's anon.
+pub const MapEntry = struct {
+    local: Ids,
+    remote: ?Ids,
+};
+
+/// Translates client IDs to host IDs, UIDs and GIDs independently.
+pub const Map = struct {
+    entries: []const MapEntry,
+
+    /// The host ID for a client UID: its mapping, else the anon's, else itself.
+    pub fn localUid(m: Map, uid: u32) u32 {
+        for (m.entries) |e| if (e.remote) |r| if (r.uid == uid) if (e.local.uid) |l| return l;
+        return m.anonUid() orelse uid;
+    }
+
+    pub fn localGid(m: Map, gid: u32) u32 {
+        for (m.entries) |e| if (e.remote) |r| if (r.gid == gid) if (e.local.gid) |l| return l;
+        return m.anonGid() orelse gid;
+    }
+
+    /// The client ID to show for a host UID: the first client UID mapped to
+    /// it, else itself.
+    pub fn remoteUid(m: Map, uid: u32) u32 {
+        for (m.entries) |e| if (e.local.uid == uid) if (e.remote) |r| if (r.uid) |ru| return ru;
+        return uid;
+    }
+
+    pub fn remoteGid(m: Map, gid: u32) u32 {
+        for (m.entries) |e| if (e.local.gid == gid) if (e.remote) |r| if (r.gid) |rg| return rg;
+        return gid;
+    }
+
+    pub fn anonUid(m: Map) ?u32 {
+        for (m.entries) |e| if (e.remote == null) if (e.local.uid) |u| return u;
+        return null;
+    }
+
+    pub fn anonGid(m: Map) ?u32 {
+        for (m.entries) |e| if (e.remote == null) if (e.local.gid) |g| return g;
+        return null;
+    }
+};
+
+pub const Maps = std.StringHashMapUnmanaged(Map);
+
+/// Export rules and the groups and maps they name.
 pub const Table = struct {
     rules: []const Rule = &.{},
     groups: Groups = .empty,
+    maps: Maps = .empty,
 
     /// Distinct exported paths, in rule order.
     pub fn paths(t: *const Table, arena: std.mem.Allocator) std.mem.Allocator.Error![]const []const u8 {
@@ -300,6 +371,36 @@ test "the most specific client wins, whole" {
     try testing.expectEqual(null, t.match("/srv/home", ip("192.168.1.1"), null));
     try testing.expectEqual(null, t.match("/srvx", ip("10.1.2.3"), null));
     try testing.expectEqual(null, t.match("/etc", ip("10.1.2.3"), null));
+}
+
+test "maps translate UIDs and GIDs independently, with anon" {
+    const entries = [_]MapEntry{
+        .{ .local = .{ .uid = 501 }, .remote = .{ .uid = 1000 } },
+        .{ .local = .{ .uid = 501 }, .remote = .{ .uid = 1001 } },
+        .{ .local = .{ .gid = 20 }, .remote = .{ .gid = 100 } },
+        .{ .local = .{ .uid = 600, .gid = 60 }, .remote = .{ .uid = 2000, .gid = 200 } },
+    };
+    const m: Map = .{ .entries = &entries };
+    try testing.expectEqual(501, m.localUid(1001));
+    try testing.expectEqual(1000, m.remoteUid(501));
+    try testing.expectEqual(20, m.localGid(100));
+    try testing.expectEqual(60, m.localGid(200));
+    try testing.expectEqual(4242, m.localUid(4242)); // no anon: passes through
+    try testing.expectEqual(77, m.remoteUid(77));
+
+    const with_anon = entries ++ [_]MapEntry{.{ .local = .{ .uid = 65534 }, .remote = null }};
+    const a: Map = .{ .entries = &with_anon };
+    try testing.expectEqual(65534, a.localUid(4242));
+    try testing.expectEqual(4242, a.localGid(4242)); // the anon sets no GID
+    try testing.expectEqual(65534, a.anonUid().?);
+}
+
+test "IDs as written" {
+    try testing.expectEqual(Ids{ .uid = 501 }, try Ids.parse("501"));
+    try testing.expectEqual(Ids{ .gid = 20 }, try Ids.parse(":20"));
+    try testing.expectEqual(Ids{ .uid = 501, .gid = 20 }, try Ids.parse("501:20"));
+    try testing.expectError(error.BadId, Ids.parse(":"));
+    try testing.expectError(error.BadId, Ids.parse("art"));
 }
 
 test "paths contain subpaths by whole components" {

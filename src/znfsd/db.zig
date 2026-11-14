@@ -34,7 +34,7 @@ const sqlite = struct {
 pub const Error = error{ Sqlite, OutOfMemory };
 
 /// The schema's version, in `PRAGMA user_version`.
-const schema_version = 3;
+const schema_version = 4;
 const schema =
     \\CREATE TABLE IF NOT EXISTS export_rules (
     \\  path TEXT NOT NULL,
@@ -60,6 +60,12 @@ const schema =
     \\  name TEXT PRIMARY KEY,
     \\  address TEXT NOT NULL
     \\);
+    \\CREATE TABLE IF NOT EXISTS map_entries (
+    \\  name TEXT NOT NULL,
+    \\  local TEXT NOT NULL,
+    \\  remote TEXT NOT NULL,
+    \\  PRIMARY KEY (name, remote)
+    \\);
     \\CREATE TABLE IF NOT EXISTS file_handles (
     \\  fsid TEXT NOT NULL,
     \\  inode INTEGER NOT NULL,
@@ -70,6 +76,8 @@ const schema =
 
 pub const Db = struct {
     handle: ?*anyopaque,
+    /// Where the database is, for --run-as to hand it over.
+    path: []const u8 = "",
     /// The last error's message, for showing.
     message: [256]u8 = undefined,
     message_len: usize = 0,
@@ -79,7 +87,7 @@ pub const Db = struct {
     pub fn open(path: [:0]const u8) Error!Db {
         var handle: ?*anyopaque = null;
         const rc = sqlite.sqlite3_open_v2(path, &handle, sqlite.open_readwrite | sqlite.open_create | sqlite.open_fullmutex, null);
-        var db: Db = .{ .handle = handle };
+        var db: Db = .{ .handle = handle, .path = path };
         if (rc != sqlite.ok) {
             db.remember();
             _ = sqlite.sqlite3_close_v2(handle);
@@ -208,6 +216,38 @@ pub const Db = struct {
     pub fn deleteMembers(db: *Db, name: []const u8, client: ?[]const u8) Error!usize {
         if (client) |c| return db.run("DELETE FROM group_members WHERE name = ?1 AND client = ?2", &.{ name, c });
         return db.run("DELETE FROM group_members WHERE name = ?1", &.{name});
+    }
+
+    // Maps. Each row is one client ID, or with `remote` empty, the anon.
+
+    pub const StoredMapEntry = struct { name: []const u8, local: []const u8, remote: []const u8 };
+
+    pub fn mapEntries(db: *Db, arena: std.mem.Allocator, name: ?[]const u8) Error![]StoredMapEntry {
+        var stmt = if (name) |n|
+            try db.prepare("SELECT name, local, remote FROM map_entries WHERE name = ?1 ORDER BY name, remote", &.{n})
+        else
+            try db.prepare("SELECT name, local, remote FROM map_entries ORDER BY name, remote", &.{});
+        defer stmt.finish();
+        var out: std.ArrayList(StoredMapEntry) = .empty;
+        while (try stmt.next()) {
+            try out.append(arena, .{
+                .name = try arena.dupe(u8, stmt.text(0)),
+                .local = try arena.dupe(u8, stmt.text(1)),
+                .remote = try arena.dupe(u8, stmt.text(2)),
+            });
+        }
+        return out.items;
+    }
+
+    /// Adds or replaces the entry for `remote` ("" for the anon).
+    pub fn putMapEntry(db: *Db, name: []const u8, local: []const u8, remote: []const u8) Error!void {
+        _ = try db.run("INSERT INTO map_entries (name, local, remote) VALUES (?1, ?2, ?3) " ++
+            "ON CONFLICT (name, remote) DO UPDATE SET local = excluded.local", &.{ name, local, remote });
+    }
+
+    pub fn deleteMapEntries(db: *Db, name: []const u8, remote: ?[]const u8) Error!usize {
+        if (remote) |r| return db.run("DELETE FROM map_entries WHERE name = ?1 AND remote = ?2", &.{ name, r });
+        return db.run("DELETE FROM map_entries WHERE name = ?1", &.{name});
     }
 
     // Mount records.
@@ -340,12 +380,20 @@ pub const Db = struct {
     }
 
     /// Builds an export table from the stored rules and groups.
-    pub fn table(db: *Db, arena: std.mem.Allocator) (Error || exports.Client.ParseError || exports.Options.ParseError)!Loaded {
+    pub fn table(db: *Db, arena: std.mem.Allocator) (Error || exports.Client.ParseError || exports.Options.ParseError || error{BadMap})!Loaded {
         var loaded: Loaded = .{};
         for (try db.members(arena, null)) |m| {
             const gop = try loaded.groups.getOrPut(arena, m.name);
             if (!gop.found_existing) gop.value_ptr.* = .empty;
             try gop.value_ptr.append(arena, try .parse(m.client));
+        }
+        for (try db.mapEntries(arena, null)) |m| {
+            const gop = try loaded.maps.getOrPut(arena, m.name);
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            try gop.value_ptr.append(arena, .{
+                .local = exports.Ids.parse(m.local) catch return error.BadMap,
+                .remote = if (m.remote.len == 0) null else exports.Ids.parse(m.remote) catch return error.BadMap,
+            });
         }
         for (try db.rules(arena, null)) |r| {
             try loaded.rules.append(arena, .{
@@ -362,6 +410,7 @@ pub const Db = struct {
 pub const Loaded = struct {
     rules: std.ArrayList(exports.Rule) = .empty,
     groups: std.StringHashMapUnmanaged(std.ArrayList(exports.Client)) = .empty,
+    maps: std.StringHashMapUnmanaged(std.ArrayList(exports.MapEntry)) = .empty,
 };
 
 pub const Stmt = struct {

@@ -49,6 +49,10 @@ Writes are always stable: data reaches storage before the reply, so COMMIT has n
 
 Files are reached through descriptors, never bare paths: a handle's cached path is opened refusing symbolic links in every component (`O_NOFOLLOW_ANY` on macOS, `openat2` with `RESOLVE_NO_SYMLINKS` on Linux) and its inode checked, then entries are changed relative to that descriptor (`openat`, `mkdirat`, `renameat`, and so on), so a client swapping a directory for a link can't redirect an operation outside its export. A renamed directory's cached descendants move with it.
 
+## Maps
+
+A map is a list of entries, each a host ID (`[UID][:GID]`) and the client IDs that act as it, or with none, the map's anon. Each rule names at most one. In a request, the caller's UID, GID, and supplementary GIDs each become their mapped host ID, else the anon's, else themselves; squashed callers become the anon, else the host's `nobody`. In replies, owners become the first client ID mapped to them; owners a client sets (SETATTR, and the attributes of CREATE, MKDIR, SYMLINK, and MKNOD) are mapped like callers. Stored maps keep host IDs as numbers, names resolved when an entry is added.
+
 ## Export rules
 
 A rule is (path, client, options). Stored rules come from the hooks; ephemeral rules from `serve` arguments overlay them by (path, client), and ephemeral groups and maps overlay stored ones by name. For each request, the most specific matching client wins. Host and `*.domain` clients need the caller's name, found by forward-confirmed reverse DNS and cached.
@@ -83,4 +87,4 @@ All other I/O goes through `std.Io`, so libnfsd runs on whatever implementation 
 
 ## Privileges
 
-When root, znfsd binds its ports, then with `--run-as USER` drops to that user and accesses files as them; maps are disabled because acting as other users needs root. Opening files by handle on Linux needs `CAP_DAC_READ_SEARCH`, so an unprivileged znfsd relies on stored paths. Unprivileged, znfsd also can't set owners or write files whose mode denies its own user, even when the client may, so a root client's `cp -a` loses ownership, and writes into files it created read-only fail. As root, new files and directories are given to their creators; switching to each caller's identity for every operation is still to come.
+When root, znfsd binds its ports, then with `--run-as USER` drops to that user and accesses files as them: once every port is bound and registered (libnfsd's `Config.after_bind`), it hands the database's directory and files and the control socket to USER, then sets USER's groups, GID, and UID, and checks root can't be regained; maps are disabled because acting as other users needs root. Opening files by handle on Linux needs `CAP_DAC_READ_SEARCH`, so an unprivileged znfsd relies on stored paths. Unprivileged, znfsd also can't set owners or write files whose mode denies its own user, even when the client may, so a root client's `cp -a` loses ownership, and writes into files it created read-only fail. As root, new files and directories are given to their creators; switching to each caller's identity for every operation is still to come.

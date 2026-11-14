@@ -47,10 +47,6 @@ fn run(
         try stdout.writeAll(usage);
         return 0;
     }
-    if (c.noun == .map) {
-        try stderr.writeAll("znfsd: map: maps aren't implemented yet\n");
-        return 1;
-    }
     const socket = invocation.globals.socket orelse control.defaultPath(arena, environ, libnfsd.sys.isRoot()) catch |err| {
         try stderr.print("znfsd: no control socket path: {t}; use --socket PATH\n", .{err});
         return 2;
@@ -77,7 +73,7 @@ fn run(
             try stderr.print("znfsd: lock: needs the running daemon; none answers at {s}\n", .{socket});
             return 1;
         },
-        .@"export", .group, .mount => {
+        .@"export", .group, .mount, .map => {
             var db = try openDb(io, arena, invocation.globals, environ, stderr) orelse return 1;
             defer db.close();
             const ctx: commands.Context = .{ .db = &db, .arena = arena, .out = stdout, .err = stderr };
@@ -89,7 +85,7 @@ fn run(
                 else => return err,
             };
         },
-        .help, .map, .serve => unreachable,
+        .help, .serve => unreachable,
     }
 }
 

@@ -20,6 +20,7 @@ pub fn run(c: Context, noun: cli.Noun, verb: cli.Verb, args: []const []const u8)
         .@"export" => exportCommand(c, verb, args),
         .group => groupCommand(c, verb, args),
         .mount => mountCommand(c, verb, args),
+        .map => mapCommand(c, verb, args),
         else => unreachable,
     };
 }
@@ -126,6 +127,92 @@ fn groupCommand(c: Context, verb: cli.Verb, args: []const []const u8) !u8 {
         .set => unreachable,
     }
     return 0;
+}
+
+fn mapCommand(c: Context, verb: cli.Verb, args: []const []const u8) !u8 {
+    switch (verb) {
+        .list => {
+            if (args.len > 1) return usage(c, "map list [MAP]");
+            var rows: std.ArrayList([3][]const u8) = .empty;
+            for (try c.db.mapEntries(c.arena, if (args.len == 1) args[0] else null)) |m| {
+                try rows.append(c.arena, .{ m.name, m.local, if (m.remote.len == 0) "anon" else m.remote });
+            }
+            try table(c.out, 3, rows.items);
+        },
+        .add => {
+            if (args.len < 2) return usage(c, "map add MAP LOCAL [REMOTE ...]");
+            const local = resolveLocal(args[1]) catch {
+                try c.err.print("znfsd: {s}: not [UID|USER][:GID|:GROUP] with known names\n", .{args[1]});
+                return 2;
+            };
+            var lw: Io.Writer.Allocating = .init(c.arena);
+            try local.format(&lw.writer);
+            var remotes: std.ArrayList([]const u8) = .empty;
+            for (args[2..]) |text| {
+                const remote = exports.Ids.parse(text) catch {
+                    try c.err.print("znfsd: {s}: not [UID][:GID] in numbers\n", .{text});
+                    return 2;
+                };
+                if ((remote.uid == null or local.uid == null) and (remote.gid == null or local.gid == null)) {
+                    try c.err.print("znfsd: {s}: maps nothing to {s}; pair UIDs with UIDs and GIDs with GIDs\n", .{ text, args[1] });
+                    return 2;
+                }
+                var rw: Io.Writer.Allocating = .init(c.arena);
+                try remote.format(&rw.writer);
+                try remotes.append(c.arena, rw.written());
+            }
+            if (remotes.items.len == 0) {
+                try c.db.putMapEntry(args[0], lw.written(), "");
+            } else for (remotes.items) |r| try c.db.putMapEntry(args[0], lw.written(), r);
+        },
+        .del => {
+            if (args.len < 1) return usage(c, "map del MAP [REMOTE ...]");
+            var removed: usize = 0;
+            if (args.len == 1) {
+                removed = try c.db.deleteMapEntries(args[0], null);
+            } else for (args[1..]) |text| {
+                const remote = exports.Ids.parse(text) catch {
+                    try c.err.print("znfsd: {s}: not [UID][:GID] in numbers\n", .{text});
+                    return 2;
+                };
+                var rw: Io.Writer.Allocating = .init(c.arena);
+                try remote.format(&rw.writer);
+                removed += try c.db.deleteMapEntries(args[0], rw.written());
+            }
+            if (removed == 0) {
+                try c.err.print("znfsd: no such map or entry\n", .{});
+                return 1;
+            }
+        },
+        .set => unreachable,
+    }
+    return 0;
+}
+
+/// `[UID|USER][:GID|:GROUP]`, with names looked up now.
+pub fn resolveLocal(text: []const u8) error{BadId}!exports.Ids {
+    const colon = std.mem.indexOfScalar(u8, text, ':');
+    const user = text[0 .. colon orelse text.len];
+    const group = if (colon) |i| text[i + 1 ..] else "";
+    var ids: exports.Ids = .{};
+    if (user.len > 0) ids.uid = std.fmt.parseInt(u32, user, 10) catch lookup: {
+        var z: [256]u8 = undefined;
+        if (user.len >= z.len) return error.BadId;
+        @memcpy(z[0..user.len], user);
+        z[user.len] = 0;
+        const pw = std.c.getpwnam(z[0..user.len :0]) orelse return error.BadId;
+        break :lookup pw.uid;
+    };
+    if (group.len > 0) ids.gid = std.fmt.parseInt(u32, group, 10) catch lookup: {
+        var z: [256]u8 = undefined;
+        if (group.len >= z.len) return error.BadId;
+        @memcpy(z[0..group.len], group);
+        z[group.len] = 0;
+        const gr = std.c.getgrnam(z[0..group.len :0]) orelse return error.BadId;
+        break :lookup gr.gid;
+    };
+    if (ids.uid == null and ids.gid == null) return error.BadId;
+    return ids;
 }
 
 fn mountCommand(c: Context, verb: cli.Verb, args: []const []const u8) !u8 {

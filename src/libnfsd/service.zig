@@ -37,6 +37,14 @@ pub const Config = struct {
     portmap_port: u16 = portmap.port,
     /// Largest TCP record accepted.
     max_record: usize = 1024 * 1024 + 4096,
+    /// Runs once every port is bound and registered, before any request is
+    /// served, as for dropping root.
+    after_bind: ?AfterBind = null,
+};
+
+pub const AfterBind = struct {
+    ptr: *anyopaque,
+    call: *const fn (ptr: *anyopaque, diag: *Diagnostic) bool,
 };
 
 pub const Error = error{
@@ -48,6 +56,8 @@ pub const Error = error{
     NoPortmapper,
     /// The portmapper refused a registration.
     RegistrationRefused,
+    /// `Config.after_bind` failed, and said why in the diagnostic.
+    AfterBindFailed,
 } || net.IpAddress.BindError || net.IpAddress.ListenError || Io.ConcurrentError || std.mem.Allocator.Error;
 
 /// Why `run` failed, for its caller to show.
@@ -59,7 +69,7 @@ pub const Diagnostic = struct {
         return d.buf[0..d.len];
     }
 
-    fn set(d: *Diagnostic, comptime fmt: []const u8, args: anytype) void {
+    pub fn set(d: *Diagnostic, comptime fmt: []const u8, args: anytype) void {
         const written: []u8 = std.fmt.bufPrint(&d.buf, fmt, args) catch &d.buf;
         d.len = written.len;
     }
@@ -125,6 +135,8 @@ pub fn run(io: Io, gpa: std.mem.Allocator, config: Config, registrations: []cons
             return error.NoPortmapper;
         }
     }
+
+    if (config.after_bind) |hook| if (!hook.call(hook.ptr, diag)) return error.AfterBindFailed;
 
     var group: Io.Group = .init;
     defer group.cancel(io);

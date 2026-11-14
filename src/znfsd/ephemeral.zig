@@ -8,6 +8,7 @@ const exports = libnfsd.exports;
 pub const Error = error{
     BadExport,
     BadGroup,
+    BadMap,
     UnknownOption,
     BadClient,
     OutOfMemory,
@@ -72,6 +73,30 @@ pub fn parseGroup(arena: std.mem.Allocator, text: []const u8) Error!Group {
     return .{ .name = text[0..colon], .clients = clients.items };
 }
 
+pub const MapArg = struct {
+    name: []const u8,
+    entries: []const exports.MapEntry,
+};
+
+/// Parses `MAP:LOCAL=[REMOTE[,REMOTE ...]]`; names in LOCAL are looked up
+/// now, and no REMOTE makes LOCAL the map's anon.
+pub fn parseMap(arena: std.mem.Allocator, text: []const u8) Error!MapArg {
+    const colon = std.mem.indexOfScalar(u8, text, ':') orelse return error.BadMap;
+    if (colon == 0) return error.BadMap;
+    const rest = text[colon + 1 ..];
+    const eq = std.mem.indexOfScalar(u8, rest, '=') orelse return error.BadMap;
+    const local = @import("commands.zig").resolveLocal(rest[0..eq]) catch return error.BadMap;
+    var entries: std.ArrayList(exports.MapEntry) = .empty;
+    var it = std.mem.tokenizeScalar(u8, rest[eq + 1 ..], ',');
+    while (it.next()) |r| {
+        const remote = exports.Ids.parse(r) catch return error.BadMap;
+        if ((remote.uid == null or local.uid == null) and (remote.gid == null or local.gid == null)) return error.BadMap;
+        try entries.append(arena, .{ .local = local, .remote = remote });
+    }
+    if (entries.items.len == 0) try entries.append(arena, .{ .local = local, .remote = null });
+    return .{ .name = text[0..colon], .entries = entries.items };
+}
+
 const testing = std.testing;
 
 test "exports: path only, options, clients, and escapes" {
@@ -100,6 +125,20 @@ test "exports: path only, options, clients, and escapes" {
 
     try testing.expectError(error.UnknownOption, parseExport(arena, "/srv:async"));
     try testing.expectError(error.BadExport, parseExport(arena, ":ro"));
+}
+
+test "maps" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const m = try parseMap(arena, "art:501:20=1000,1001:100");
+    try testing.expectEqualStrings("art", m.name);
+    try testing.expectEqual(2, m.entries.len);
+    try testing.expectEqual(1001, m.entries[1].remote.?.uid.?);
+    const anon = try parseMap(arena, "art:65534=");
+    try testing.expectEqual(null, anon.entries[0].remote);
+    try testing.expectError(error.BadMap, parseMap(arena, "art:501=:100"));
+    try testing.expectError(error.BadMap, parseMap(arena, "art:skynet-nobody-knows=1"));
 }
 
 test "groups" {
