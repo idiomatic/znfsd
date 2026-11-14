@@ -2,7 +2,7 @@
 
 How to work on znfsd. [AGENTS.md](AGENTS.md) is the specification; [README.md](README.md) explains it for users, and [ARCHITECTURE.md](ARCHITECTURE.md) describes the design.
 
-So far, `serve` runs the portmapper logic, MOUNT, all of NFS v3, and locking (NLM and NSM, with restart recovery), with stored and ephemeral exports and groups; Linux 6.18 has mounted it read-write and locked, blocked, and reclaimed after a restart. Maps and `--run-as` work too. The `export`, `group`, `map`, `mount`, `lock`, and `stop` commands work, through the control socket when the daemon runs, so changes apply at once. Running as root, each request acts as its caller. Still to come: the activity monitor, and testing with macOS and Windows clients.
+So far, `serve` runs the portmapper logic, MOUNT, all of NFS v3, and locking (NLM and NSM, with restart recovery), with stored and ephemeral exports and groups; Linux 6.18 has mounted it read-write and locked, blocked, and reclaimed after a restart. Maps and `--run-as` work too. The `export`, `group`, `map`, `mount`, `lock`, and `stop` commands work, through the control socket when the daemon runs, so changes apply at once. Running as root, each request acts as its caller. macOS 27.2 and Windows 11 have mounted it too, read-write and locking. Still to come: the activity monitor.
 
 ## Requirements
 
@@ -41,6 +41,10 @@ zig build -Dtarget=aarch64-linux-musl -Doptimize=ReleaseSafe --prefix /tmp/znfsd
 1. **`zig build test`**, no root: unit tests, plus loopback tests that run libnfsd in-process on ephemeral ports against an in-project RPC client.
 2. **Unprivileged daemon with kernel clients:** `znfsd serve` on the host as yourself. Every `rpcbind` tested (macOS 27.2; Alpine, Ubuntu, and Fedora) accepts registrations from non-root over loopback, and macOS's on-demand `rpcbind` starts when any user connects to `/var/run/portmap.socket`. Where no portmapper is available, use `--no-portmap` and mount with explicit ports and `nolock` (see [README.md](README.md)).
 3. **Full stack as root, isolated:** znfsd as root in an Apple `container` (static `aarch64-linux-musl` build), which has its own kernel, binds every port, and is reachable from the host and every VM on `192.168.64.0/24`. Kernel clients run in terrarium VMs. Container kernels have no NFS client, and terrarium VMs can't reach each other, so neither can stand in for the other's role. terrarium's named networks (`terrarium network znfsd --subnet CIDR --reserve client1=IP`, then `start --network znfsd:client1`) let VMs reach each other and the Mac (at the subnet's `.1`), so znfsd can also run on the Mac or as root in a VM serving client VMs. Alpine guests may get a default route via their own named-network address; delete it for internet access. Suites: Connectathon (`cthon04`) from Linux and macOS clients, server-restart and client-reboot lock recovery, and a Windows smoke test.
+
+macOS clients ask before an app reads a network volume, and a background process like terrarium's helper can't be asked, so its reads block, then fail with "Operation not permitted". Run macOS client tests from Terminal in the VM's GUI, allowing its prompt once, and write results to a local file for `exec` to read. macOS handles `flock()` on NFS within the client; use `fcntl()` locks to test NLM. Debug builds log every RPC call (`debug(libnfsd)`), which shows what a client sent.
+
+Windows needs the Client for NFS feature (`Enable-WindowsOptionalFeature -Online -FeatureName ServicesForNFS-ClientOnly,ClientForNFS-Infrastructure -All`; Pro or better). `mount -o anon` sends UID and GID 4294967294, which a map can make a host user. It writes back lazily, so changes reach the server a while after a command returns, and it locks with NLM's NM_LOCK, unmonitored, plus SHARE and UNSHARE.
 
 If a VM gets only a `169.254.x` address, the host's DHCP isn't answering; give it a static address on `192.168.64.0/24` with gateway `192.168.64.1` and DNS `1.1.1.1`.
 

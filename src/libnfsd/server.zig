@@ -49,7 +49,11 @@ pub fn dispatch(programs: []const Program, ctx: Context, message: []const u8, ou
                 break :status .{ .prog_mismatch = .{ .low = program.low, .high = program.high } };
             }
             var results: Io.Writer = .fixed(out[success_header..]);
+            log.debug("{f} {t}: prog {d} vers {d} proc {d}: arrived", .{ ctx.from, ctx.protocol, call.prog, call.vers, call.proc });
             const reply = program.handle(program.ptr, ctx, call, &results);
+            log.debug("{f} {t}: prog {d} vers {d} proc {d}: {t}, {d} bytes", .{
+                ctx.from, ctx.protocol, call.prog, call.vers, call.proc, reply, results.end,
+            });
             if (reply == .none) return null;
             if (reply == .success) {
                 var header: Io.Writer = .fixed(out[0..success_header]);
