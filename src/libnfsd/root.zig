@@ -15,6 +15,10 @@ pub const fh = @import("fh.zig");
 pub const mount = @import("mount.zig");
 pub const files = @import("files.zig");
 pub const nfs = @import("nfs.zig");
+pub const locks = @import("locks.zig");
+pub const callback = @import("callback.zig");
+pub const nsm = @import("nsm.zig");
+pub const nlm = @import("nlm.zig");
 
 pub const version: std.SemanticVersion = .{ .major = 0, .minor = 0, .patch = 0 };
 

@@ -34,7 +34,7 @@ const sqlite = struct {
 pub const Error = error{ Sqlite, OutOfMemory };
 
 /// The schema's version, in `PRAGMA user_version`.
-const schema_version = 1;
+const schema_version = 3;
 const schema =
     \\CREATE TABLE IF NOT EXISTS export_rules (
     \\  path TEXT NOT NULL,
@@ -51,6 +51,20 @@ const schema =
     \\  host TEXT NOT NULL,
     \\  path TEXT NOT NULL,
     \\  PRIMARY KEY (host, path)
+    \\);
+    \\CREATE TABLE IF NOT EXISTS nsm (
+    \\  id INTEGER PRIMARY KEY CHECK (id = 1),
+    \\  state INTEGER NOT NULL
+    \\);
+    \\CREATE TABLE IF NOT EXISTS monitors (
+    \\  name TEXT PRIMARY KEY,
+    \\  address TEXT NOT NULL
+    \\);
+    \\CREATE TABLE IF NOT EXISTS file_handles (
+    \\  fsid TEXT NOT NULL,
+    \\  inode INTEGER NOT NULL,
+    \\  path TEXT NOT NULL,
+    \\  PRIMARY KEY (fsid, inode)
     \\);
 ;
 
@@ -238,6 +252,93 @@ pub const Db = struct {
         return db.run("DELETE FROM mounts WHERE host = ?1", &.{host});
     }
 
+    // File handles' last-known paths.
+
+    /// Keeps the path cache's entries here, so handles survive restarts.
+    /// Failures only lose that, so they're dropped.
+    pub fn filesStore(db: *Db) libnfsd.files.Store {
+        const S = struct {
+            fn keys(fsid: [16]u8, inode: u64, fsid_hex: *[32]u8, inode_buf: *[20]u8) [2][]const u8 {
+                fsid_hex.* = std.fmt.bytesToHex(fsid, .lower);
+                return .{ fsid_hex, std.fmt.bufPrint(inode_buf, "{d}", .{inode}) catch unreachable };
+            }
+            fn remember(ptr: *anyopaque, fsid: [16]u8, inode: u64, path: []const u8) void {
+                const d: *Db = @ptrCast(@alignCast(ptr));
+                var hex: [32]u8 = undefined;
+                var ino: [20]u8 = undefined;
+                const k = keys(fsid, inode, &hex, &ino);
+                _ = d.run("INSERT INTO file_handles (fsid, inode, path) VALUES (?1, ?2, ?3) " ++
+                    "ON CONFLICT (fsid, inode) DO UPDATE SET path = excluded.path", &.{ k[0], k[1], path }) catch {};
+            }
+            fn lookup(ptr: *anyopaque, fsid: [16]u8, inode: u64, out: []u8) ?usize {
+                const d: *Db = @ptrCast(@alignCast(ptr));
+                var hex: [32]u8 = undefined;
+                var ino: [20]u8 = undefined;
+                const k = keys(fsid, inode, &hex, &ino);
+                var stmt = d.prepare("SELECT path FROM file_handles WHERE fsid = ?1 AND inode = ?2", &k) catch return null;
+                defer stmt.finish();
+                if (!(stmt.next() catch return null)) return null;
+                const p = stmt.text(0);
+                if (p.len > out.len) return null;
+                @memcpy(out[0..p.len], p);
+                return p.len;
+            }
+            fn renamePrefix(ptr: *anyopaque, old: []const u8, new: []const u8) void {
+                const d: *Db = @ptrCast(@alignCast(ptr));
+                _ = d.run("UPDATE file_handles SET path = ?2 || substr(path, length(?1) + 1) " ++
+                    "WHERE substr(path, 1, length(?1) + 1) = ?1 || '/'", &.{ old, new }) catch {};
+            }
+        };
+        return .{ .ptr = db, .remember = S.remember, .lookup = S.lookup, .renamePrefix = S.renamePrefix };
+    }
+
+    // The status monitor.
+
+    /// Advances and stores the NSM state number, as at each start.
+    pub fn advanceNsmState(db: *Db) Error!u32 {
+        var previous: u32 = 0;
+        {
+            var stmt = try db.prepare("SELECT state FROM nsm WHERE id = 1", &.{});
+            defer stmt.finish();
+            if (try stmt.next()) previous = @truncate(@as(u64, @bitCast(stmt.int(0))));
+        }
+        const state = libnfsd.nsm.nextState(previous);
+        var buf: [16]u8 = undefined;
+        const text = std.fmt.bufPrint(&buf, "{d}", .{state}) catch unreachable;
+        _ = try db.run("INSERT INTO nsm (id, state) VALUES (1, ?1) ON CONFLICT (id) DO UPDATE SET state = excluded.state", &.{text});
+        return state;
+    }
+
+    pub fn monitors(db: *Db, arena: std.mem.Allocator) Error![]libnfsd.nsm.Host {
+        var stmt = try db.prepare("SELECT name, address FROM monitors ORDER BY name", &.{});
+        defer stmt.finish();
+        var out: std.ArrayList(libnfsd.nsm.Host) = .empty;
+        while (try stmt.next()) {
+            try out.append(arena, .{ .name = try arena.dupe(u8, stmt.text(0)), .address = try arena.dupe(u8, stmt.text(1)) });
+        }
+        return out.items;
+    }
+
+    pub fn deleteMonitor(db: *Db, name: []const u8) Error!void {
+        _ = try db.run("DELETE FROM monitors WHERE name = ?1", &.{name});
+    }
+
+    /// Keeps NSM's monitored hosts here, for notifying after a restart.
+    pub fn nsmStore(db: *Db) libnfsd.nsm.Store {
+        const S = struct {
+            fn monitor(ptr: *anyopaque, host: libnfsd.nsm.Host) void {
+                const d: *Db = @ptrCast(@alignCast(ptr));
+                _ = d.run("INSERT INTO monitors (name, address) VALUES (?1, ?2) " ++
+                    "ON CONFLICT (name) DO UPDATE SET address = excluded.address", &.{ host.name, host.address }) catch {};
+            }
+            fn unmonitor(ptr: *anyopaque, name: []const u8) void {
+                const d: *Db = @ptrCast(@alignCast(ptr));
+                d.deleteMonitor(name) catch {};
+            }
+        };
+        return .{ .ptr = db, .monitor = S.monitor, .unmonitor = S.unmonitor };
+    }
+
     /// Builds an export table from the stored rules and groups.
     pub fn table(db: *Db, arena: std.mem.Allocator) (Error || exports.Client.ParseError || exports.Options.ParseError)!Loaded {
         var loaded: Loaded = .{};
@@ -352,6 +453,46 @@ test "store, merge, list, and delete rules and groups" {
     try testing.expectEqual(1, try db.deleteRules("/srv", "*"));
     try testing.expectEqual(1, (try db.rules(arena, null)).len);
     try testing.expectEqual(1, try db.deleteMembers("lab", null));
+}
+
+test "NSM state numbers advance and stay odd" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [libnfsd.sys.max_path]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(testing.io, &buf)];
+    const path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/znfsd.db", .{dir}, 0);
+    defer testing.allocator.free(path);
+    var db: Db = try .open(path);
+    defer db.close();
+    try testing.expectEqual(1, try db.advanceNsmState());
+    try testing.expectEqual(3, try db.advanceNsmState());
+    const store = db.nsmStore();
+    store.monitor(store.ptr, .{ .name = "art", .address = "192.168.213.11" });
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    try testing.expectEqualStrings("192.168.213.11", (try db.monitors(arena_state.allocator()))[0].address);
+    store.unmonitor(store.ptr, "art");
+    try testing.expectEqual(0, (try db.monitors(arena_state.allocator())).len);
+}
+
+test "file handle paths persist and move with renamed directories" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [libnfsd.sys.max_path]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(testing.io, &buf)];
+    const path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/znfsd.db", .{dir}, 0);
+    defer testing.allocator.free(path);
+    var db: Db = try .open(path);
+    defer db.close();
+    const s = db.filesStore();
+    const fsid: [16]u8 = @splat(7);
+    s.remember(s.ptr, fsid, 42, "/srv/a/b");
+    s.remember(s.ptr, fsid, 43, "/srv/ab");
+    s.renamePrefix(s.ptr, "/srv/a", "/srv/z");
+    var out: [64]u8 = undefined;
+    try testing.expectEqualStrings("/srv/z/b", out[0..s.lookup(s.ptr, fsid, 42, &out).?]);
+    try testing.expectEqualStrings("/srv/ab", out[0..s.lookup(s.ptr, fsid, 43, &out).?]);
+    try testing.expectEqual(null, s.lookup(s.ptr, fsid, 44, &out));
 }
 
 test "options round trip" {

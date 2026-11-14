@@ -2,7 +2,7 @@
 
 znfsd is an NFS v3 server for Linux and macOS hosts, serving macOS, Linux, and Windows clients. One process provides everything a v3 client needs: NFS, mountd, statd, lockd, and, when no portmapper is running, a portmapper too. It has few options, and its defaults are sensible.
 
-[AGENTS.md](AGENTS.md) is the authoritative specification; this page explains and illustrates it. The protocol specifications znfsd relies on are collected in [docs/specifications](docs/specifications/README.md). znfsd is under construction. So far, `serve` runs the portmapper logic, MOUNT, and all of NFS v3, with stored and ephemeral exports and groups; Linux 6.18 has mounted it read-write. The `export`, `group`, `mount`, and `stop` commands work, through the control socket when the daemon runs, so changes apply at once. NLM, NSM, maps, the `lock` commands' locks, and the activity monitor are still to come.
+[AGENTS.md](AGENTS.md) is the authoritative specification; this page explains and illustrates it. The protocol specifications znfsd relies on are collected in [docs/specifications](docs/specifications/README.md). znfsd is under construction. So far, `serve` runs the portmapper logic, MOUNT, all of NFS v3, and locking (NLM and NSM, with restart recovery), with stored and ephemeral exports and groups; Linux 6.18 has mounted it read-write and locked, blocked, and reclaimed after a restart. The `export`, `group`, `mount`, `lock`, and `stop` commands work, through the control socket when the daemon runs, so changes apply at once. Maps, `--run-as`, and the activity monitor are still to come.
 
 ## Why
 
@@ -112,7 +112,7 @@ If the host's own NFS server or kernel lock manager already holds a port or RPC 
 
 ## State and recovery
 
-znfsd keeps exports, groups, maps, file handles, mount records, and statd's monitor list in SQLite. Locks live only in memory: after a restart, znfsd notifies its clients, which reclaim their locks during a grace period of about 90 seconds.
+znfsd keeps exports, groups, maps, file handles, mount records, and statd's monitor list in SQLite. Locks live only in memory: after a restart, znfsd notifies its clients, which reclaim their locks during a grace period of about 90 seconds. Locks coordinate NFS clients with each other; processes on the server itself don't see them.
 
 File handles identify a file by filesystem and inode rather than path, so they survive renames, including ones made directly on the host.
 

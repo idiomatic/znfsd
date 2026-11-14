@@ -149,7 +149,7 @@ fn mountCommand(c: Context, verb: cli.Verb, args: []const []const u8) !u8 {
 }
 
 /// Prints rows in columns separated by two spaces.
-fn table(out: *Io.Writer, comptime n: usize, rows: []const [n][]const u8) !void {
+pub fn table(out: *Io.Writer, comptime n: usize, rows: []const [n][]const u8) !void {
     var widths: [n]usize = @splat(0);
     for (rows) |row| for (row, &widths) |cell, *w| {
         w.* = @max(w.*, cell.len);

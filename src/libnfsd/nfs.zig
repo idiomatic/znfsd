@@ -176,6 +176,32 @@ pub const Nfs = struct {
         return .{ .prog = prog, .low = vers, .high = vers, .ptr = n, .handle = handle };
     }
 
+    pub const Located = struct {
+        file: @import("locks.zig").File,
+        path_buf: [sys.max_path + 1]u8,
+        path_len: usize,
+
+        pub fn path(l: *const Located) []const u8 {
+            return l.path_buf[0..l.path_len];
+        }
+    };
+
+    /// The file a handle names, if it still exists and `from` may reach
+    /// it, as for NLM's lock requests.
+    pub fn locate(n: *Nfs, io: Io, bytes: []const u8, from: Io.net.IpAddress, out: *Located) bool {
+        const h = fh.Handle.decode(bytes) catch return false;
+        const table = @atomicLoad(*const exports.Table, &n.table, .acquire);
+        var attr: sys.Attr = undefined;
+        const path = n.files.resolve(io, h, &out.path_buf, &attr) catch |err| switch (err) {
+            error.Stale => exportRootPath(n.files, table, io, h, &attr, &out.path_buf) orelse return false,
+            error.Canceled => return false,
+        };
+        if (table.match(path, from, null) == null) return false;
+        out.file = .{ .fsid = h.fsid, .inode = h.inode };
+        out.path_len = path.len;
+        return true;
+    }
+
     fn handle(ptr: *anyopaque, ctx: server.Context, call: rpc.Call, results: *Io.Writer) rpc.Reply {
         const n: *Nfs = @ptrCast(@alignCast(ptr));
         if (call.proc == @backingInt(Proc.null)) return .success;
@@ -281,18 +307,8 @@ const Request = struct {
         return .{ .found = .{ .handle = h, .path = path, .attr = attr, .match = match } };
     }
 
-    /// The path of the export whose root `h` is, so root handles always
-    /// resolve, even before any lookup and across restarts.
     fn exportRoot(r: *Request, h: fh.Handle, attr: *sys.Attr, buf: *[sys.max_path + 1]u8) ?[:0]const u8 {
-        for (r.table.rules) |rule| {
-            if (exportId(rule.path) != h.export_id or rule.path.len > sys.max_path) continue;
-            const path = copyZ(buf, rule.path);
-            if (sys.lstat(path, attr) != .SUCCESS) continue;
-            if (!h.eql(fh.Handle.fromAttr(h.export_id, attr.*))) continue;
-            r.n.files.remember(r.ctx.io, h, path) catch {};
-            return path;
-        }
-        return null;
+        return exportRootPath(r.n.files, r.table, r.ctx.io, h, attr, buf);
     }
 
     fn getattr(r: *Request) Error!void {
@@ -1152,6 +1168,20 @@ fn wcc(e: xdr.Encoder, pre: ?sys.Attr, post: ?sys.Attr) Error!void {
         try time(e, a.ctime);
     }
     try postOpAttr(e, post);
+}
+
+/// The path of the export whose root `h` is, so root handles always
+/// resolve, even before any lookup and across restarts.
+fn exportRootPath(files: *Files, table: *const exports.Table, io: Io, h: fh.Handle, attr: *sys.Attr, buf: *[sys.max_path + 1]u8) ?[:0]const u8 {
+    for (table.rules) |rule| {
+        if (exportId(rule.path) != h.export_id or rule.path.len > sys.max_path) continue;
+        const path = copyZ(buf, rule.path);
+        if (sys.lstat(path, attr) != .SUCCESS) continue;
+        if (!h.eql(fh.Handle.fromAttr(h.export_id, attr.*))) continue;
+        files.remember(io, h, path) catch {};
+        return path;
+    }
+    return null;
 }
 
 /// Whether `name` is an ordinary directory entry name.

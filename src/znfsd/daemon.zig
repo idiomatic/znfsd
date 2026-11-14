@@ -89,6 +89,9 @@ pub fn serve(
         .ephemeral_groups = groups.items,
         .mount = undefined,
         .nfs = undefined,
+        .files = undefined,
+        .nlm = undefined,
+        .nsm = undefined,
     };
     defer d.tables.deinit();
     const table = d.build(stderr) catch return 1;
@@ -103,15 +106,41 @@ pub fn serve(
     mount.store = db.mountStore();
     var files: libnfsd.files.Files = .init(gpa);
     defer files.deinit();
+    files.store = db.filesStore();
     var verifier: [8]u8 = undefined;
     std.mem.writeInt(i64, &verifier, @truncate(Io.Clock.real.now(io).nanoseconds), .big);
     var nfs: libnfsd.nfs.Nfs = .init(gpa, table, &files, verifier);
+
+    // Locking: a new NSM state number at each start; hosts that held locks
+    // before are told, and get a grace period to reclaim them.
+    const state = try db.advanceNsmState();
+    const previous = try db.monitors(arena);
+    for (previous) |h| try db.deleteMonitor(h.name);
+    var locks: libnfsd.locks.Locks = .init(gpa);
+    defer locks.deinit();
+    var status: libnfsd.nsm.Nsm = .init(gpa, state);
+    defer status.deinit();
+    status.store = db.nsmStore();
+    var nlm: libnfsd.nlm.Nlm = .init(gpa, &nfs, &locks, &status);
+    defer nlm.deinit(io);
+    status.rebooted = nlm.rebooted();
+    const locking = !options.no_portmap;
+    if (locking and previous.len > 0) nlm.startGrace(io);
+
     d.mount = &mount;
     d.nfs = &nfs;
-    const registrations = [_]libnfsd.service.Registration{
+    d.files = &files;
+    d.nlm = &nlm;
+    d.nsm = &status;
+    var registrations: std.ArrayList(libnfsd.service.Registration) = .empty;
+    try registrations.appendSlice(arena, &.{
         .{ .program = mount.program(), .service = .mount },
         .{ .program = nfs.program(), .service = .nfs },
-    };
+    });
+    if (locking) try registrations.appendSlice(arena, &.{
+        .{ .program = nlm.program(), .service = .lock },
+        .{ .program = status.program(), .service = .stat },
+    });
 
     var socket = control.listen(io, socket_path) catch |err| {
         switch (err) {
@@ -134,10 +163,12 @@ pub fn serve(
 
     var diag: libnfsd.service.Diagnostic = .{};
     var result: Outcome = .running;
-    var service = try io.concurrent(runService, .{ io, gpa, config, &registrations, &diag, &result });
+    var service = try io.concurrent(runService, .{ io, gpa, config, registrations.items, &diag, &result });
     var controller = try io.concurrent(control.serve, .{ io, gpa, &socket, d.handler() });
+    var notifier = try io.concurrent(notifyRestart, .{ io, if (locking) previous else &.{}, state });
     var signal: c_int = 0;
     _ = std.c.sigwait(&signals, &signal);
+    notifier.cancel(io);
     _ = controller.cancel(io) catch {};
     _ = service.cancel(io);
 
@@ -165,6 +196,9 @@ const Daemon = struct {
     ephemeral_groups: []const ephemeral.Group,
     mount: *libnfsd.mount.Mount,
     nfs: *libnfsd.nfs.Nfs,
+    files: *libnfsd.files.Files,
+    nlm: *libnfsd.nlm.Nlm,
+    nsm: *libnfsd.nsm.Nsm,
 
     /// Builds the table: stored rules and groups, with ephemeral ones laid
     /// over them by path and client, and by name.
@@ -223,20 +257,16 @@ const Daemon = struct {
                 _ = std.c.kill(std.c.getpid(), .TERM);
                 return 0;
             },
-            .lock => switch (c.verb.?) {
-                // No lock manager yet, so no locks.
-                .list => return 0,
-                else => {
-                    try err.writeAll("znfsd: no such locks\n");
-                    return 1;
-                },
-            },
+            .lock => return d.lockCommand(arena, c.verb.?, c.args, out, err),
             .@"export", .group, .mount => {
                 const ctx: commands.Context = .{ .db = d.db, .arena = arena, .out = out, .err = err };
                 const status = try commands.run(ctx, c.noun, c.verb.?, c.args);
                 if (status != 0 or c.verb.? == .list) return status;
                 switch (c.noun) {
-                    .mount => try d.mount.unmount(d.io, c.args[0], if (c.args.len > 1) c.args[1] else null),
+                    .mount => {
+                        try d.mount.unmount(d.io, c.args[0], if (c.args.len > 1) c.args[1] else null);
+                        try d.nsm.forget(d.io, c.args[0]);
+                    },
                     else => {
                         const table = d.build(err) catch return 1;
                         d.mount.setTable(table);
@@ -251,7 +281,81 @@ const Daemon = struct {
             },
         }
     }
+
+    /// `lock list [PATH]` and `lock del HOST [PATH]`, on the live locks.
+    fn lockCommand(d: *Daemon, arena: std.mem.Allocator, verb: cli.Verb, args: []const []const u8, out: *Io.Writer, err: *Io.Writer) !u8 {
+        switch (verb) {
+            .list => {
+                if (args.len > 1) return usage(err, "lock list [PATH]");
+                const only: ?libnfsd.locks.File = if (args.len == 1) fileOf(args[0]) orelse return 0 else null;
+                var rows: std.ArrayList([4][]const u8) = .empty;
+                for (try d.nlm.locks.snapshot(d.io, arena)) |l| {
+                    if (only) |f| if (!std.meta.eql(f, l.file)) continue;
+                    const path = try d.files.pathOf(d.io, arena, l.file.fsid, l.file.inode) orelse
+                        try std.fmt.allocPrint(arena, "inode {d}", .{l.file.inode});
+                    const range = if (l.range.end == libnfsd.locks.Range.eof)
+                        try std.fmt.allocPrint(arena, "{d}-", .{l.range.start})
+                    else
+                        try std.fmt.allocPrint(arena, "{d}-{d}", .{ l.range.start, l.range.end - 1 });
+                    try rows.append(arena, .{ l.owner.host, path, range, if (l.exclusive) "exclusive" else "shared" });
+                }
+                try commands.table(out, 4, rows.items);
+                return 0;
+            },
+            .del => {
+                if (args.len < 1 or args.len > 2) return usage(err, "lock del HOST [PATH]");
+                const file: ?libnfsd.locks.File = if (args.len == 2) fileOf(args[1]) orelse {
+                    try err.print("znfsd: {s}: no such file\n", .{args[1]});
+                    return 1;
+                } else null;
+                if (try d.nlm.releaseHost(d.io, args[0], file) == 0) {
+                    try err.writeAll("znfsd: no such locks\n");
+                    return 1;
+                }
+                if (file == null) try d.nsm.forget(d.io, args[0]);
+                return 0;
+            },
+            .add, .set => unreachable,
+        }
+    }
 };
+
+fn usage(err: *Io.Writer, text: []const u8) !u8 {
+    try err.print("znfsd: usage: znfsd {s}\n", .{text});
+    return 2;
+}
+
+/// The lock table's key for the file at `path`.
+fn fileOf(path: []const u8) ?libnfsd.locks.File {
+    var buf: [libnfsd.sys.max_path]u8 = undefined;
+    var canonical: []const u8 = undefined;
+    if (libnfsd.sys.canonical(path, &buf, &canonical) != .SUCCESS) return null;
+    var z: [libnfsd.sys.max_path + 1]u8 = undefined;
+    @memcpy(z[0..canonical.len], canonical);
+    z[canonical.len] = 0;
+    var attr: libnfsd.sys.Attr = undefined;
+    if (libnfsd.sys.lstat(z[0..canonical.len :0], &attr) != .SUCCESS) return null;
+    const h: libnfsd.fh.Handle = .fromAttr(0, attr);
+    return .{ .fsid = h.fsid, .inode = h.inode };
+}
+
+/// After a restart, tells the hosts that held locks, once our services are
+/// registered, retrying those that don't answer.
+fn notifyRestart(io: Io, hosts: []const libnfsd.nsm.Host, state: u32) void {
+    var pending: [256]bool = @splat(true);
+    const count = @min(hosts.len, pending.len);
+    for (0..5) |_| {
+        io.sleep(.fromSeconds(2), .awake) catch return;
+        var left: usize = 0;
+        for (hosts[0..count], 0..) |h, i| {
+            if (!pending[i]) continue;
+            if (libnfsd.nsm.notify(io, &.{h}, state) == 1) {
+                pending[i] = false;
+            } else left += 1;
+        }
+        if (left == 0) return;
+    }
+}
 
 fn sameClient(a: exports.Client, b: exports.Client) bool {
     var abuf: [300]u8 = undefined;

@@ -141,6 +141,8 @@ pub const Range = struct { low: u32, high: u32 };
 /// A reply's status. After `success`, the caller encodes the results.
 pub const Reply = union(enum) {
     success,
+    /// Send nothing, as for NLM's asynchronous `_MSG` procedures.
+    none,
     prog_unavail,
     prog_mismatch: Range,
     proc_unavail,
@@ -183,7 +185,7 @@ pub const Reply = union(enum) {
                     .proc_unavail => try e.enumeration(AcceptStat.proc_unavail),
                     .garbage_args => try e.enumeration(AcceptStat.garbage_args),
                     .system_err => try e.enumeration(AcceptStat.system_err),
-                    .rpc_mismatch, .auth_error => unreachable,
+                    .rpc_mismatch, .auth_error, .none => unreachable,
                 }
             },
         }

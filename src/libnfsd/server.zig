@@ -50,6 +50,7 @@ pub fn dispatch(programs: []const Program, ctx: Context, message: []const u8, ou
             }
             var results: Io.Writer = .fixed(out[success_header..]);
             const reply = program.handle(program.ptr, ctx, call, &results);
+            if (reply == .none) return null;
             if (reply == .success) {
                 var header: Io.Writer = .fixed(out[0..success_header]);
                 rpc.Reply.encode(.success, .init(&header), call.xid) catch unreachable;

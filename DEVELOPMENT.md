@@ -2,7 +2,7 @@
 
 How to work on znfsd. [AGENTS.md](AGENTS.md) is the specification; [README.md](README.md) explains it for users, and [ARCHITECTURE.md](ARCHITECTURE.md) describes the design.
 
-So far, `serve` runs the portmapper logic, MOUNT, and all of NFS v3, with stored and ephemeral exports and groups; Linux 6.18 has mounted it read-write. The `export`, `group`, `mount`, and `stop` commands work, through the control socket when the daemon runs, so changes apply at once. NLM, NSM, maps, the `lock` commands' locks, and the activity monitor are still to come.
+So far, `serve` runs the portmapper logic, MOUNT, all of NFS v3, and locking (NLM and NSM, with restart recovery), with stored and ephemeral exports and groups; Linux 6.18 has mounted it read-write and locked, blocked, and reclaimed after a restart. The `export`, `group`, `mount`, `lock`, and `stop` commands work, through the control socket when the daemon runs, so changes apply at once. Maps, `--run-as`, and the activity monitor are still to come.
 
 ## Requirements
 

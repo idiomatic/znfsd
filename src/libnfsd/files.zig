@@ -6,8 +6,18 @@ const Io = std.Io;
 const fh = @import("fh.zig");
 const sys = @import("sys.zig");
 
+/// Where an embedder keeps paths across restarts, so handles stay valid.
+pub const Store = struct {
+    ptr: *anyopaque,
+    remember: *const fn (ptr: *anyopaque, fsid: [16]u8, inode: u64, path: []const u8) void,
+    /// Copies the stored path into `out` and returns its length, if known.
+    lookup: *const fn (ptr: *anyopaque, fsid: [16]u8, inode: u64, out: []u8) ?usize,
+    renamePrefix: *const fn (ptr: *anyopaque, old: []const u8, new: []const u8) void,
+};
+
 pub const Files = struct {
     gpa: std.mem.Allocator,
+    store: ?Store = null,
     mutex: Io.Mutex = .init,
     paths: std.AutoHashMapUnmanaged(Key, []u8) = .empty,
 
@@ -40,6 +50,7 @@ pub const Files = struct {
             f.paths.removeByPtr(gop.key_ptr);
             return err;
         };
+        if (f.store) |s| s.remember(s.ptr, h.fsid, h.inode, path);
     }
 
     pub fn forget(f: *Files, io: Io, h: fh.Handle) Io.Cancelable!void {
@@ -61,6 +72,15 @@ pub const Files = struct {
             f.gpa.free(path);
             p.* = moved;
         }
+        if (f.store) |s| s.renamePrefix(s.ptr, old, new);
+    }
+
+    /// The last-known path of a file, copied into `arena`.
+    pub fn pathOf(f: *Files, io: Io, arena: std.mem.Allocator, fsid: [16]u8, inode: u64) !?[]const u8 {
+        try f.mutex.lock(io);
+        defer f.mutex.unlock(io);
+        const p = f.paths.get(.{ .fsid = fsid, .inode = inode }) orelse return null;
+        return try arena.dupe(u8, p);
     }
 
     pub const ResolveError = error{Stale} || Io.Cancelable;
@@ -68,16 +88,25 @@ pub const Files = struct {
     /// Copies `h`'s path into `out`, NUL-terminated, and stats it; the file
     /// there must still be `h`'s.
     pub fn resolve(f: *Files, io: Io, h: fh.Handle, out: *[sys.max_path + 1]u8, attr: *sys.Attr) ResolveError![:0]const u8 {
-        const path = path: {
+        const cached = cached: {
             try f.mutex.lock(io);
             defer f.mutex.unlock(io);
-            const p = f.paths.get(key(h)) orelse return error.Stale;
+            const p = f.paths.get(key(h)) orelse break :cached false;
             @memcpy(out[0..p.len], p);
             out[p.len] = 0;
-            break :path out[0..p.len :0];
+            break :cached true;
         };
+        const len = if (cached)
+            std.mem.indexOfScalar(u8, out, 0).?
+        else if (f.store) |s|
+            s.lookup(s.ptr, h.fsid, h.inode, out[0..sys.max_path]) orelse return error.Stale
+        else
+            return error.Stale;
+        out[len] = 0;
+        const path = out[0..len :0];
         if (sys.lstat(path, attr) != .SUCCESS) return error.Stale;
         if (attr.ino != h.inode or !h.eql(fh.Handle.fromAttr(h.export_id, attr.*))) return error.Stale;
+        if (!cached) f.remember(io, h, path) catch {};
         return path;
     }
 };

@@ -59,15 +59,17 @@ A rule is (path, client, options). Stored rules come from the hooks; ephemeral r
 version │ export ID │ filesystem ID │ inode │ generation
 ```
 
-Handles name a file without its path, so they survive renames. Built so far: resolution through the last-known path, cached in memory by MNT, LOOKUP, and READDIRPLUS, with export roots always recognized, so root handles survive restarts. Planned: libnfsd opens by handle on Linux (`open_by_handle_at`), asks the filesystem for the path on macOS (`fsgetpath`), and otherwise falls back to the last-known path, accepting it only if the inode still matches. Each handle's last-known path is stored and updated on NFS renames.
+Handles name a file without its path, so they survive renames. Built so far: resolution through the last-known path, cached by MNT, LOOKUP, READDIRPLUS, and creation, and kept in the database through libnfsd's `files.Store` hook, so handles survive restarts (locks are reclaimed by handle); export roots are always recognized. Planned: libnfsd opens by handle on Linux (`open_by_handle_at`), asks the filesystem for the path on macOS (`fsgetpath`), and otherwise falls back to the last-known path, accepting it only if the inode still matches. Each handle's last-known path is stored and updated on NFS renames.
 
 ## Locks and recovery
+
+NLM locks live only in memory, with POSIX byte-range semantics per owner (client host, process ID, and owner handle); they coordinate NFS clients with each other, not with processes on the server, since one server process can't hold host locks for many owners. Linux clients use NLM's synchronous procedures; macOS clients use the `_MSG` ones, whose results go back as `_RES` calls to the client's lock manager, found through its portmapper. A blocked request waits in a queue and is granted with a `GRANTED_MSG` callback, sent in the background. With `--no-portmap`, NLM and NSM aren't served.
 
 NLM locks live only in memory. NSM records which clients hold state, and that list persists with an NSM state number. At startup, znfsd increments the number, notifies each listed client with SM_NOTIFY, and for about 90 seconds grants only lock reclaims, so clients recover their locks before new ones compete.
 
 ## State
 
-znfsd stores exports, groups, maps, file handles, mount records, the NSM monitor list, and the NSM state number in SQLite, using WAL mode and a busy timeout. Built so far: export rules (path, client, and every option written out, defaults included), group members, and mount records, which MOUNT keeps through libnfsd's `mount.Store` hook and restores at startup. `serve` lays its ephemeral rules over the stored ones by path and client, and its groups by name. While the daemon runs, commands reach it through the control socket and it writes the database; otherwise commands open the database themselves.
+znfsd stores exports, groups, maps, file handles, mount records, the NSM monitor list, and the NSM state number in SQLite, using WAL mode and a busy timeout. Built so far: export rules (path, client, and every option written out, defaults included), group members, mount records (through `mount.Store`, restored at startup), file handles' paths (through `files.Store`), the NSM state number, and monitored hosts (through `nsm.Store`). `serve` lays its ephemeral rules over the stored ones by path and client, and its groups by name. While the daemon runs, commands reach it through the control socket and it writes the database; otherwise commands open the database themselves.
 
 ## Control socket
 
