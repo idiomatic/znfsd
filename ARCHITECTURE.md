@@ -63,7 +63,7 @@ A rule is (path, client, options). Stored rules come from the hooks; ephemeral r
 version │ export ID │ filesystem ID │ inode │ generation
 ```
 
-Handles name a file without its path, so they survive renames. Built so far: resolution through the last-known path, cached by MNT, LOOKUP, READDIRPLUS, and creation, and kept in the database through libnfsd's `files.Store` hook, so handles survive restarts (locks are reclaimed by handle); export roots are always recognized. Planned: libnfsd opens by handle on Linux (`open_by_handle_at`), asks the filesystem for the path on macOS (`fsgetpath`), and otherwise falls back to the last-known path, accepting it only if the inode still matches. Each handle's last-known path is stored and updated on NFS renames.
+Handles name a file without its path, so they survive renames. Built so far: resolution through the last-known path, cached by MNT, LOOKUP, READDIRPLUS, and creation, and kept in the database through libnfsd's `files.Store` hook, so handles survive restarts (locks are reclaimed by handle); export roots are always recognized. Only new or changed paths are written, and a READDIRPLUS reply's entries go together, in one transaction. Planned: libnfsd opens by handle on Linux (`open_by_handle_at`), asks the filesystem for the path on macOS (`fsgetpath`), and otherwise falls back to the last-known path, accepting it only if the inode still matches. Each handle's last-known path is stored and updated on NFS renames.
 
 ## Locks and recovery
 

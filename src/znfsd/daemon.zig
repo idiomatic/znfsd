@@ -137,6 +137,7 @@ pub fn serve(
     mount.store = db.mountStore();
     var files: libnfsd.files.Files = .init(gpa);
     defer files.deinit();
+    db.io = io;
     files.store = db.filesStore();
     var verifier: [8]u8 = undefined;
     std.mem.writeInt(i64, &verifier, @truncate(Io.Clock.real.now(io).nanoseconds), .big);

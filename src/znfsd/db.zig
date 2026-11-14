@@ -76,6 +76,11 @@ const schema =
 
 pub const Db = struct {
     handle: ?*anyopaque,
+    /// Set by the daemon, for `batch_mutex`.
+    io: ?std.Io = null,
+    /// Keeps batched writes' transactions from nesting: the connection is
+    /// shared by every request.
+    batch_mutex: std.Io.Mutex = .init,
     /// Where the database is, for --run-as to hand it over.
     path: []const u8 = "",
     /// The last error's message, for showing.
@@ -329,7 +334,31 @@ pub const Db = struct {
                     "WHERE substr(path, 1, length(?1) + 1) = ?1 || '/'", &.{ old, new }) catch {};
             }
         };
-        return .{ .ptr = db, .remember = S.remember, .lookup = S.lookup, .renamePrefix = S.renamePrefix };
+        return .{ .ptr = db, .remember = S.remember, .rememberMany = rememberMany, .lookup = S.lookup, .renamePrefix = S.renamePrefix };
+    }
+
+    /// Stores many paths in one transaction.
+    fn rememberMany(ptr: *anyopaque, entries: []const libnfsd.files.Entry) void {
+        const d: *Db = @ptrCast(@alignCast(ptr));
+        const io = d.io orelse {
+            const store = d.filesStore();
+            for (entries) |e| store.remember(d, e.fsid, e.inode, e.path);
+            return;
+        };
+        d.batch_mutex.lockUncancelable(io);
+        defer d.batch_mutex.unlock(io);
+        d.exec("BEGIN IMMEDIATE") catch return;
+        for (entries) |e| {
+            var hex: [32]u8 = std.fmt.bytesToHex(e.fsid, .lower);
+            var ino: [20]u8 = undefined;
+            const inode = std.fmt.bufPrint(&ino, "{d}", .{e.inode}) catch unreachable;
+            _ = d.run("INSERT INTO file_handles (fsid, inode, path) VALUES (?1, ?2, ?3) " ++
+                "ON CONFLICT (fsid, inode) DO UPDATE SET path = excluded.path", &.{ &hex, inode, e.path }) catch {
+                d.exec("ROLLBACK") catch {};
+                return;
+            };
+        }
+        d.exec("COMMIT") catch d.exec("ROLLBACK") catch {};
     }
 
     // The status monitor.
@@ -542,6 +571,16 @@ test "file handle paths persist and move with renamed directories" {
     try testing.expectEqualStrings("/srv/z/b", out[0..s.lookup(s.ptr, fsid, 42, &out).?]);
     try testing.expectEqualStrings("/srv/ab", out[0..s.lookup(s.ptr, fsid, 43, &out).?]);
     try testing.expectEqual(null, s.lookup(s.ptr, fsid, 44, &out));
+
+    // Many at once, in one transaction.
+    db.io = testing.io;
+    const many = [_]libnfsd.files.Entry{
+        .{ .fsid = fsid, .inode = 50, .path = "/srv/x" },
+        .{ .fsid = fsid, .inode = 42, .path = "/srv/moved" },
+    };
+    s.rememberMany.?(s.ptr, &many);
+    try testing.expectEqualStrings("/srv/x", out[0..s.lookup(s.ptr, fsid, 50, &out).?]);
+    try testing.expectEqualStrings("/srv/moved", out[0..s.lookup(s.ptr, fsid, 42, &out).?]);
 }
 
 test "options round trip" {

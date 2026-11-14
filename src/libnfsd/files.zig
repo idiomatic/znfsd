@@ -6,10 +6,20 @@ const Io = std.Io;
 const fh = @import("fh.zig");
 const sys = @import("sys.zig");
 
+/// A file's path, for storing.
+pub const Entry = struct {
+    fsid: [16]u8,
+    inode: u64,
+    path: []const u8,
+};
+
 /// Where an embedder keeps paths across restarts, so handles stay valid.
 pub const Store = struct {
     ptr: *anyopaque,
     remember: *const fn (ptr: *anyopaque, fsid: [16]u8, inode: u64, path: []const u8) void,
+    /// Stores many at once, as in one transaction; without it, `remember`
+    /// is called for each.
+    rememberMany: ?*const fn (ptr: *anyopaque, entries: []const Entry) void = null,
     /// Copies the stored path into `out` and returns its length, if known.
     lookup: *const fn (ptr: *anyopaque, fsid: [16]u8, inode: u64, out: []u8) ?usize,
     renamePrefix: *const fn (ptr: *anyopaque, old: []const u8, new: []const u8) void,
@@ -56,6 +66,36 @@ pub const Files = struct {
             defer sys.@"resume"(caller);
             s.remember(s.ptr, h.fsid, h.inode, path);
         }
+    }
+
+    /// Records many paths, storing only those new or changed, all at once.
+    /// `entries` must stay valid during the call.
+    pub fn rememberAll(f: *Files, io: Io, entries: []const Entry) (std.mem.Allocator.Error || Io.Cancelable)!void {
+        var changed: std.ArrayList(Entry) = .empty;
+        defer changed.deinit(f.gpa);
+        {
+            try f.mutex.lock(io);
+            defer f.mutex.unlock(io);
+            for (entries) |e| {
+                const gop = try f.paths.getOrPut(f.gpa, .{ .fsid = e.fsid, .inode = e.inode });
+                if (gop.found_existing) {
+                    if (std.mem.eql(u8, gop.value_ptr.*, e.path)) continue;
+                    f.gpa.free(gop.value_ptr.*);
+                }
+                gop.value_ptr.* = f.gpa.dupe(u8, e.path) catch |err| {
+                    f.paths.removeByPtr(gop.key_ptr);
+                    return err;
+                };
+                try changed.append(f.gpa, e);
+            }
+        }
+        if (changed.items.len == 0) return;
+        const s = f.store orelse return;
+        const caller = sys.pause();
+        defer sys.@"resume"(caller);
+        if (s.rememberMany) |many| {
+            many(s.ptr, changed.items);
+        } else for (changed.items) |e| s.remember(s.ptr, e.fsid, e.inode, e.path);
     }
 
     pub fn forget(f: *Files, io: Io, h: fh.Handle) Io.Cancelable!void {
@@ -122,6 +162,48 @@ pub const Files = struct {
 };
 
 const testing = std.testing;
+
+test "remember many at once, storing only what changed" {
+    const io = testing.io;
+    const Counting = struct {
+        singles: usize = 0,
+        batches: usize = 0,
+        stored: usize = 0,
+        fn remember(ptr: *anyopaque, _: [16]u8, _: u64, _: []const u8) void {
+            const c: *@This() = @ptrCast(@alignCast(ptr));
+            c.singles += 1;
+        }
+        fn many(ptr: *anyopaque, entries: []const Entry) void {
+            const c: *@This() = @ptrCast(@alignCast(ptr));
+            c.batches += 1;
+            c.stored += entries.len;
+        }
+        fn lookup(_: *anyopaque, _: [16]u8, _: u64, _: []u8) ?usize {
+            return null;
+        }
+        fn rename(_: *anyopaque, _: []const u8, _: []const u8) void {}
+    };
+    var counting: Counting = .{};
+    var files: Files = .init(testing.allocator);
+    defer files.deinit();
+    files.store = .{ .ptr = &counting, .remember = Counting.remember, .rememberMany = Counting.many, .lookup = Counting.lookup, .renamePrefix = Counting.rename };
+    const fsid: [16]u8 = @splat(3);
+    const first = [_]Entry{
+        .{ .fsid = fsid, .inode = 1, .path = "/srv/a" },
+        .{ .fsid = fsid, .inode = 2, .path = "/srv/b" },
+    };
+    try files.rememberAll(io, &first);
+    const again = [_]Entry{
+        .{ .fsid = fsid, .inode = 1, .path = "/srv/a" },
+        .{ .fsid = fsid, .inode = 2, .path = "/srv/c" },
+    };
+    try files.rememberAll(io, &again);
+    try files.rememberAll(io, &again);
+    try testing.expectEqual(2, counting.batches);
+    try testing.expectEqual(3, counting.stored);
+    try testing.expectEqual(0, counting.singles);
+    try testing.expectEqualStrings("/srv/c", files.paths.get(.{ .fsid = fsid, .inode = 2 }).?);
+}
 
 test "renaming a directory moves the paths beneath it" {
     const io = testing.io;

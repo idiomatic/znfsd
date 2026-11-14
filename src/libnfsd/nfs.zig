@@ -556,6 +556,10 @@ const Request = struct {
         const limit = @min(maxcount, r.results.buffer.len + 24) -| 24;
         const export_id = exportId(dir.match.path);
         var dir_used: usize = 0;
+        // Entries' paths, stored together after the loop.
+        var arena_state: std.heap.ArenaAllocator = .init(r.n.gpa);
+        defer arena_state.deinit();
+        var entries: std.ArrayList(@import("files.zig").Entry) = .empty;
         var index: u64 = 0;
         var eof = true;
         while (reader.next()) |entry| {
@@ -581,7 +585,11 @@ const Request = struct {
                 const path = if (dot) null else join(&path_buf, dir.path, entry.name);
                 if (path != null and sys.lstat(path.?, &attr) == .SUCCESS) {
                     const h: fh.Handle = .fromAttr(export_id, attr);
-                    try r.n.files.remember(r.ctx.io, h, path.?);
+                    try entries.append(arena_state.allocator(), .{
+                        .fsid = h.fsid,
+                        .inode = h.inode,
+                        .path = try arena_state.allocator().dupe(u8, path.?),
+                    });
                     try r.postOp(attr);
                     try r.e.boolean(true);
                     try r.e.opaque_(&h.encode());
@@ -593,6 +601,7 @@ const Request = struct {
         }
         try r.e.boolean(false);
         try r.e.boolean(eof);
+        try r.n.files.rememberAll(r.ctx.io, entries.items);
     }
 
     fn fsstat(r: *Request) Error!void {
