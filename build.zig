@@ -22,6 +22,22 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    znfsd.root_module.link_libc = true;
+    znfsd.root_module.addIncludePath(b.path("vendor/sqlite"));
+    znfsd.root_module.addCSourceFile(.{
+        .file = b.path("vendor/sqlite/sqlite3.c"),
+        .flags = &.{
+            "-DSQLITE_DQS=0",
+            "-DSQLITE_THREADSAFE=1",
+            "-DSQLITE_DEFAULT_MEMSTATUS=0",
+            "-DSQLITE_DEFAULT_WAL_SYNCHRONOUS=1",
+            "-DSQLITE_LIKE_DOESNT_MATCH_BLOBS",
+            "-DSQLITE_OMIT_DEPRECATED",
+            "-DSQLITE_OMIT_LOAD_EXTENSION",
+            "-DSQLITE_OMIT_SHARED_CACHE",
+            "-fno-sanitize=undefined",
+        },
+    });
     b.installArtifact(znfsd);
 
     const run = b.addRunArtifact(znfsd);

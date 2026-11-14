@@ -7,6 +7,8 @@ const posix = std.posix;
 const libnfsd = @import("libnfsd");
 const cli = @import("cli.zig");
 const ephemeral = @import("ephemeral.zig");
+const dbm = @import("db.zig");
+const commands = @import("commands.zig");
 
 const usage = @embedFile("usage.txt");
 
@@ -22,7 +24,7 @@ pub fn main(init: std.process.Init) !u8 {
     var stderr_writer: Io.File.Writer = .init(.stderr(), io, &stderr_buffer);
     const stderr = &stderr_writer.interface;
 
-    const status: u8 = run(io, init.gpa, arena, args[1..], stdout, stderr) catch |err| status: {
+    const status: u8 = run(io, init.gpa, arena, init.environ_map, args[1..], stdout, stderr) catch |err| status: {
         try stderr.print("znfsd: {t}\n", .{err});
         break :status 2;
     };
@@ -31,14 +33,42 @@ pub fn main(init: std.process.Init) !u8 {
     return status;
 }
 
-fn run(io: Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, args: []const []const u8, stdout: *Io.Writer, stderr: *Io.Writer) !u8 {
+fn run(
+    io: Io,
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    environ: *const std.process.Environ.Map,
+    args: []const []const u8,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+) !u8 {
     const invocation = try cli.parse(arena, args);
     switch (invocation.command.noun) {
         .help => {
             try stdout.writeAll(usage);
             return 0;
         },
-        .serve => return serve(io, gpa, arena, invocation, stderr),
+        .serve => {
+            var db = try openDb(io, arena, invocation.globals, environ, stderr) orelse return 1;
+            defer db.close();
+            return serve(io, gpa, arena, invocation, &db, stderr);
+        },
+        .@"export", .group, .mount => {
+            var db = try openDb(io, arena, invocation.globals, environ, stderr) orelse return 1;
+            defer db.close();
+            const c: commands.Context = .{ .db = &db, .arena = arena, .out = stdout, .err = stderr };
+            return commands.run(c, invocation.command.noun, invocation.command.verb.?, invocation.command.args) catch |err| switch (err) {
+                error.Sqlite => {
+                    try stderr.print("znfsd: database: {s}\n", .{db.errorMessage()});
+                    return 1;
+                },
+                else => return err,
+            };
+        },
+        .lock => {
+            try stderr.writeAll("znfsd: lock: needs the running daemon, which can't be reached yet\n");
+            return 1;
+        },
         else => |noun| {
             try stderr.print("znfsd {f}: {t}: not implemented\n", .{ libnfsd.version, noun });
             return 1;
@@ -46,7 +76,24 @@ fn run(io: Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, args: []const [
     }
 }
 
-fn serve(io: Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, invocation: cli.Invocation, stderr: *Io.Writer) !u8 {
+/// Opens the database at `--db` or the default path, creating its
+/// directory; reports failures and returns null.
+fn openDb(io: Io, arena: std.mem.Allocator, globals: cli.Globals, environ: *const std.process.Environ.Map, stderr: *Io.Writer) !?dbm.Db {
+    const path: [:0]const u8 = if (globals.db) |p| try arena.dupeSentinel(u8, p, 0) else dbm.defaultPath(arena, environ, libnfsd.sys.isRoot()) catch |err| {
+        try stderr.print("znfsd: no database path: {t}; use --db PATH\n", .{err});
+        return null;
+    };
+    if (std.fs.path.dirname(path)) |dir| Io.Dir.cwd().createDirPath(io, dir) catch |err| {
+        try stderr.print("znfsd: {s}: {t}\n", .{ dir, err });
+        return null;
+    };
+    return dbm.Db.open(path) catch {
+        try stderr.print("znfsd: {s}: can't open the database\n", .{path});
+        return null;
+    };
+}
+
+fn serve(io: Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, invocation: cli.Invocation, db: *dbm.Db, stderr: *Io.Writer) !u8 {
     const options = try cli.parseServe(arena, invocation.command.args);
 
     var binds: std.ArrayList(net.IpAddress) = .empty;
@@ -73,6 +120,18 @@ fn serve(io: Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, invocation: c
 
     var table: libnfsd.exports.Table = .{};
     defer table.groups.deinit(gpa);
+    const stored = db.table(arena) catch |err| {
+        if (err == error.Sqlite) {
+            try stderr.print("znfsd: database: {s}\n", .{db.errorMessage()});
+        } else try stderr.print("znfsd: database: a stored rule is invalid: {t}\n", .{err});
+        return 1;
+    };
+    for (stored.rules.items) |r| if (r.options.map != null) {
+        try stderr.print("znfsd: stored rule for {s}: maps aren't implemented yet\n", .{r.path});
+        return 1;
+    };
+    var stored_groups = stored.groups.iterator();
+    while (stored_groups.next()) |g| try table.groups.put(gpa, g.key_ptr.*, g.value_ptr.items);
     if (options.maps.len > 0) {
         try stderr.writeAll("znfsd: --map: maps aren't implemented yet\n");
         return 2;
@@ -109,10 +168,20 @@ fn serve(io: Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, invocation: c
             try rules.append(arena, .{ .path = path, .client = client, .options = parsed.options });
         }
     }
+    // Stored rules apply unless an ephemeral one has the same path and client.
+    const ephemeral_count = rules.items.len;
+    for (stored.rules.items) |r| {
+        const shadowed = for (rules.items[0..ephemeral_count]) |e| {
+            if (std.mem.eql(u8, e.path, r.path) and sameClient(e.client, r.client)) break true;
+        } else false;
+        if (!shadowed) try rules.append(arena, r);
+    }
     table.rules = rules.items;
 
     var mount: libnfsd.mount.Mount = .init(gpa, &table);
     defer mount.deinit();
+    for (try db.mounts(arena, null)) |m| try mount.restore(io, m.host, m.path);
+    mount.store = db.mountStore();
     var files: libnfsd.files.Files = .init(gpa);
     defer files.deinit();
     var verifier: [8]u8 = undefined;
@@ -150,6 +219,16 @@ fn serve(io: Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, invocation: c
     }
 }
 
+fn sameClient(a: libnfsd.exports.Client, b: libnfsd.exports.Client) bool {
+    var abuf: [300]u8 = undefined;
+    var bbuf: [300]u8 = undefined;
+    var aw: Io.Writer = .fixed(&abuf);
+    var bw: Io.Writer = .fixed(&bbuf);
+    a.format(&aw) catch return false;
+    b.format(&bw) catch return false;
+    return std.mem.eql(u8, aw.buffered(), bw.buffered());
+}
+
 const Outcome = union(enum) {
     running,
     canceled,
@@ -177,4 +256,6 @@ fn runService(
 test {
     _ = cli;
     _ = ephemeral;
+    _ = dbm;
+    _ = commands;
 }

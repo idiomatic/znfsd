@@ -187,12 +187,15 @@ fn inUse(err: anytype, name: []const u8, address: net.IpAddress, diag: *Diagnost
 /// Whether a portmapper answers at `address`, first waking macOS's
 /// on-demand `rpcbind`, which can take a few seconds to answer.
 fn probe(io: Io, address: net.IpAddress) bool {
-    const woke = portmap.wakeMacos(io);
+    // Only the system's own portmapper, on port 111, is woken.
+    const woke = address.getPort() == portmap.port and portmap.wakeMacos(io);
     var client = portmap.Client.init(io, address, .{ .raw = .fromMilliseconds(300), .clock = .awake }) catch return false;
     defer client.deinit();
     // Until `rpcbind` binds its port, a ping can fail at once (connection
     // refused), so retry until a deadline rather than a number of times.
-    const patience: Io.Clock.Duration = .{ .raw = .fromSeconds(if (woke) 6 else 1), .clock = .awake };
+    // launchd won't relaunch a daemon within 10 s of its last launch, and
+    // `rpcbind` exits when idle, so a wake can take that long.
+    const patience: Io.Clock.Duration = .{ .raw = .fromSeconds(if (woke) 15 else 1), .clock = .awake };
     const deadline: Io.Clock.Timestamp = .fromNow(io, patience);
     while (true) {
         client.ping() catch |err| {

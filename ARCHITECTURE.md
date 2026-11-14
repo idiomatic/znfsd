@@ -36,7 +36,7 @@ Built so far: XDR and RPC, UDP and TCP serving, the portmapper and registration,
 | NLM | 100021 | 4 | 32803 |
 | NSM | 100024 | 1 | 32765 |
 
-Each program listens on TCP and UDP at every `--bind` address. When both `0.0.0.0` and `::` are requested, as by default, znfsd binds one dual-stack `::` socket instead, which also serves IPv4: Zig 0.17 can't make a TCP listener IPv6-only, and on Linux the two would collide. At startup, znfsd probes port 111; on macOS, it first connects to `/var/run/portmap.socket`, which makes launchd start the on-demand `rpcbind`, and retries for up to 6 seconds, since `rpcbind` takes a moment to answer after a wake, and until it binds, pings fail at once rather than time out. It exits when idle, but stays while it holds registrations. If a portmapper answers, znfsd registers with it; otherwise it serves its own when root, or exits. With `--no-portmap`, it skips the portmapper entirely and serves only NFS and MOUNT on their fixed ports. Any existing registration or bound port that znfsd needs is fatal, which keeps it from silently sharing duties with the host's own NFS services.
+Each program listens on TCP and UDP at every `--bind` address. When both `0.0.0.0` and `::` are requested, as by default, znfsd binds one dual-stack `::` socket instead, which also serves IPv4: Zig 0.17 can't make a TCP listener IPv6-only, and on Linux the two would collide. At startup, znfsd probes port 111; on macOS, it first connects to `/var/run/portmap.socket`, which makes launchd start the on-demand `rpcbind`, and retries for up to 15 seconds: launchd waits 10 seconds before relaunching a daemon that recently ran, and until `rpcbind` binds, pings fail at once rather than time out. It exits when idle, but stays while it holds registrations. If a portmapper answers, znfsd registers with it; otherwise it serves its own when root, or exits. With `--no-portmap`, it skips the portmapper entirely and serves only NFS and MOUNT on their fixed ports. Any existing registration or bound port that znfsd needs is fatal, which keeps it from silently sharing duties with the host's own NFS services.
 
 ## Requests
 
@@ -67,7 +67,7 @@ NLM locks live only in memory. NSM records which clients hold state, and that li
 
 ## State
 
-znfsd stores exports, groups, maps, file handles, mount records, the NSM monitor list, and the NSM state number in SQLite, using WAL mode and a busy timeout. While the daemon runs, commands reach it through the control socket and it writes the database; otherwise commands open the database themselves.
+znfsd stores exports, groups, maps, file handles, mount records, the NSM monitor list, and the NSM state number in SQLite, using WAL mode and a busy timeout. Built so far: export rules (path, client, and every option written out, defaults included), group members, and mount records, which MOUNT keeps through libnfsd's `mount.Store` hook and restores at startup. `serve` lays its ephemeral rules over the stored ones by path and client, and its groups by name. While the daemon runs, commands reach it through the control socket and it writes the database; otherwise commands open the database themselves.
 
 ## I/O
 

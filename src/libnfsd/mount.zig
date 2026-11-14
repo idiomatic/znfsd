@@ -51,8 +51,17 @@ pub const Record = struct {
     path: []const u8,
 };
 
+/// Where an embedder keeps mount records across restarts.
+pub const Store = struct {
+    ptr: *anyopaque,
+    mounted: *const fn (ptr: *anyopaque, host: []const u8, path: []const u8) void,
+    /// Forgets `host`'s mount of `path`, or of everything when null.
+    unmounted: *const fn (ptr: *anyopaque, host: []const u8, path: ?[]const u8) void,
+};
+
 pub const Mount = struct {
     gpa: std.mem.Allocator,
+    store: ?Store = null,
     /// Exported paths must be canonical.
     table: *const exports.Table,
     mutex: Io.Mutex = .init,
@@ -65,6 +74,11 @@ pub const Mount = struct {
     pub fn deinit(m: *Mount) void {
         for (m.records.items) |r| m.freeRecord(r);
         m.records.deinit(m.gpa);
+    }
+
+    /// Adds a record kept from before a restart, without storing it again.
+    pub fn restore(m: *Mount, io: Io, host: []const u8, path: []const u8) !void {
+        _ = try m.add(io, host, path);
     }
 
     pub fn program(m: *Mount) server.Program {
@@ -170,18 +184,25 @@ pub const Mount = struct {
     }
 
     fn remember(m: *Mount, io: Io, host: []const u8, path: []const u8) !void {
+        if (try m.add(io, host, path)) if (m.store) |s| s.mounted(s.ptr, host, path);
+    }
+
+    /// Adds a record; returns whether it was new.
+    fn add(m: *Mount, io: Io, host: []const u8, path: []const u8) !bool {
         try m.mutex.lock(io);
         defer m.mutex.unlock(io);
         for (m.records.items) |r| {
-            if (std.mem.eql(u8, r.host, host) and std.mem.eql(u8, r.path, path)) return;
+            if (std.mem.eql(u8, r.host, host) and std.mem.eql(u8, r.path, path)) return false;
         }
         const record: Record = .{ .host = try m.gpa.dupe(u8, host), .path = try m.gpa.dupe(u8, path) };
         errdefer m.freeRecord(record);
         try m.records.append(m.gpa, record);
+        return true;
     }
 
     /// Forgets `host`'s mount of `path`, or of everything when null.
     fn forget(m: *Mount, io: Io, host: []const u8, path: ?[]const u8) !void {
+        if (m.store) |s| s.unmounted(s.ptr, host, path);
         try m.mutex.lock(io);
         defer m.mutex.unlock(io);
         var i: usize = 0;
