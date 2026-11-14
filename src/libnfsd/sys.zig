@@ -237,11 +237,60 @@ pub fn chownIn(dir: Fd, name: [*:0]const u8, uid: ?u32, gid: ?u32) E {
     return check(c.fchownat(dir, name, uid orelse std.math.maxInt(u32), gid orelse std.math.maxInt(u32), c.AT.SYMLINK_NOFOLLOW));
 }
 
-/// Changes the mode of a non-link entry of `dir`. macOS refuses to follow a
-/// final symbolic link; Linux can't chmod links at all, so callers skip them.
+/// Changes the mode of an entry of `dir`, never following a final symbolic
+/// link: `fchmodat` with `AT_SYMLINK_NOFOLLOW` on macOS, `fchmodat2` on
+/// Linux (6.6+), whose `fchmodat` lacks the flag. Links themselves can't be
+/// changed on Linux, so callers skip them.
 pub fn chmodIn(dir: Fd, name: [*:0]const u8, mode: u32) E {
-    const flags: c_uint = if (builtin.os.tag.isDarwin()) c.AT.SYMLINK_NOFOLLOW else 0;
-    return check(c.fchmodat(dir, name, @intCast(mode), flags));
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        const rc = linux.syscall4(.fchmodat2, @bitCast(@as(isize, dir)), @intFromPtr(name), mode, c.AT.SYMLINK_NOFOLLOW);
+        return linux.errno(rc);
+    }
+    return check(c.fchmodat(dir, name, @intCast(mode), c.AT.SYMLINK_NOFOLLOW));
+}
+
+/// Opens like `openVerified`, but when refused for want of permission on a
+/// file the effective user owns (the caller being acted as, else this
+/// process), briefly grants the owner read and write to open it, as a local
+/// owner could: an owner may always change a file's mode, and a file stays
+/// usable once open. Linux's kernel server calls this the owner override.
+pub fn openOwned(path: [*:0]const u8, flags: c.O, ino: u64, fd: *Fd, attr: *Attr) E {
+    const e = openVerified(path, flags, ino, fd, attr);
+    if (e != .ACCES) return e;
+    const owner = if (acting) |a| a.uid else c.geteuid();
+    const full = std.mem.span(path);
+    const dir_path = std.fs.path.dirname(full) orelse return e;
+    const base = full[dir_path.len + 1 ..];
+    var dir_buf: [max_path + 1]u8 = undefined;
+    @memcpy(dir_buf[0..dir_path.len], dir_path);
+    dir_buf[dir_path.len] = 0;
+    var dir: Fd = undefined;
+    if (openSafe(dir_buf[0..dir_path.len :0], .{ .DIRECTORY = true }, 0, &dir) != .SUCCESS) return e;
+    defer closeFd(dir);
+    var name_buf: [max_path + 1]u8 = undefined;
+    @memcpy(name_buf[0..base.len], base);
+    name_buf[base.len] = 0;
+    const name = name_buf[0..base.len :0];
+    var before: Attr = undefined;
+    if (statIn(dir, name, &before) != .SUCCESS or before.ino != ino) return .STALE;
+    if (before.uid != owner or before.mode & std.posix.S.IFMT != std.posix.S.IFREG) return e;
+    const mode = before.mode & 0o7777;
+    if (chmodIn(dir, name, mode | 0o600) != .SUCCESS) return e;
+    var o = flags;
+    o.NOFOLLOW = true;
+    o.NONBLOCK = true;
+    o.CLOEXEC = true;
+    const r = c.openat(dir, name, o, @as(c.mode_t, 0));
+    const open_errno = if (r < 0) errno() else E.SUCCESS;
+    _ = chmodIn(dir, name, mode);
+    if (open_errno != .SUCCESS) return open_errno;
+    fd.* = r;
+    if (fstat(r, attr) != .SUCCESS or attr.ino != ino) {
+        closeFd(r);
+        return .STALE;
+    }
+    return .SUCCESS;
 }
 
 pub fn setTimesIn(dir: Fd, name: [*:0]const u8, atime: SetTime, mtime: SetTime) E {
@@ -613,6 +662,32 @@ test "act as another user, then revert" {
     try testing.expectEqual(4242, attr.uid);
     try testing.expectEqual(E.SUCCESS, statIn(dir, "server", &attr));
     try testing.expectEqual(0, attr.uid);
+}
+
+test "an owner opens their own file whatever its mode" {
+    if (isRoot()) return error.SkipZigTest; // root needs no override
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "hal", .data = "9000" });
+    var buf: [max_path]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(io, &buf)];
+    var z: [max_path + 1]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&z, "{s}/hal", .{root}, 0);
+    var attr: Attr = undefined;
+    try testing.expectEqual(E.SUCCESS, lstat(path, &attr));
+    var fd: Fd = undefined;
+    try testing.expectEqual(E.SUCCESS, openSafe(path, .{}, 0, &fd));
+    try testing.expectEqual(E.SUCCESS, chmodFd(fd, 0));
+    closeFd(fd);
+
+    try testing.expectEqual(E.ACCES, openVerified(path, .{ .ACCMODE = .WRONLY }, attr.ino, &fd, &attr));
+    try testing.expectEqual(E.SUCCESS, openOwned(path, .{ .ACCMODE = .WRONLY }, attr.ino, &fd, &attr));
+    try testing.expectEqual(E.SUCCESS, writeAt(fd, 0, "2001"));
+    closeFd(fd);
+    // The mode is as it was.
+    try testing.expectEqual(E.SUCCESS, lstat(path, &attr));
+    try testing.expectEqual(0, attr.mode & 0o7777);
 }
 
 test "lstat a directory and a missing path" {

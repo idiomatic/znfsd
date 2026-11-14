@@ -495,7 +495,7 @@ const Request = struct {
         var got: usize = 0;
         var fd: sys.Fd = undefined;
         var now: sys.Attr = undefined;
-        var e = sys.openVerified(f.path, .{}, f.handle.inode, &fd, &now);
+        var e = sys.openOwned(f.path, .{}, f.handle.inode, &fd, &now);
         if (e == .SUCCESS) {
             e = sys.readFd(fd, offset, data, &got);
             sys.closeFd(fd);
@@ -715,34 +715,19 @@ const Request = struct {
         }
 
         const kind = ftype(f.attr.mode);
-        if (kind == .reg or kind == .dir) {
+        // Only truncation needs the file open; the rest goes through its
+        // directory, which works whatever the file's own mode.
+        if (s.size) |size| {
             var fd: sys.Fd = undefined;
             var now: sys.Attr = undefined;
-            const flags: std.c.O = if (kind == .dir) .{ .DIRECTORY = true } else if (s.size != null) .{ .ACCMODE = .WRONLY } else .{};
-            var e = sys.openVerified(f.path, flags, f.handle.inode, &fd, &now);
+            var e = sys.openOwned(f.path, .{ .ACCMODE = .WRONLY }, f.handle.inode, &fd, &now);
             if (e != .SUCCESS) return .fromErrno(e);
             defer sys.closeFd(fd);
-            if (s.size) |size| {
-                e = sys.truncateFd(fd, size);
-                if (e != .SUCCESS) return .fromErrno(e);
-            }
-            if (s.mode) |mode| {
-                e = sys.chmodFd(fd, mode & 0o7777);
-                if (e != .SUCCESS) return .fromErrno(e);
-            }
-            if (s.uid != null or s.gid != null) {
-                e = sys.chownFd(fd, s.uid, s.gid);
-                if (e != .SUCCESS) return .fromErrno(e);
-            }
-            if (s.atime != .omit or s.mtime != .omit) {
-                e = sys.setTimesFd(fd, s.atime, s.mtime);
-                if (e != .SUCCESS) return .fromErrno(e);
-            }
-            if (s.size != null) _ = sys.sync(fd);
-            return .ok;
+            e = sys.truncateFd(fd, size);
+            if (e == .SUCCESS) e = sys.sync(fd);
+            if (e != .SUCCESS) return .fromErrno(e);
         }
-        // Links, FIFOs, sockets, and devices: through their directory, so
-        // nothing is opened or followed.
+        if (s.mode == null and s.uid == null and s.gid == null and s.atime == .omit and s.mtime == .omit) return .ok;
         var parent: Parent = undefined;
         const pe = r.openParent(f, &parent);
         if (pe != .ok) return pe;
@@ -821,7 +806,7 @@ const Request = struct {
         const n = @min(count, data.len);
         var fd: sys.Fd = undefined;
         var post: sys.Attr = undefined;
-        var e = sys.openVerified(f.path, .{ .ACCMODE = .WRONLY }, f.handle.inode, &fd, &post);
+        var e = sys.openOwned(f.path, .{ .ACCMODE = .WRONLY }, f.handle.inode, &fd, &post);
         if (e == .SUCCESS) {
             e = sys.writeAt(fd, offset, data[0..n]);
             if (e == .SUCCESS) e = sys.sync(fd);
@@ -850,7 +835,7 @@ const Request = struct {
         // Writes are already on disk; sync anyway for writes made locally.
         var fd: sys.Fd = undefined;
         var post: sys.Attr = undefined;
-        if (ftype(f.attr.mode) == .reg and sys.openVerified(f.path, .{}, f.handle.inode, &fd, &post) == .SUCCESS) {
+        if (ftype(f.attr.mode) == .reg and sys.openOwned(f.path, .{}, f.handle.inode, &fd, &post) == .SUCCESS) {
             _ = sys.sync(fd);
             sys.closeFd(fd);
         }
