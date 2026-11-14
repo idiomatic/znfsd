@@ -26,6 +26,7 @@ SQLite is vendored as its C amalgamation in [vendor/sqlite](vendor/sqlite/README
 ```sh
 zig build                 # build zig-out/bin/znfsd
 zig build test            # run unit tests
+zig build test -Dtest-filter=NAME   # only tests whose names contain NAME
 zig build run -- help     # run znfsd with arguments
 zig fmt build.zig src     # format
 ```
@@ -35,6 +36,16 @@ Cross-compile static Linux binaries for test machines:
 ```sh
 zig build -Dtarget=aarch64-linux-musl -Doptimize=ReleaseSafe --prefix /tmp/znfsd-linux
 ```
+
+## Fuzzing
+
+`src/libnfsd/fuzz.zig` feeds untrusted bytes to TCP record marking and to `server.dispatch`, with all five programs over a scratch export whose options (read-only, squash, map) vary per input. Each input makes up to eight calls, raw or built from parts: file handles taken from earlier replies, likely names, numbers, and bytes. An input fails on a panic, a leak, or an error log. NLM's `_MSG` procedures are skipped, since their callbacks wait on the caller's portmapper. `zig build test` replays 300 fixed pseudorandom inputs per target; to search:
+
+```sh
+zig build test --fuzz=1M -Doptimize=ReleaseSafe -Dtest-filter="fuzz dispatch"
+```
+
+Run it on Linux as root too (a throwaway VM), where acting as callers, `openat2`, and `fchmodat2` come into play. Smith replays inputs eight bytes per value and maps out-of-range values to the minimum, so the harness draws whole `u64`s and reduces them itself, with zero (exhausted input) meaning the common choice.
 
 ## Test tiers
 

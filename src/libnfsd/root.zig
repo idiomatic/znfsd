@@ -24,4 +24,5 @@ pub const version: std.SemanticVersion = .{ .major = 0, .minor = 0, .patch = 0 }
 
 test {
     std.testing.refAllDecls(@This());
+    _ = @import("fuzz.zig");
 }

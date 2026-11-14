@@ -46,8 +46,9 @@ pub fn build(b: *std.Build) void {
     b.step("run", "Run znfsd").dependOn(&run.step);
 
     const test_step = b.step("test", "Run unit tests");
+    const filters = b.option([]const []const u8, "test-filter", "Run only tests whose names contain this (repeatable)") orelse &.{};
     for ([_]*std.Build.Module{ libnfsd, znfsd.root_module }) |module| {
-        const tests = b.addTest(.{ .root_module = module });
+        const tests = b.addTest(.{ .root_module = module, .filters = filters });
         test_step.dependOn(&b.addRunArtifact(tests).step);
     }
 }

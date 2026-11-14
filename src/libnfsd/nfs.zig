@@ -1325,7 +1325,8 @@ const Fixture = struct {
         var buf: [sys.max_path]u8 = undefined;
         const n = try f.tmp.dir.realPath(io, &buf);
         f.root = try std.fmt.allocPrint(testing.allocator, "{s}/share", .{buf[0..n]});
-        f.rules = .{.{ .path = f.root, .client = .any, .options = .{} }};
+        // Root's calls aren't squashed, so they reach the test directory.
+        f.rules = .{.{ .path = f.root, .client = .any, .options = .{ .squash = if (sys.isRoot()) .none else .root } }};
         f.table = .{ .rules = &f.rules };
         f.files = .init(testing.allocator);
         f.nfs = .init(testing.allocator, &f.table, &f.files, "znfsd-t\x00".*);
@@ -1536,8 +1537,6 @@ test "create, write, set attributes, rename, link, and remove" {
     var f: Fixture = undefined;
     try f.init();
     defer f.deinit();
-    // Run as root, the caller is root, whom the default squashes.
-    if (sys.isRoot()) f.rules[0].options.squash = .none;
     const nfs = f.nfs.program();
     const root = try f.rootHandle();
     var a: Args = .{};

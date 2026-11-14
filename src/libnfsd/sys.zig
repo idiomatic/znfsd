@@ -159,10 +159,17 @@ pub fn fstat(fd: Fd, attr: *Attr) E {
 }
 
 /// Writes all of `data` at `offset`.
+/// `offset + done` as a file offset, or null past the largest.
+fn fileOffset(offset: u64, done: usize) ?c.off_t {
+    return std.math.cast(c.off_t, std.math.add(u64, offset, done) catch return null);
+}
+
+/// Writes all of `data` at `offset`; past the largest file offset, `FBIG`.
 pub fn writeAt(fd: Fd, offset: u64, data: []const u8) E {
+    if (fileOffset(offset, data.len) == null) return .FBIG;
     var done: usize = 0;
     while (done < data.len) {
-        const r = c.pwrite(fd, data[done..].ptr, data.len - done, @intCast(offset + done));
+        const r = c.pwrite(fd, data[done..].ptr, data.len - done, fileOffset(offset, done).?);
         if (r < 0) {
             if (errno() == .INTR) continue;
             return errno();
@@ -172,11 +179,16 @@ pub fn writeAt(fd: Fd, offset: u64, data: []const u8) E {
     return .SUCCESS;
 }
 
-/// Reads up to `out.len` bytes at `offset`.
+/// Reads up to `out.len` bytes at `offset`; nothing past the largest file
+/// offset, as at the end of a file.
 pub fn readFd(fd: Fd, offset: u64, out: []u8, n: *usize) E {
     var done: usize = 0;
     while (done < out.len) {
-        const r = c.pread(fd, out[done..].ptr, out.len - done, @intCast(offset + done));
+        const at = fileOffset(offset, done) orelse break;
+        // Linux refuses reads that would end past the largest offset.
+        const room: u64 = @intCast(std.math.maxInt(c.off_t) - at);
+        if (room == 0) break;
+        const r = c.pread(fd, out[done..].ptr, @intCast(@min(out.len - done, room)), at);
         if (r < 0) {
             if (errno() == .INTR) continue;
             return errno();
@@ -197,11 +209,11 @@ pub fn sync(fd: Fd) E {
 }
 
 pub fn truncateFd(fd: Fd, size: u64) E {
-    return check(c.ftruncate(fd, @intCast(size)));
+    return check(c.ftruncate(fd, std.math.cast(c.off_t, size) orelse return .FBIG));
 }
 
 pub fn chmodFd(fd: Fd, mode: u32) E {
-    return check(c.fchmod(fd, @intCast(mode)));
+    return check(c.fchmod(fd, @intCast(mode & 0o7777)));
 }
 
 pub fn chownFd(fd: Fd, uid: ?u32, gid: ?u32) E {
@@ -244,10 +256,10 @@ pub fn chownIn(dir: Fd, name: [*:0]const u8, uid: ?u32, gid: ?u32) E {
 pub fn chmodIn(dir: Fd, name: [*:0]const u8, mode: u32) E {
     if (builtin.os.tag == .linux) {
         const linux = std.os.linux;
-        const rc = linux.syscall4(.fchmodat2, @bitCast(@as(isize, dir)), @intFromPtr(name), mode, c.AT.SYMLINK_NOFOLLOW);
+        const rc = linux.syscall4(.fchmodat2, @bitCast(@as(isize, dir)), @intFromPtr(name), mode & 0o7777, c.AT.SYMLINK_NOFOLLOW);
         return linux.errno(rc);
     }
-    return check(c.fchmodat(dir, name, @intCast(mode), c.AT.SYMLINK_NOFOLLOW));
+    return check(c.fchmodat(dir, name, @intCast(mode & 0o7777), c.AT.SYMLINK_NOFOLLOW));
 }
 
 /// Opens like `openVerified`, but when refused for want of permission on a
@@ -301,14 +313,14 @@ pub fn setTimesIn(dir: Fd, name: [*:0]const u8, atime: SetTime, mtime: SetTime) 
 /// Opens or creates a regular file in `dir`, never following a link there.
 pub fn createIn(dir: Fd, name: [*:0]const u8, exclusive: bool, mode: u32, fd: *Fd) E {
     const o: c.O = .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = exclusive, .NOFOLLOW = true, .CLOEXEC = true, .NONBLOCK = true };
-    const r = c.openat(dir, name, o, @as(c.mode_t, @intCast(mode)));
+    const r = c.openat(dir, name, o, @as(c.mode_t, @intCast(mode & 0o7777)));
     if (r < 0) return errno();
     fd.* = r;
     return .SUCCESS;
 }
 
 pub fn mkdirIn(dir: Fd, name: [*:0]const u8, mode: u32) E {
-    return check(c.mkdirat(dir, name, @intCast(mode)));
+    return check(c.mkdirat(dir, name, @intCast(mode & 0o7777)));
 }
 
 pub fn symlinkIn(target: [*:0]const u8, dir: Fd, name: [*:0]const u8) E {
@@ -317,8 +329,14 @@ pub fn symlinkIn(target: [*:0]const u8, dir: Fd, name: [*:0]const u8) E {
 
 extern "c" fn mknodat(dir: Fd, path: [*:0]const u8, mode: c.mode_t, dev: c.dev_t) c_int;
 
+/// `mode` holds the file type and permissions; a `dev` too large for the
+/// host is `INVAL`.
 pub fn mknodIn(dir: Fd, name: [*:0]const u8, mode: u32, dev: u64) E {
-    return check(mknodat(dir, name, @intCast(mode), @intCast(dev)));
+    const d: c.dev_t = if (@typeInfo(c.dev_t).int.signedness == .signed)
+        std.math.cast(c.dev_t, @as(i64, @bitCast(dev))) orelse return .INVAL
+    else
+        std.math.cast(c.dev_t, dev) orelse return .INVAL;
+    return check(mknodat(dir, name, @intCast(mode & 0o177777), d));
 }
 
 pub fn unlinkIn(dir: Fd, name: [*:0]const u8, directory: bool) E {
@@ -688,6 +706,28 @@ test "an owner opens their own file whatever its mode" {
     // The mode is as it was.
     try testing.expectEqual(E.SUCCESS, lstat(path, &attr));
     try testing.expectEqual(0, attr.mode & 0o7777);
+}
+
+test "offsets past the largest file offset" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "hal", .data = "9000" });
+    var buf: [max_path]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(io, &buf)];
+    var z: [max_path + 1]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&z, "{s}/hal", .{root}, 0);
+    var fd: Fd = undefined;
+    try testing.expectEqual(E.SUCCESS, openSafe(path, .{ .ACCMODE = .RDWR }, 0, &fd));
+    defer closeFd(fd);
+    var out: [4]u8 = undefined;
+    var n: usize = 1;
+    for ([_]u64{ std.math.maxInt(i64), std.math.maxInt(i64) + 1, std.math.maxInt(u64) }) |offset| {
+        try testing.expectEqual(E.SUCCESS, readFd(fd, offset, &out, &n));
+        try testing.expectEqual(0, n);
+        try testing.expectEqual(E.FBIG, writeAt(fd, offset, "2001"));
+    }
+    try testing.expectEqual(E.FBIG, truncateFd(fd, std.math.maxInt(u64)));
 }
 
 test "lstat a directory and a missing path" {
