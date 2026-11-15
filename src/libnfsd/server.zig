@@ -139,6 +139,8 @@ pub const ConnectionOptions = struct {
     /// in any order, matched by XID. Each can hold two records' worth of
     /// buffers.
     max_calls: usize = 16,
+    /// Connections open at once on a listener; more are closed unserved.
+    max_connections: usize = 1024,
     /// Told of every call answered.
     observer: ?*const Observer = null,
 };
@@ -153,6 +155,7 @@ pub fn serveTcp(
 ) Io.Cancelable!void {
     var connections: Io.Group = .init;
     defer connections.cancel(io);
+    var open: std.atomic.Value(usize) = .init(0);
     while (true) {
         const stream = listener.accept(io) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
@@ -161,11 +164,24 @@ pub fn serveTcp(
                 continue;
             },
         };
-        connections.concurrent(io, serveConnection, .{ io, gpa, programs, stream, options }) catch |err| {
+        if (open.load(.monotonic) >= options.max_connections) {
+            log.warn("tcp: {d} connections open, refusing {f}", .{ options.max_connections, stream.socket.address });
+            stream.close(io);
+            continue;
+        }
+        _ = open.fetchAdd(1, .monotonic);
+        connections.concurrent(io, counted, .{ &open, io, gpa, programs, stream, options }) catch |err| {
+            _ = open.fetchSub(1, .monotonic);
             log.warn("tcp connection: {t}", .{err});
             stream.close(io);
         };
     }
+}
+
+/// Serves a connection, counted among those open until it ends.
+fn counted(open: *std.atomic.Value(usize), io: Io, gpa: std.mem.Allocator, programs: []const Program, stream: net.Stream, options: ConnectionOptions) Io.Cancelable!void {
+    defer _ = open.fetchSub(1, .monotonic);
+    return serveConnection(io, gpa, programs, stream, options);
 }
 
 /// A call's buffers: its record, and room for its reply.

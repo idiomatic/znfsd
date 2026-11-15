@@ -460,8 +460,11 @@ const Request = struct {
         };
         const wanted = try r.d.u32_();
         const c = r.creds(f.match.rule);
-        const can_read = c.allows(f.attr, 4);
-        const can_write = c.allows(f.attr, 2);
+        // Owners may read and write their files whatever the mode, as READ
+        // and WRITE allow.
+        const owns_file = ftype(f.attr.mode) == .reg and c.uid == f.attr.uid;
+        const can_read = owns_file or c.allows(f.attr, 4);
+        const can_write = owns_file or c.allows(f.attr, 2);
         const can_exec = c.allows(f.attr, 1);
         var granted: u32 = 0;
         if (can_read) granted |= Access.read;
@@ -533,10 +536,10 @@ const Request = struct {
             sys.closeFd(fd);
         }
         try r.status(.fromErrno(e));
-        try r.postOp(f.attr);
+        try r.postOp(if (e == .SUCCESS) now else f.attr);
         if (e != .SUCCESS) return;
         try r.e.u32_(@intCast(got));
-        try r.e.boolean(offset + got >= f.attr.size);
+        try r.e.boolean(offset +| got >= now.size);
         try r.e.opaque_(data[0..got]);
     }
 
@@ -655,9 +658,9 @@ const Request = struct {
         try r.status(.fromErrno(e));
         try r.postOp(f.attr);
         if (e != .SUCCESS) return;
-        try r.e.u64_(s.blocks * s.block_size);
-        try r.e.u64_(s.blocks_free * s.block_size);
-        try r.e.u64_(s.blocks_avail * s.block_size);
+        try r.e.u64_(s.blocks *| s.block_size);
+        try r.e.u64_(s.blocks_free *| s.block_size);
+        try r.e.u64_(s.blocks_avail *| s.block_size);
         try r.e.u64_(s.files);
         try r.e.u64_(s.files_free);
         try r.e.u64_(s.files_free);
@@ -767,7 +770,7 @@ const Request = struct {
         }
         if (s.mode == null and s.uid == null and s.gid == null and s.atime == .omit and s.mtime == .omit) return .ok;
         var parent: Parent = undefined;
-        const pe = r.openParent(f, &parent);
+        const pe = Request.openParent(f, &parent);
         if (pe != .ok) return pe;
         defer sys.closeFd(parent.fd);
         if (s.mode) |mode| if (kind != .lnk) {
@@ -792,8 +795,7 @@ const Request = struct {
     };
 
     /// Opens the directory holding `f` and checks the entry is still `f`.
-    fn openParent(r: *Request, f: Found, p: *Parent) Status {
-        _ = r;
+    fn openParent(f: Found, p: *Parent) Status {
         const dir = std.fs.path.dirname(f.path) orelse return .inval;
         const base = std.fs.path.basename(f.path);
         if (base.len > max_name) return .nametoolong;
@@ -801,12 +803,10 @@ const Request = struct {
         p.name_buf[base.len] = 0;
         p.name = p.name_buf[0..base.len :0];
         var dir_buf: [sys.max_path + 1]u8 = undefined;
-        var dir_attr: sys.Attr = undefined;
         var e = sys.openSafe(copyZ(&dir_buf, dir), .{ .DIRECTORY = true }, 0, &p.fd);
         if (e != .SUCCESS) return .stale;
         var attr: sys.Attr = undefined;
         e = sys.statIn(p.fd, p.name, &attr);
-        _ = &dir_attr;
         if (e != .SUCCESS or attr.ino != f.handle.inode) {
             sys.closeFd(p.fd);
             return .stale;
@@ -1212,7 +1212,7 @@ const Request = struct {
             .ok;
         if (st == .ok) {
             var parent: Parent = undefined;
-            st = r.openParent(f, &parent);
+            st = Request.openParent(f, &parent);
             if (st == .ok) {
                 st = .fromErrno(sys.linkIn(parent.fd, parent.name, w.fd, w.name));
                 sys.closeFd(parent.fd);

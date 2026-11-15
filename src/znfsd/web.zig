@@ -72,7 +72,10 @@ fn answer(io: Io, gpa: std.mem.Allocator, stream: net.Stream, provider: Provider
 
     const request_line = reader.interface.takeDelimiterInclusive('\n') catch return;
     var host: []const u8 = "";
+    var headers: usize = 0;
     while (true) {
+        headers += 1;
+        if (headers > 100) return;
         const line = reader.interface.takeDelimiterInclusive('\n') catch return;
         const trimmed = std.mem.trimEnd(u8, line, "\r\n");
         if (trimmed.len == 0) break;

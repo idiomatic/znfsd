@@ -280,7 +280,7 @@ pub fn openOwned(path: [*:0]const u8, flags: c.O, ino: u64, fd: *Fd, attr: *Attr
     const owner = if (acting) |a| a.uid else c.geteuid();
     const full = std.mem.span(path);
     const dir_path = std.fs.path.dirname(full) orelse return e;
-    const base = full[dir_path.len + 1 ..];
+    const base = std.fs.path.basename(full);
     var dir_buf: [max_path + 1]u8 = undefined;
     @memcpy(dir_buf[0..dir_path.len], dir_path);
     dir_buf[dir_path.len] = 0;
@@ -319,6 +319,11 @@ pub fn setTimesIn(dir: Fd, name: [*:0]const u8, atime: SetTime, mtime: SetTime) 
 
 /// Opens or creates a regular file in `dir`, never following a link there.
 pub fn createIn(dir: Fd, name: [*:0]const u8, exclusive: bool, mode: u32, fd: *Fd) E {
+    // An existing device or FIFO isn't opened: opening can have effects.
+    var existing: Attr = undefined;
+    if (!exclusive and statIn(dir, name, &existing) == .SUCCESS and existing.mode & posix.S.IFMT != posix.S.IFREG) {
+        return if (existing.mode & posix.S.IFMT == posix.S.IFDIR) .ISDIR else .INVAL;
+    }
     const o: c.O = .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = exclusive, .NOFOLLOW = true, .CLOEXEC = true, .NONBLOCK = true };
     const r = c.openat(dir, name, o, @as(c.mode_t, @intCast(mode & 0o7777)));
     if (r < 0) return errno();
