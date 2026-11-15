@@ -74,6 +74,9 @@ const schema =
     \\);
 ;
 
+/// Whether this thread holds `Db.batch_mutex`, inside a transaction.
+threadlocal var in_batch = false;
+
 pub const Db = struct {
     handle: ?*anyopaque,
     /// Set by the daemon, for `batch_mutex`.
@@ -135,6 +138,12 @@ pub const Db = struct {
     /// Runs `sql` with text parameters, ignoring any rows; returns how many
     /// rows it changed.
     pub fn run(db: *Db, sql: []const u8, params: []const []const u8) Error!usize {
+        // Writes wait for any batch's transaction, so a batch's rollback
+        // can't undo another thread's write; the batch itself runs on.
+        const io = db.io;
+        const wait = io != null and !in_batch;
+        if (wait) db.batch_mutex.lockUncancelable(io.?);
+        defer if (wait) db.batch_mutex.unlock(io.?);
         var stmt = try db.prepare(sql, params);
         defer stmt.finish();
         while (try stmt.next()) {}
@@ -347,6 +356,8 @@ pub const Db = struct {
         };
         d.batch_mutex.lockUncancelable(io);
         defer d.batch_mutex.unlock(io);
+        in_batch = true;
+        defer in_batch = false;
         d.exec("BEGIN IMMEDIATE") catch return;
         for (entries) |e| {
             var hex: [32]u8 = std.fmt.bytesToHex(e.fsid, .lower);

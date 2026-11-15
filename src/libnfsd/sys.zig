@@ -402,13 +402,15 @@ pub fn become(id: Identity) E {
         saveServerGroups();
         const n = @min(id.gids.len, max_groups);
         const rc = linux.syscall2(.setgroups, n, @intFromPtr(id.gids.ptr));
-        if (linux.errno(rc) != .SUCCESS) return linux.errno(rc);
+        if (linux.errno(rc) != .SUCCESS) return restoreLinux(linux.errno(rc));
         // setfsuid and setfsgid report the previous ID, never an error, so
-        // a second call checks the first took.
+        // a second call checks the first took. A failure after the first
+        // change restores the server's own identity, so no thread is left
+        // half-changed.
         _ = linux.syscall1(.setfsgid, id.gid);
-        if (linux.syscall1(.setfsgid, id.gid) != id.gid) return .PERM;
+        if (linux.syscall1(.setfsgid, id.gid) != id.gid) return restoreLinux(.PERM);
         _ = linux.syscall1(.setfsuid, id.uid);
-        if (linux.syscall1(.setfsuid, id.uid) != id.uid) return .PERM;
+        if (linux.syscall1(.setfsuid, id.uid) != id.uid) return restoreLinux(.PERM);
     } else if (builtin.os.tag.isDarwin()) {
         // From another identity, return to the process's first.
         if (acting != null) _ = pthread_setugid_np(kauth_none, kauth_none);
@@ -420,14 +422,20 @@ pub fn become(id: Identity) E {
     return .SUCCESS;
 }
 
+/// Puts this thread's Linux identity back to the server's, returning `e`.
+fn restoreLinux(e: E) E {
+    const linux = std.os.linux;
+    _ = linux.syscall1(.setfsuid, 0);
+    _ = linux.syscall1(.setfsgid, 0);
+    _ = linux.syscall2(.setgroups, server_groups_len, @intFromPtr(&server_groups));
+    return e;
+}
+
 /// Returns this thread to the server's own identity.
 pub fn revert() void {
     if (acting == null) return;
     if (builtin.os.tag == .linux) {
-        const linux = std.os.linux;
-        _ = linux.syscall1(.setfsuid, 0);
-        _ = linux.syscall1(.setfsgid, 0);
-        _ = linux.syscall2(.setgroups, server_groups_len, @intFromPtr(&server_groups));
+        _ = restoreLinux(.SUCCESS);
     } else if (builtin.os.tag.isDarwin()) {
         _ = pthread_setugid_np(kauth_none, kauth_none);
     }

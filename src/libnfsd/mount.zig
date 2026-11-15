@@ -183,13 +183,22 @@ pub const Mount = struct {
     fn mnt(m: *Mount, ctx: server.Context, host: []const u8, path: []const u8, out: *[fh.size]u8) !Status {
         var canonical_buf: [sys.max_path]u8 = undefined;
         var canonical: []const u8 = undefined;
-        switch (sys.canonical(path, &canonical_buf, &canonical)) {
-            .SUCCESS => {},
-            .NOENT => return .noent,
-            .NOTDIR => return .notdir,
-            .NAMETOOLONG => return .nametoolong,
-            .ACCES => return .acces,
-            else => return .io,
+        const resolved = sys.canonical(path, &canonical_buf, &canonical);
+        if (resolved != .SUCCESS) {
+            // Callers the path's export doesn't admit learn nothing about
+            // what exists.
+            var parts = std.mem.splitScalar(u8, path, '/');
+            const dotdot = while (parts.next()) |p| {
+                if (std.mem.eql(u8, p, "..")) break true;
+            } else false;
+            if (dotdot or m.currentTable().match(path, ctx.from, null) == null) return .acces;
+            return switch (resolved) {
+                .NOENT => .noent,
+                .NOTDIR => .notdir,
+                .NAMETOOLONG => .nametoolong,
+                .ACCES => .acces,
+                else => .io,
+            };
         }
         const match = m.currentTable().match(canonical, ctx.from, null) orelse return .acces;
 

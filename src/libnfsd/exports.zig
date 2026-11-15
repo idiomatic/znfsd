@@ -259,6 +259,12 @@ pub const Table = struct {
         return out.items;
     }
 
+    /// Whether any rule covers `peer`, for services that name no path.
+    pub fn admits(t: *const Table, peer: net.IpAddress, name: ?[]const u8) bool {
+        for (t.rules) |r| if (r.client.matches(peer, name, &t.groups)) return true;
+        return false;
+    }
+
     pub const Match = struct {
         /// The export containing the requested path.
         path: []const u8,
@@ -371,6 +377,13 @@ test "the most specific client wins, whole" {
     try testing.expectEqual(null, t.match("/srv/home", ip("192.168.1.1"), null));
     try testing.expectEqual(null, t.match("/srvx", ip("10.1.2.3"), null));
     try testing.expectEqual(null, t.match("/etc", ip("10.1.2.3"), null));
+}
+
+test "a table admits only peers some rule covers" {
+    const rules = [_]Rule{.{ .path = "/srv", .client = try .parse("10.1.0.0/16"), .options = .{} }};
+    const t: Table = .{ .rules = &rules };
+    try testing.expect(t.admits(ip("10.1.2.3"), null));
+    try testing.expect(!t.admits(ip("192.168.1.1"), null));
 }
 
 test "maps translate UIDs and GIDs independently, with anon" {

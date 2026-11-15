@@ -93,6 +93,17 @@ pub const Nsm = struct {
         if (n.store) |s| s.monitor(s.ptr, .{ .name = name, .address = text });
     }
 
+    /// Whether `name` is monitored at `address`, the only place requests
+    /// to release its locks are accepted from.
+    pub fn monitoredAt(n: *Nsm, io: Io, name: []const u8, address: net.IpAddress) bool {
+        var buf: [64]u8 = undefined;
+        const text = addressText(address, &buf);
+        n.mutex.lock(io) catch return false;
+        defer n.mutex.unlock(io);
+        const at = n.hosts.get(name) orelse return false;
+        return std.mem.eql(u8, at, text);
+    }
+
     /// Stops monitoring `name`, which holds no more locks.
     pub fn unmonitor(n: *Nsm, io: Io, name: []const u8) !void {
         try n.mutex.lock(io);
@@ -154,9 +165,10 @@ pub const Nsm = struct {
             },
             .unmon, .unmon_all => try e.u32_(n.state),
             .notify => {
-                const name = try d.string(max_name);
+                _ = try d.string(max_name);
                 _ = try d.u32_();
-                // Match the name, or the address it came from.
+                // Only the host's own address can say it restarted, whatever
+                // name it gives; others' locks are theirs to keep.
                 var buf: [64]u8 = undefined;
                 const from = addressText(ctx.from, &buf);
                 var names: std.ArrayList([]u8) = .empty;
@@ -169,12 +181,11 @@ pub const Nsm = struct {
                     defer n.mutex.unlock(ctx.io);
                     var it = n.hosts.iterator();
                     while (it.next()) |h| {
-                        if (std.ascii.eqlIgnoreCase(h.key_ptr.*, name) or std.mem.eql(u8, h.value_ptr.*, from)) {
+                        if (std.mem.eql(u8, h.value_ptr.*, from)) {
                             try names.append(n.gpa, try n.gpa.dupe(u8, h.key_ptr.*));
                         }
                     }
                 }
-                if (names.items.len == 0) try names.append(n.gpa, try n.gpa.dupe(u8, name));
                 for (names.items) |host| {
                     if (n.rebooted) |r| r.call(r.ptr, ctx.io, host);
                     try n.unmonitor(ctx.io, host);

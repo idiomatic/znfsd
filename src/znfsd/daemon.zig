@@ -147,7 +147,6 @@ pub fn serve(
     // before are told, and get a grace period to reclaim them.
     const state = try db.advanceNsmState();
     const previous = try db.monitors(arena);
-    for (previous) |h| try db.deleteMonitor(h.name);
     var locks: libnfsd.locks.Locks = .init(gpa);
     defer locks.deinit();
     var status: libnfsd.nsm.Nsm = .init(gpa, state);
@@ -157,6 +156,7 @@ pub fn serve(
     defer nlm.deinit(io);
     status.rebooted = nlm.rebooted();
     const locking = !options.no_portmap;
+    if (!locking) for (previous) |h| try db.deleteMonitor(h.name);
     if (locking and previous.len > 0) nlm.startGrace(io);
 
     d.mount = &mount;
@@ -214,7 +214,7 @@ pub fn serve(
     var result: Outcome = .running;
     var service = try io.concurrent(runService, .{ io, gpa, config, registrations.items, &diag, &result });
     var controller = try io.concurrent(control.serve, .{ io, gpa, &socket, d.handler() });
-    var notifier = try io.concurrent(notifyRestart, .{ io, if (locking) previous else &.{}, state });
+    var notifier = try io.concurrent(notifyRestart, .{ io, gpa, db, if (locking) previous else &.{}, state });
     var monitor: ?Io.Future(Io.Cancelable!void) = if (web_server) |*w|
         try io.concurrent(web.serve, .{ io, gpa, w, d.provider() })
     else
@@ -495,20 +495,25 @@ fn fileOf(path: []const u8) ?libnfsd.locks.File {
 
 /// After a restart, tells the hosts that held locks, once our services are
 /// registered, retrying those that don't answer.
-fn notifyRestart(io: Io, hosts: []const libnfsd.nsm.Host, state: u32) void {
-    var pending: [256]bool = @splat(true);
-    const count = @min(hosts.len, pending.len);
+/// A host stays in the database until told, or until retries run out, so
+/// a crash meanwhile doesn't lose it.
+fn notifyRestart(io: Io, gpa: std.mem.Allocator, db: *dbm.Db, hosts: []const libnfsd.nsm.Host, state: u32) void {
+    const pending = gpa.alloc(bool, hosts.len) catch return;
+    defer gpa.free(pending);
+    @memset(pending, true);
     for (0..5) |_| {
         io.sleep(.fromSeconds(2), .awake) catch return;
         var left: usize = 0;
-        for (hosts[0..count], 0..) |h, i| {
-            if (!pending[i]) continue;
+        for (hosts, pending) |h, *p| {
+            if (!p.*) continue;
             if (libnfsd.nsm.notify(io, &.{h}, state) == 1) {
-                pending[i] = false;
+                p.* = false;
+                db.deleteMonitor(h.name) catch {};
             } else left += 1;
         }
         if (left == 0) return;
     }
+    for (hosts, pending) |h, p| if (p) db.deleteMonitor(h.name) catch {};
 }
 
 fn sameClient(a: exports.Client, b: exports.Client) bool {

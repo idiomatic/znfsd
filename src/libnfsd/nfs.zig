@@ -188,6 +188,11 @@ pub const Nfs = struct {
         }
     };
 
+    /// Whether an export rule covers `from`, as NLM requires of any caller.
+    pub fn admits(n: *Nfs, from: Io.net.IpAddress) bool {
+        return @atomicLoad(*const exports.Table, &n.table, .acquire).admits(from, null);
+    }
+
     /// The file a handle names, if it still exists and `from` may reach
     /// it, as for NLM's lock requests.
     pub fn locate(n: *Nfs, io: Io, bytes: []const u8, from: Io.net.IpAddress, out: *Located) bool {
@@ -851,14 +856,21 @@ const Request = struct {
             },
         };
         // The whole file, whatever the range: fsync has no finer grain.
-        var fd: sys.Fd = undefined;
-        var post: sys.Attr = undefined;
-        if (ftype(f.attr.mode) == .reg and sys.openOwned(f.path, .{}, f.handle.inode, &fd, &post) == .SUCCESS) {
-            _ = sys.sync(fd);
-            sys.closeFd(fd);
+        // Writers may lack read permission, so open for writing first.
+        var e: sys.E = .SUCCESS;
+        if (ftype(f.attr.mode) == .reg) {
+            var fd: sys.Fd = undefined;
+            var post: sys.Attr = undefined;
+            e = sys.openOwned(f.path, .{ .ACCMODE = .WRONLY }, f.handle.inode, &fd, &post);
+            if (e == .ACCES) e = sys.openOwned(f.path, .{}, f.handle.inode, &fd, &post);
+            if (e == .SUCCESS) {
+                e = sys.sync(fd);
+                sys.closeFd(fd);
+            }
         }
-        try r.status(.ok);
+        try r.status(.fromErrno(e));
         try r.wccData(f.attr, f.attr);
+        if (e != .SUCCESS) return;
         try r.e.fixedOpaque(&r.n.verifier);
     }
 

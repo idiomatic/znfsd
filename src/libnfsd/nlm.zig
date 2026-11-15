@@ -199,7 +199,10 @@ pub const Nlm = struct {
                 return .success;
             },
             .test_msg, .lock_msg, .cancel_msg, .unlock_msg => {
-                // Answer with the matching `_RES` call; send no reply.
+                // Answer with the matching `_RES` call; send no reply. Calls
+                // from hosts no export covers get nothing, so a spoofed
+                // source can't aim our callbacks at others.
+                if (!n.nfs.admits(ctx.from)) return .none;
                 const sync: Proc = @fromBackingInt(@intCast(call.proc - 5));
                 var buf: [max_netobj * 2 + 64]u8 = undefined;
                 var w: Io.Writer = .fixed(&buf);
@@ -227,7 +230,8 @@ pub const Nlm = struct {
             .free_all => {
                 const name = try d.string(max_string + 1);
                 _ = try d.i32_();
-                _ = try n.releaseHost(ctx.io, name, null);
+                // A host frees its own locks, from where it holds them.
+                if (n.nsm.monitoredAt(ctx.io, name, ctx.from)) _ = try n.releaseHost(ctx.io, name, null);
                 return .success;
             },
             _ => return .proc_unavail,
@@ -278,12 +282,14 @@ pub const Nlm = struct {
                 _ = try d.boolean(); // block
                 _ = try d.boolean(); // exclusive
                 const lock: LockArgs = try .decode(d);
+                if (!n.nfs.admits(ctx.from)) return e.enumeration(Stat.denied);
                 const h = fh.Handle.decode(lock.fh) catch return e.enumeration(Stat.stale_fh);
                 n.cancel(ctx.io, .{ .fsid = h.fsid, .inode = h.inode }, lock) catch {};
                 try e.enumeration(Stat.granted);
             },
             .unlock => {
                 const lock: LockArgs = try .decode(d);
+                if (!n.nfs.admits(ctx.from)) return e.enumeration(Stat.denied);
                 const h = fh.Handle.decode(lock.fh) catch return e.enumeration(Stat.stale_fh);
                 try n.locks.release(ctx.io, .{ .fsid = h.fsid, .inode = h.inode }, lock.owner(), lock.range());
                 if (!try n.locks.hostHolds(ctx.io, lock.caller_name)) n.nsm.unmonitor(ctx.io, lock.caller_name) catch {};
