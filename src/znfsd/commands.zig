@@ -43,10 +43,14 @@ fn exportPath(c: Context, path: []const u8, must_exist: bool) !?[]const u8 {
 
 /// Checks a client's syntax and returns it as written.
 fn client(c: Context, text: []const u8) !?[]const u8 {
-    _ = exports.Client.parse(text) catch {
+    const parsed = exports.Client.parse(text) catch {
         try c.err.print("znfsd: {s}: not a host, *.domain, CIDR, @group, or *\n", .{text});
         return null;
     };
+    if (parsed.needsName()) {
+        try c.err.print("znfsd: {s}: host names aren't matched yet; use an address, CIDR, @group, or *\n", .{text});
+        return null;
+    }
     return text;
 }
 

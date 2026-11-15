@@ -48,7 +48,11 @@ pub fn parseExport(arena: std.mem.Allocator, text: []const u8) Error!Export {
     if (colon) |c| {
         var clients: std.ArrayList(exports.Client) = .empty;
         var it = std.mem.tokenizeScalar(u8, rest[c + 1 ..], ',');
-        while (it.next()) |client| try clients.append(arena, try .parse(client));
+        while (it.next()) |client| {
+            const parsed: exports.Client = try .parse(client);
+            if (parsed.needsName()) return error.BadClient;
+            try clients.append(arena, parsed);
+        }
         if (clients.items.len > 0) result.clients = clients.items;
     }
     return result;
@@ -67,6 +71,7 @@ pub fn parseGroup(arena: std.mem.Allocator, text: []const u8) Error!Group {
     while (it.next()) |client| {
         const c: exports.Client = try .parse(client);
         if (c == .group) return error.BadGroup;
+        if (c.needsName()) return error.BadClient;
         try clients.append(arena, c);
     }
     if (clients.items.len == 0) return error.BadGroup;

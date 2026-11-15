@@ -58,6 +58,12 @@ pub const Client = union(enum) {
         return .{ .host = text };
     }
 
+    /// Whether matching needs the peer's name, which isn't resolved yet,
+    /// so such a rule never matches.
+    pub fn needsName(c: Client) bool {
+        return c == .host or c == .domain;
+    }
+
     /// Writes the client as written in a rule.
     pub fn format(c: Client, w: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (c) {

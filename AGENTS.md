@@ -25,7 +25,7 @@ NFS v3 server daemon with few options and sensible defaults.
 * `lock` commands: need the daemon; without it, `list` is empty and `del` fails
 * `mount` commands: work with or without the daemon
 * Rule matching: the most specific CLIENT wins, whole, without merging: host, longest CIDR, longest `*.domain`, `@GROUP`, `*`
-* Host and `*.domain` matching: forward-confirmed reverse DNS, cached, resolved asynchronously
+* Host and `*.domain` matching: forward-confirmed reverse DNS, cached, resolved asynchronously; until built, new rules and groups refuse such CLIENTs, since they'd match no one
 * `--bind`: repeatable; default `0.0.0.0` and `::`
 * Ports: fixed; nfs 2049, mount 20048, stat 32765, lock 32803
 * TCP connections: up to 16 calls at once each; replies in any order, matched by XID

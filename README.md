@@ -63,7 +63,7 @@ mount -o anon \\hal\srv\projects P:
 An export rule pairs a path with a client and options:
 
 * Clients are a host name, a `*.domain` wildcard, a CIDR, a `@group`, or `*`. When several rules match, the most specific wins outright: an exact host beats a CIDR, a longer CIDR beats a shorter one, and so on down to `*`. The winning rule's options aren't merged with others.
-* Host names will be checked with forward-confirmed reverse DNS, so a forged PTR record alone can't claim a name. That isn't built yet: for now, host and `*.domain` rules match no one, so use addresses or CIDRs.
+* Host names will be checked with forward-confirmed reverse DNS, so a forged PTR record alone can't claim a name. That isn't built yet: for now, host and `*.domain` rules would match no one, so new rules and groups refuse them: use addresses or CIDRs.
 * `rw` is the default; `ro` makes the export read-only.
 * `squash=root` (the default) treats the client's root as an anonymous user; `squash=all` does so for every user; `squash=none` trusts client IDs as sent.
 
