@@ -105,6 +105,10 @@ pub const Db = struct {
         errdefer db.close();
         _ = sqlite.sqlite3_busy_timeout(handle, 5000);
         try db.exec("PRAGMA journal_mode = WAL");
+        // WAL syncs at checkpoints, not each commit: a power loss can drop
+        // the last commits, never corrupt, and the file-handle cache writes
+        // on every first lookup. The NSM state number is checkpointed.
+        try db.exec("PRAGMA synchronous = NORMAL");
         try db.exec("PRAGMA foreign_keys = ON");
         try db.exec("BEGIN IMMEDIATE");
         try db.exec(schema);
@@ -386,6 +390,8 @@ pub const Db = struct {
         var buf: [16]u8 = undefined;
         const text = std.fmt.bufPrint(&buf, "{d}", .{state}) catch unreachable;
         _ = try db.run("INSERT INTO nsm (id, state) VALUES (1, ?1) ON CONFLICT (id) DO UPDATE SET state = excluded.state", &.{text});
+        // A repeated state number would make clients ignore our restart.
+        try db.exec("PRAGMA wal_checkpoint(FULL)");
         return state;
     }
 

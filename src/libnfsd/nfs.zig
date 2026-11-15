@@ -353,10 +353,20 @@ const Request = struct {
             .root => if (r.auth.uid == 0) return anon,
             .none => {},
         }
-        const x = m orelse return .{ .uid = r.auth.uid, .gid = r.auth.gid, .gids = r.auth.gids() };
-        const gids = r.auth.gids();
-        for (gids, r.gid_buf[0..gids.len]) |g, *out| out.* = x.localGid(g);
-        return .{ .uid = x.localUid(r.auth.uid), .gid = x.localGid(r.auth.gid), .gids = r.gid_buf[0..gids.len] };
+        // Squashing root squashes group 0 too: as the primary group it
+        // becomes the anon's, and from the supplementary groups it goes.
+        const squash_group = rule.options.squash == .root;
+        var n: usize = 0;
+        for (r.auth.gids()) |g| {
+            if (squash_group and g == 0) continue;
+            r.gid_buf[n] = if (m) |x| x.localGid(g) else g;
+            n += 1;
+        }
+        const gid = if (squash_group and r.auth.gid == 0)
+            anon.gid
+        else if (m) |x| x.localGid(r.auth.gid) else r.auth.gid;
+        const uid = if (m) |x| x.localUid(r.auth.uid) else r.auth.uid;
+        return .{ .uid = uid, .gid = gid, .gids = r.gid_buf[0..n] };
     }
 
     fn mapOf(r: *const Request, rule: *const exports.Rule) ?exports.Map {
@@ -533,7 +543,7 @@ const Request = struct {
     fn readdir(r: *Request, plus: bool) Error!void {
         const found = try r.find(&r.path_buf);
         const cookie = try r.d.u64_();
-        _ = try r.d.fixedOpaque(8); // cookie verifier: not checked
+        const sent_verf = (try r.d.fixedOpaque(8))[0..8].*;
         const dircount = if (plus) try r.d.u32_() else std.math.maxInt(u32);
         const maxcount = try r.d.u32_();
         const dir = switch (found) {
@@ -555,6 +565,15 @@ const Request = struct {
             try r.status(.toosmall);
             return r.postOp(dir.attr);
         }
+        // Cookies count entries, so they hold only while the directory is
+        // unchanged; after a change, the client starts over.
+        var verf: [8]u8 = undefined;
+        std.mem.writeInt(u32, verf[0..4], @truncate(@as(u64, @bitCast(dir.attr.mtime.sec))), .big);
+        std.mem.writeInt(u32, verf[4..8], dir.attr.mtime.nsec, .big);
+        if (cookie != 0 and !std.mem.eql(u8, &verf, &sent_verf)) {
+            try r.status(.bad_cookie);
+            return r.postOp(dir.attr);
+        }
         var reader: sys.DirReader = undefined;
         var dir_fd: sys.Fd = undefined;
         var now: sys.Attr = undefined;
@@ -568,9 +587,6 @@ const Request = struct {
 
         try r.status(.ok);
         try r.postOp(dir.attr);
-        var verf: [8]u8 = undefined;
-        std.mem.writeInt(u32, verf[0..4], @truncate(@as(u64, @bitCast(dir.attr.mtime.sec))), .big);
-        std.mem.writeInt(u32, verf[4..8], dir.attr.mtime.nsec, .big);
         try r.e.fixedOpaque(&verf);
 
         // Budgets: the whole reply (`maxcount`), and for READDIRPLUS the
@@ -1504,19 +1520,21 @@ test "read directories, plain and plus, across several calls" {
         names.deinit(testing.allocator);
     }
     var cookie: u64 = 0;
+    var verf: [8]u8 = @splat(0);
     var calls: usize = 0;
     while (true) : (calls += 1) {
         // READDIRPLUS with a small budget, forcing several calls.
         var extra: [28]u8 = undefined;
         std.mem.writeInt(u64, extra[0..8], cookie, .big);
-        @memset(extra[8..16], 0);
+        extra[8..16].* = verf;
         std.mem.writeInt(u32, extra[16..20], 4096, .big); // dircount
         std.mem.writeInt(u32, extra[20..24], 400, .big); // maxcount
         var args: [128]u8 = undefined;
         var d: xdr.Decoder = .init(try f.call(f.nfs.program(), @backingInt(Proc.readdirplus), handleArgs(&args, root, extra[0..24])));
         try testing.expectEqual(Status.ok, try d.enumeration(Status));
         _ = try d.boolean();
-        _ = try d.fixedOpaque(84 + 8);
+        _ = try d.fixedOpaque(84);
+        verf = (try d.fixedOpaque(8))[0..8].*;
         while (try d.boolean()) {
             _ = try d.u64_();
             try names.append(testing.allocator, try testing.allocator.dupe(u8, try d.string(max_name)));
@@ -1535,6 +1553,22 @@ test "read directories, plain and plus, across several calls" {
     try testing.expectEqual(5, names.items.len);
     // Entries found by READDIRPLUS resolve without a LOOKUP.
     try testing.expect((try f.lookup(root, "dir")) == .ok);
+}
+
+test "a continued READDIR with a stale verifier is a bad cookie" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const root = try f.rootHandle();
+    var extra: [16]u8 = undefined;
+    std.mem.writeInt(u64, extra[0..8], 2, .big);
+    @memset(extra[8..16], 0xff);
+    var tail: [8]u8 = undefined;
+    std.mem.writeInt(u32, tail[0..4], 4096, .big);
+    std.mem.writeInt(u32, tail[4..8], 4096, .big);
+    var args: [128]u8 = undefined;
+    var d: xdr.Decoder = .init(try f.call(f.nfs.program(), @backingInt(Proc.readdir), handleArgs(&args, root, &(extra ++ tail[4..8].*))));
+    try testing.expectEqual(Status.bad_cookie, try d.enumeration(Status));
 }
 
 /// Builds arguments: a handle, then XDR items.

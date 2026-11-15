@@ -49,17 +49,20 @@ pub const Files = struct {
 
     /// Records `path` as where `h`'s file is.
     pub fn remember(f: *Files, io: Io, h: fh.Handle, path: []const u8) (std.mem.Allocator.Error || Io.Cancelable)!void {
-        try f.mutex.lock(io);
-        defer f.mutex.unlock(io);
-        const gop = try f.paths.getOrPut(f.gpa, key(h));
-        if (gop.found_existing) {
-            if (std.mem.eql(u8, gop.value_ptr.*, path)) return;
-            f.gpa.free(gop.value_ptr.*);
+        {
+            // The store can be slow, so the lock isn't held across it.
+            try f.mutex.lock(io);
+            defer f.mutex.unlock(io);
+            const gop = try f.paths.getOrPut(f.gpa, key(h));
+            if (gop.found_existing) {
+                if (std.mem.eql(u8, gop.value_ptr.*, path)) return;
+                f.gpa.free(gop.value_ptr.*);
+            }
+            gop.value_ptr.* = f.gpa.dupe(u8, path) catch |err| {
+                f.paths.removeByPtr(gop.key_ptr);
+                return err;
+            };
         }
-        gop.value_ptr.* = f.gpa.dupe(u8, path) catch |err| {
-            f.paths.removeByPtr(gop.key_ptr);
-            return err;
-        };
         if (f.store) |s| {
             // The store is the server's own: never touched as a caller.
             const caller = sys.pause();

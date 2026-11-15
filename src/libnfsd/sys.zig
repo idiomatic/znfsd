@@ -204,7 +204,14 @@ fn check(rc: c_int) E {
     return if (rc == 0) .SUCCESS else errno();
 }
 
+/// Flushes `fd` to stable storage. macOS's `fsync` stops at the drive's
+/// cache, so it asks for `F_FULLFSYNC` first, falling back to `fsync` on
+/// file systems that refuse.
 pub fn sync(fd: Fd) E {
+    if (builtin.os.tag.isDarwin()) {
+        const F_FULLFSYNC = 51;
+        if (c.fcntl(fd, F_FULLFSYNC) == 0) return .SUCCESS;
+    }
     return check(c.fsync(fd));
 }
 
