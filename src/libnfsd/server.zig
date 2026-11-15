@@ -194,6 +194,8 @@ const Slot = struct {
     /// An allocator may wait on a cancelable lock and drop the cancelation
     /// (`DebugAllocator`'s stack traces do, on macOS), which would leave
     /// the next read deaf to it, so cancelation is blocked meanwhile.
+    /// Needless from the Zig release after 0.17.1, which has
+    /// https://codeberg.org/ziglang/zig/pulls/36010.
     fn allocate(slot: *Slot, io: Io, gpa: std.mem.Allocator, size: usize) std.mem.Allocator.Error!void {
         const protection = io.swapCancelProtection(.blocked);
         defer _ = io.swapCancelProtection(protection);
