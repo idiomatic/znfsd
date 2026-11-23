@@ -108,18 +108,25 @@ pub const Files = struct {
     }
 
     /// After a directory moves from `old` to `new`, moves the cached paths
-    /// of everything beneath it too.
+    /// of everything beneath it too, forgetting those grown too long to use.
     pub fn renamePrefix(f: *Files, io: Io, old: []const u8, new: []const u8) (std.mem.Allocator.Error || Io.Cancelable)!void {
         try f.mutex.lock(io);
         defer f.mutex.unlock(io);
-        var it = f.paths.valueIterator();
-        while (it.next()) |p| {
-            const path = p.*;
+        var too_long: std.ArrayList(Key) = .empty;
+        defer too_long.deinit(f.gpa);
+        var it = f.paths.iterator();
+        while (it.next()) |kv| {
+            const path = kv.value_ptr.*;
             if (!std.mem.startsWith(u8, path, old) or path.len == old.len or path[old.len] != '/') continue;
+            if (new.len + path.len - old.len > sys.max_path) {
+                try too_long.append(f.gpa, kv.key_ptr.*);
+                continue;
+            }
             const moved = try std.mem.concat(f.gpa, u8, &.{ new, path[old.len..] });
             f.gpa.free(path);
-            p.* = moved;
+            kv.value_ptr.* = moved;
         }
+        for (too_long.items) |k| if (f.paths.fetchRemove(k)) |kv| f.gpa.free(kv.value);
         if (f.store) |s| {
             const caller = sys.pause();
             defer sys.@"resume"(caller);
@@ -144,6 +151,7 @@ pub const Files = struct {
             try f.mutex.lock(io);
             defer f.mutex.unlock(io);
             const p = f.paths.get(key(h)) orelse break :cached false;
+            if (p.len > sys.max_path) return error.Stale;
             @memcpy(out[0..p.len], p);
             out[p.len] = 0;
             break :cached true;
@@ -224,6 +232,19 @@ test "renaming a directory moves the paths beneath it" {
     try testing.expectEqualStrings("/srv/a", files.paths.get(.{ .fsid = @splat(0), .inode = 1 }).?);
     try testing.expectEqualStrings("/srv/z/b/c", files.paths.get(.{ .fsid = @splat(0), .inode = 2 }).?);
     try testing.expectEqualStrings("/srv/ab", files.paths.get(.{ .fsid = @splat(0), .inode = 3 }).?);
+
+    // A path grown past the limit is forgotten, not kept to overflow later.
+    var deep: [sys.max_path - 8]u8 = @splat('d');
+    @memcpy(deep[0..7], "/srv/z/");
+    try files.remember(io, h(4), &deep);
+    var long: [256]u8 = @splat('n');
+    @memcpy(long[0..5], "/srv/");
+    try files.renamePrefix(io, "/srv/z", &long);
+    try testing.expect(files.paths.get(.{ .fsid = @splat(0), .inode = 4 }) == null);
+    try testing.expect(files.paths.get(.{ .fsid = @splat(0), .inode = 2 }) != null);
+    var out: [sys.max_path + 1]u8 = undefined;
+    var attr: sys.Attr = undefined;
+    try testing.expectError(error.Stale, files.resolve(io, h(4), &out, &attr));
 }
 
 test "resolve while the inode matches, and go stale after replacement" {

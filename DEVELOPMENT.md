@@ -80,7 +80,6 @@ From the code review of `ee622cc`; each leaves this list when fixed or accepted 
 
 ### High
 
-* **Long renamed paths crash the daemon:** `renamePrefix` lengthens cached paths unchecked ([files.zig:119](src/libnfsd/files.zig:119)), and `resolve` copies them into a `max_path` buffer ([files.zig:147](src/libnfsd/files.zig:147)); a client nesting directories near `PATH_MAX` and renaming the top one overflows it. Forget paths past `max_path`; treat them as stale.
 * **Clients can release others' locks:** lock owners are only the client's `caller_name`, `svid`, and `oh`. UNLOCK and CANCEL check only `admits`, not the handle's export ([nlm.zig:285](src/libnfsd/nlm.zig:285), [nlm.zig:292](src/libnfsd/nlm.zig:292)), and TEST reveals holders' owners. A LOCK under another host's name moves its NSM entry to the caller ([nsm.zig:82](src/libnfsd/nsm.zig:82)), whose FREE_ALL then frees that host's locks. Key owners by address too, check exports on UNLOCK and CANCEL, and don't move a name that holds locks.
 * **`--run-as` gives away files:** it changes the owner of `--db`'s parent directory, whatever it is, and follows symbolic links doing so ([daemon.zig:453](src/znfsd/daemon.zig:453), [daemon.zig:471](src/znfsd/daemon.zig:471)); a link planted at `znfsd.db-shm` hands its target to USER at the next start. Use `AT_SYMLINK_NOFOLLOW`, and change only directories znfsd created.
 
