@@ -588,15 +588,18 @@ const Request = struct {
         }
         defer reader.close();
 
+        const start = r.results.end;
         try r.status(.ok);
         try r.postOp(dir.attr);
         try r.e.fixedOpaque(&verf);
 
         // Budgets: the whole reply (`maxcount`), and for READDIRPLUS the
-        // names and cookies alone (`dircount`). The 24 is the RPC header.
+        // names and cookies alone (`dircount`), a hint the first entry may
+        // exceed. The 24 is the RPC header.
         const limit = @min(maxcount, r.results.buffer.len + 24) -| 24;
         const export_id = exportId(dir.match.path);
         var dir_used: usize = 0;
+        var sent: usize = 0;
         // Entries' paths, stored together after the loop.
         var arena_state: std.heap.ArenaAllocator = .init(r.n.gpa);
         defer arena_state.deinit();
@@ -610,11 +613,19 @@ const Request = struct {
             const base = 4 + 8 + name_size + 8;
             const plus_size: usize = 4 + 84 + 4 + 4 + fh.size;
             const size = base + if (plus) plus_size else 0;
-            if (r.results.end + size + 8 > limit or dir_used + base > dircount) {
+            if (r.results.end + size + 8 > limit or (sent > 0 and dir_used + base > dircount)) {
+                if (sent == 0) {
+                    // An empty reply short of the end would be asked for
+                    // again forever.
+                    r.results.end = start;
+                    try r.status(.toosmall);
+                    return r.postOp(dir.attr);
+                }
                 eof = false;
                 break;
             }
             dir_used += base;
+            sent += 1;
             try r.e.boolean(true);
             try r.e.u64_(r.fileid(dir.attr.dev, entry.ino));
             try r.e.string(entry.name);
@@ -1553,6 +1564,55 @@ test "read directories, plain and plus, across several calls" {
     try testing.expectEqual(5, names.items.len);
     // Entries found by READDIRPLUS resolve without a LOOKUP.
     try testing.expect((try f.lookup(root, "dir")) == .ok);
+}
+
+test "READDIR sends one entry past dircount, and too small a maxcount is TOOSMALL" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const root = try f.rootHandle();
+    var a: Args = .{};
+
+    // A dircount of 1 still makes progress, one entry a call.
+    var cookie: u64 = 0;
+    var verf: [8]u8 = @splat(0);
+    var names: usize = 0;
+    var calls: usize = 0;
+    while (true) : (calls += 1) {
+        try testing.expect(calls < 10);
+        const e = a.start(root);
+        try e.u64_(cookie);
+        try e.fixedOpaque(&verf);
+        try e.u32_(1); // dircount
+        try e.u32_(8192); // maxcount
+        var d = try expectStatus(.ok, try f.call(f.nfs.program(), @backingInt(Proc.readdirplus), a.bytes()));
+        _ = try d.boolean();
+        _ = try d.fixedOpaque(84);
+        verf = (try d.fixedOpaque(8))[0..8].*;
+        var here: usize = 0;
+        while (try d.boolean()) : (here += 1) {
+            _ = try d.u64_();
+            _ = try d.string(max_name);
+            cookie = try d.u64_();
+            if (try d.boolean()) _ = try d.fixedOpaque(84);
+            if (try d.boolean()) _ = try d.opaque_(64);
+        }
+        names += here;
+        if (try d.boolean()) break;
+        try testing.expectEqual(1, here);
+    }
+    try testing.expectEqual(5, names);
+
+    // No READDIRPLUS entry fits 256 bytes.
+    const e = a.start(root);
+    try e.u64_(0);
+    try e.fixedOpaque(&@as([8]u8, @splat(0)));
+    try e.u32_(4096);
+    try e.u32_(256);
+    var d = try expectStatus(.toosmall, try f.call(f.nfs.program(), @backingInt(Proc.readdirplus), a.bytes()));
+    try testing.expect(try d.boolean());
+    _ = try d.fixedOpaque(84);
+    try testing.expectEqual(0, d.rest().len);
 }
 
 test "handles don't reach through links put mid-path" {

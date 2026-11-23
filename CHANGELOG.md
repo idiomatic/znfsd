@@ -13,6 +13,7 @@ All notable changes to znfsd are documented here. The format follows [Keep a Cha
 
 ### Fixed
 
+* READDIR and READDIRPLUS answer `NFS3ERR_TOOSMALL` when no entry fits `maxcount`, and send one entry even past `dircount`, so a client is never sent an empty, unfinished listing to ask for again forever
 * MNT answers ACCES for any path not inside an export admitting the caller without links, so it no longer tells which paths exist elsewhere
 * Handles' stats, link reads, and file-system queries refuse symbolic links mid-path, as opens do, so a client racing a RENAME and SYMLINK can't read metadata outside its export
 * `--run-as` gives USER only the database's own files, and its directory only if that holds nothing else; database files that are links are refused, so none can hand USER, or aim root's writes at, another file

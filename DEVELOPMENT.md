@@ -80,7 +80,6 @@ From the code review of `ee622cc`; each leaves this list when fixed or accepted 
 
 ### Medium
 
-* **READDIR can loop forever:** when no entry fits `maxcount` or `dircount`, the reply is OK, empty, and not EOF ([nfs.zig:613](src/libnfsd/nfs.zig:613)), so the client asks again forever. Return `NFS3ERR_TOOSMALL`; let the first entry exceed `dircount`, a hint.
 * **Connections reserve memory up front:** each slot allocates `max_record` twice before reading ([server.zig:283](src/libnfsd/server.zig:283)): about 2 MiB per idle connection, 34 MiB for one pipelining without reading replies, across 1024 connections per listener. Size buffers to the record; budget them globally; time out stalled writes.
 * **Descriptors run out before the connection cap:** 8 listeners × 1024 connections exceed default `RLIMIT_NOFILE`, connections never idle out, and `accept`'s quota error spins ([server.zig:160](src/libnfsd/server.zig:160)). Raise the limit at start, cap connections globally below it, back off on quota errors, and close idle connections.
 * **Failed registrations linger:** `registered` is set only after every `set` succeeds ([service.zig:120](src/libnfsd/service.zig:120)), so a failure partway leaves mappings that make the next start fail with `AlreadyRegistered`. Unset them on error.
