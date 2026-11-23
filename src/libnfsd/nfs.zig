@@ -234,6 +234,8 @@ pub const Nfs = struct {
 
 /// A file found from a handle: where it is, what it is, and the rule
 /// covering it.
+const FindResult = union(enum) { found: Found, failed: Status };
+
 const Found = struct {
     handle: fh.Handle,
     path: [:0]const u8,
@@ -269,19 +271,19 @@ const Request = struct {
             .access => try r.access(),
             .readlink => try r.readlink(),
             .read => try r.read(),
-            .readdir => try r.readdir(false),
-            .readdirplus => try r.readdir(true),
+            .readdir => try r.readdir(),
+            .readdirplus => try r.readdirplus(),
             .fsstat => try r.fsstat(),
             .fsinfo => try r.fsinfo(),
             .pathconf => try r.pathconf(),
             .setattr => try r.setattr(),
             .write => try r.write(),
             .create => try r.create(),
-            .mkdir => try r.make(.dir),
-            .symlink => try r.make(.lnk),
-            .mknod => try r.make(.fifo),
-            .remove => try r.remove(false),
-            .rmdir => try r.remove(true),
+            .mkdir => try r.mkdir(),
+            .symlink => try r.symlink(),
+            .mknod => try r.mknod(),
+            .remove => try r.remove(),
+            .rmdir => try r.rmdir(),
             .rename => try r.rename(),
             .link => try r.link(),
             .commit => try r.commit(),
@@ -376,7 +378,7 @@ const Request = struct {
 
     /// Decodes a handle and finds its file, keeping its path in `buf`, or
     /// returns the status to report.
-    fn find(r: *Request, buf: *[sys.max_path + 1]u8) Error!union(enum) { found: Found, failed: Status } {
+    fn find(r: *Request, buf: *[sys.max_path + 1]u8) Error!FindResult {
         const bytes = try r.d.opaque_(max_handle);
         const h = fh.Handle.decode(bytes) catch return .{ .failed = .badhandle };
         var attr: sys.Attr = undefined;
@@ -543,117 +545,188 @@ const Request = struct {
         try r.e.opaque_(data[0..got]);
     }
 
-    fn readdir(r: *Request, plus: bool) Error!void {
+    fn readdir(r: *Request) Error!void {
         const found = try r.find(&r.path_buf);
         const cookie = try r.d.u64_();
-        const sent_verf = (try r.d.fixedOpaque(8))[0..8].*;
-        const dircount = if (plus) try r.d.u32_() else std.math.maxInt(u32);
+        const verf = (try r.d.fixedOpaque(8))[0..8].*;
         const maxcount = try r.d.u32_();
+        var l: Listing = undefined;
+        if (!try r.list(found, cookie, verf, std.math.maxInt(u32), maxcount, &l)) return;
+        defer l.reader.close();
+        while (l.next()) |entry| {
+            switch (try l.fit(r, entry.name, 0)) {
+                .fits => try l.encode(r, entry),
+                .full => break,
+                .toosmall => return,
+            }
+        }
+        try l.finish(r);
+    }
+
+    fn readdirplus(r: *Request) Error!void {
+        const found = try r.find(&r.path_buf);
+        const cookie = try r.d.u64_();
+        const verf = (try r.d.fixedOpaque(8))[0..8].*;
+        const dircount = try r.d.u32_();
+        const maxcount = try r.d.u32_();
+        var l: Listing = undefined;
+        if (!try r.list(found, cookie, verf, dircount, maxcount, &l)) return;
+        defer l.reader.close();
+        const export_id = exportId(l.dir.match.path);
+        // Entries' paths, stored together after the loop.
+        var arena_state: std.heap.ArenaAllocator = .init(r.n.gpa);
+        defer arena_state.deinit();
+        var entries: std.ArrayList(@import("files.zig").Entry) = .empty;
+        while (l.next()) |entry| {
+            switch (try l.fit(r, entry.name, 4 + 84 + 4 + 4 + fh.size)) {
+                .fits => {},
+                .full => break,
+                .toosmall => return,
+            }
+            try l.encode(r, entry);
+            var attr: sys.Attr = undefined;
+            var path_buf: [sys.max_path + 1]u8 = undefined;
+            const dot = std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..");
+            const path = if (dot) null else join(&path_buf, l.dir.path, entry.name);
+            if (path != null and sys.statIn(l.fd, entry.name, &attr) == .SUCCESS) {
+                const h: fh.Handle = .fromAttr(export_id, attr);
+                try entries.append(arena_state.allocator(), .{
+                    .fsid = h.fsid,
+                    .inode = h.inode,
+                    .path = try arena_state.allocator().dupe(u8, path.?),
+                });
+                try r.postOp(attr);
+                try r.e.boolean(true);
+                try r.e.opaque_(&h.encode());
+            } else {
+                try r.e.boolean(false);
+                try r.e.boolean(false);
+            }
+        }
+        try l.finish(r);
+        try r.n.files.rememberAll(r.ctx.io, entries.items);
+    }
+
+    /// A directory being listed by READDIR or READDIRPLUS, its reply begun.
+    const Listing = struct {
+        dir: Found,
+        fd: sys.Fd,
+        reader: sys.DirReader,
+        cookie: u64,
+        /// Where the reply began, to start it over as TOOSMALL.
+        start: usize,
+        /// Budgets: the whole reply (`maxcount`), and for READDIRPLUS the
+        /// names and cookies alone (`dircount`), a hint the first entry may
+        /// exceed.
+        limit: usize,
+        dircount: u32,
+        dir_used: usize = 0,
+        sent: usize = 0,
+        index: u64 = 0,
+        eof: bool = true,
+
+        const Fit = enum { fits, full, toosmall };
+
+        /// The next entry past the cookie.
+        fn next(l: *Listing) ?sys.DirReader.Entry {
+            while (l.reader.next()) |entry| {
+                l.index += 1;
+                if (l.index > l.cookie) return entry;
+            }
+            return null;
+        }
+
+        /// Counts in an entry named `name`, with `extra` bytes after its
+        /// cookie, if it fits; when none does, answers TOOSMALL instead.
+        fn fit(l: *Listing, r: *Request, name: []const u8, extra: usize) Error!Fit {
+            const base = 4 + 8 + 4 + name.len + xdr.padding(name.len) + 8;
+            if (r.results.end + base + extra + 8 <= l.limit and (l.sent == 0 or l.dir_used + base <= l.dircount)) {
+                l.dir_used += base;
+                l.sent += 1;
+                return .fits;
+            }
+            if (l.sent == 0) {
+                // An empty reply short of the end would be asked for again
+                // forever.
+                r.results.end = l.start;
+                try r.status(.toosmall);
+                try r.postOp(l.dir.attr);
+                return .toosmall;
+            }
+            l.eof = false;
+            return .full;
+        }
+
+        /// Encodes an entry's fileid, name, and cookie.
+        fn encode(l: *const Listing, r: *Request, e: sys.DirReader.Entry) Error!void {
+            try r.e.boolean(true);
+            try r.e.u64_(r.fileid(l.dir.attr.dev, e.ino));
+            try r.e.string(e.name);
+            try r.e.u64_(l.index);
+        }
+
+        fn finish(l: *const Listing, r: *Request) Error!void {
+            try r.e.boolean(false);
+            try r.e.boolean(l.eof);
+        }
+    };
+
+    /// Checks a READDIR's or READDIRPLUS's directory and cookie, opens the
+    /// directory, and begins the reply; false when it answered instead.
+    fn list(r: *Request, found: FindResult, cookie: u64, sent_verf: [8]u8, dircount: u32, maxcount: u32, l: *Listing) Error!bool {
         const dir = switch (found) {
             .found => |f| f,
             .failed => |s| {
                 try r.status(s);
-                return r.postOp(null);
+                try r.postOp(null);
+                return false;
             },
         };
-        if (ftype(dir.attr.mode) != .dir) {
-            try r.status(.notdir);
-            return r.postOp(dir.attr);
-        }
-        if (!r.creds(dir.match.rule).allows(dir.attr, 4)) {
-            try r.status(.acces);
-            return r.postOp(dir.attr);
-        }
-        if (maxcount < 256) {
-            try r.status(.toosmall);
-            return r.postOp(dir.attr);
-        }
         // Cookies count entries, so they hold only while the directory is
         // unchanged; after a change, the client starts over.
         var verf: [8]u8 = undefined;
         std.mem.writeInt(u32, verf[0..4], @truncate(@as(u64, @bitCast(dir.attr.mtime.sec))), .big);
         std.mem.writeInt(u32, verf[4..8], dir.attr.mtime.nsec, .big);
-        if (cookie != 0 and !std.mem.eql(u8, &verf, &sent_verf)) {
-            try r.status(.bad_cookie);
-            return r.postOp(dir.attr);
+        const fail: ?Status = if (ftype(dir.attr.mode) != .dir)
+            .notdir
+        else if (!r.creds(dir.match.rule).allows(dir.attr, 4))
+            .acces
+        else if (maxcount < 256)
+            .toosmall
+        else if (cookie != 0 and !std.mem.eql(u8, &verf, &sent_verf))
+            .bad_cookie
+        else
+            null;
+        if (fail) |s| {
+            try r.status(s);
+            try r.postOp(dir.attr);
+            return false;
         }
         var reader: sys.DirReader = undefined;
-        var dir_fd: sys.Fd = undefined;
+        var fd: sys.Fd = undefined;
         var now: sys.Attr = undefined;
-        var e = sys.openVerified(dir.path, .{ .DIRECTORY = true }, dir.handle.inode, &dir_fd, &now);
-        if (e == .SUCCESS) e = sys.DirReader.fromFd(dir_fd, &reader);
+        var e = sys.openVerified(dir.path, .{ .DIRECTORY = true }, dir.handle.inode, &fd, &now);
+        if (e == .SUCCESS) e = sys.DirReader.fromFd(fd, &reader);
         if (e != .SUCCESS) {
             try r.status(.fromErrno(e));
-            return r.postOp(dir.attr);
+            try r.postOp(dir.attr);
+            return false;
         }
-        defer reader.close();
-
-        const start = r.results.end;
+        errdefer reader.close();
+        l.* = .{
+            .dir = dir,
+            .fd = fd,
+            .reader = reader,
+            .cookie = cookie,
+            .start = r.results.end,
+            // The 24 is the RPC header.
+            .limit = @min(maxcount, r.results.buffer.len + 24) -| 24,
+            .dircount = dircount,
+        };
         try r.status(.ok);
         try r.postOp(dir.attr);
         try r.e.fixedOpaque(&verf);
-
-        // Budgets: the whole reply (`maxcount`), and for READDIRPLUS the
-        // names and cookies alone (`dircount`), a hint the first entry may
-        // exceed. The 24 is the RPC header.
-        const limit = @min(maxcount, r.results.buffer.len + 24) -| 24;
-        const export_id = exportId(dir.match.path);
-        var dir_used: usize = 0;
-        var sent: usize = 0;
-        // Entries' paths, stored together after the loop.
-        var arena_state: std.heap.ArenaAllocator = .init(r.n.gpa);
-        defer arena_state.deinit();
-        var entries: std.ArrayList(@import("files.zig").Entry) = .empty;
-        var index: u64 = 0;
-        var eof = true;
-        while (reader.next()) |entry| {
-            index += 1;
-            if (index <= cookie) continue;
-            const name_size = 4 + entry.name.len + xdr.padding(entry.name.len);
-            const base = 4 + 8 + name_size + 8;
-            const plus_size: usize = 4 + 84 + 4 + 4 + fh.size;
-            const size = base + if (plus) plus_size else 0;
-            if (r.results.end + size + 8 > limit or (sent > 0 and dir_used + base > dircount)) {
-                if (sent == 0) {
-                    // An empty reply short of the end would be asked for
-                    // again forever.
-                    r.results.end = start;
-                    try r.status(.toosmall);
-                    return r.postOp(dir.attr);
-                }
-                eof = false;
-                break;
-            }
-            dir_used += base;
-            sent += 1;
-            try r.e.boolean(true);
-            try r.e.u64_(r.fileid(dir.attr.dev, entry.ino));
-            try r.e.string(entry.name);
-            try r.e.u64_(index);
-            if (plus) {
-                var attr: sys.Attr = undefined;
-                var path_buf: [sys.max_path + 1]u8 = undefined;
-                const dot = std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..");
-                const path = if (dot) null else join(&path_buf, dir.path, entry.name);
-                if (path != null and sys.statIn(dir_fd, entry.name, &attr) == .SUCCESS) {
-                    const h: fh.Handle = .fromAttr(export_id, attr);
-                    try entries.append(arena_state.allocator(), .{
-                        .fsid = h.fsid,
-                        .inode = h.inode,
-                        .path = try arena_state.allocator().dupe(u8, path.?),
-                    });
-                    try r.postOp(attr);
-                    try r.e.boolean(true);
-                    try r.e.opaque_(&h.encode());
-                } else {
-                    try r.e.boolean(false);
-                    try r.e.boolean(false);
-                }
-            }
-        }
-        try r.e.boolean(false);
-        try r.e.boolean(eof);
-        try r.n.files.rememberAll(r.ctx.io, entries.items);
+        return true;
     }
 
     fn fsstat(r: *Request) Error!void {
@@ -829,8 +902,7 @@ const Request = struct {
         const found = try r.find(&r.path_buf);
         const offset = try r.d.u64_();
         const count = try r.d.u32_();
-        // stable_how: UNSTABLE waits for COMMIT; the others are FILE_SYNC.
-        const unstable = try r.d.u32_() == 0;
+        const stable = try r.d.enumeration(StableHow);
         const data = try r.d.opaque_(max_transfer);
         const f = switch (found) {
             .found => |f| f,
@@ -859,7 +931,7 @@ const Request = struct {
         var e = sys.openOwned(f.path, .{ .ACCMODE = .WRONLY }, f.handle.inode, &fd, &post);
         if (e == .SUCCESS) {
             e = sys.writeAt(fd, offset, data[0..n]);
-            if (e == .SUCCESS and !unstable) e = sys.sync(fd);
+            if (e == .SUCCESS and stable != .unstable) e = sys.sync(fd);
             _ = sys.fstat(fd, &post);
             sys.closeFd(fd);
         }
@@ -867,7 +939,7 @@ const Request = struct {
         try r.wccData(f.attr, if (e == .SUCCESS) post else null);
         if (e != .SUCCESS) return;
         try r.e.u32_(@intCast(n));
-        try r.e.u32_(if (unstable) 0 else 2); // UNSTABLE or FILE_SYNC
+        try r.e.enumeration(if (stable == .unstable) StableHow.unstable else StableHow.file_sync);
         try r.e.fixedOpaque(&r.n.verifier);
     }
 
@@ -1003,113 +1075,156 @@ const Request = struct {
     fn create(r: *Request) Error!void {
         var w: Where = undefined;
         const result = try r.where(&w);
-        const how = try r.d.u32_();
-        var s: Sattr = .{};
-        var verf: [8]u8 = undefined;
-        switch (how) {
-            0, 1 => s = try decodeSattr(&r.d),
-            2 => verf = (try r.d.fixedOpaque(8))[0..8].*,
-            else => return error.Invalid,
+        var how = try CreateHow.decode(&r.d);
+        switch (result) {
+            .failed => |failed| return r.whereFailed(failed),
+            .ok => {},
         }
+        defer w.close();
+        switch (how) {
+            .unchecked => |*s| {
+                r.inward(s);
+                return r.made(&w, r.createOrOpen(&w, s.*));
+            },
+            .guarded => |*s| {
+                r.inward(s);
+                return r.made(&w, r.createNew(&w, s.*));
+            },
+            .exclusive => |verf| return r.createExclusive(&w, verf),
+        }
+    }
+
+    /// Creates a regular file, or opens an existing one, and applies `s`.
+    fn createOrOpen(r: *Request, w: *const Where, s: Sattr) sys.E {
+        var fd: sys.Fd = undefined;
+        const e = sys.openOrCreateIn(w.fd, w.name, s.mode orelse 0o600, &fd);
+        if (e != .SUCCESS) return e;
+        defer sys.closeFd(fd);
+        return r.settleFile(w, fd, s);
+    }
+
+    /// Creates a new regular file and applies `s`.
+    fn createNew(r: *Request, w: *const Where, s: Sattr) sys.E {
+        var fd: sys.Fd = undefined;
+        const e = sys.createIn(w.fd, w.name, s.mode orelse 0o600, &fd);
+        if (e != .SUCCESS) return e;
+        defer sys.closeFd(fd);
+        return r.settleFile(w, fd, s);
+    }
+
+    /// Applies `s` to the regular file open at `fd`, just created or opened.
+    fn settleFile(r: *Request, w: *const Where, fd: sys.Fd, s: Sattr) sys.E {
+        var e: sys.E = .SUCCESS;
+        if (s.size) |size| e = sys.truncateFd(fd, size);
+        if (e == .SUCCESS) e = r.settle(w, s, .reg);
+        if (e == .SUCCESS and (s.atime != .omit or s.mtime != .omit)) e = sys.setTimesFd(fd, s.atime, s.mtime);
+        return e;
+    }
+
+    /// EXCLUSIVE keeps its verifier in the file's times, so a retransmitted
+    /// CREATE finds its own file and succeeds.
+    fn createExclusive(r: *Request, w: *const Where, verf: [8]u8) Error!void {
+        const atime: sys.Timespec = .{ .sec = std.mem.readInt(u32, verf[0..4], .big), .nsec = 0 };
+        const mtime: sys.Timespec = .{ .sec = std.mem.readInt(u32, verf[4..8], .big), .nsec = 0 };
+        var fd: sys.Fd = undefined;
+        var e = sys.createIn(w.fd, w.name, 0o600, &fd);
+        if (e == .EXIST) {
+            var existing: sys.Attr = undefined;
+            if (sys.statIn(w.fd, w.name, &existing) == .SUCCESS and
+                existing.atime.sec == atime.sec and existing.mtime.sec == mtime.sec)
+            {
+                return r.created(w);
+            }
+        }
+        if (e == .SUCCESS) {
+            e = sys.setTimesFd(fd, .{ .at = atime }, .{ .at = mtime });
+            if (e == .SUCCESS) e = r.settle(w, .{}, .reg);
+            sys.closeFd(fd);
+        }
+        return r.made(w, e);
+    }
+
+    fn mkdir(r: *Request) Error!void {
+        var w: Where = undefined;
+        const result = try r.where(&w);
+        var s = try decodeSattr(&r.d);
         switch (result) {
             .failed => |failed| return r.whereFailed(failed),
             .ok => {},
         }
         defer w.close();
         r.inward(&s);
-
-        // EXCLUSIVE keeps its verifier in the file's times, so a retransmitted
-        // CREATE finds its own file and succeeds.
-        const verf_atime: sys.Timespec = .{ .sec = std.mem.readInt(u32, verf[0..4], .big), .nsec = 0 };
-        const verf_mtime: sys.Timespec = .{ .sec = std.mem.readInt(u32, verf[4..8], .big), .nsec = 0 };
-        var fd: sys.Fd = undefined;
-        var e = sys.createIn(w.fd, w.name, how != 0, s.mode orelse 0o600, &fd);
-        if (e == .EXIST and how == 2) {
-            var existing: sys.Attr = undefined;
-            if (sys.statIn(w.fd, w.name, &existing) == .SUCCESS and
-                existing.atime.sec == verf_atime.sec and existing.mtime.sec == verf_mtime.sec)
-            {
-                return r.created(&w);
-            }
-        }
-        if (e != .SUCCESS) {
-            try r.status(.fromErrno(e));
-            return r.wccData(w.dir.attr, w.post());
-        }
-        defer sys.closeFd(fd);
-        if (how == 2) {
-            e = sys.setTimesFd(fd, .{ .at = verf_atime }, .{ .at = verf_mtime });
-        } else if (s.size) |size| {
-            e = sys.truncateFd(fd, size);
-        }
-        if (e == .SUCCESS) e = r.settle(&w, s, .reg);
-        if (e == .SUCCESS and how != 2 and (s.atime != .omit or s.mtime != .omit)) e = sys.setTimesFd(fd, s.atime, s.mtime);
-        if (e != .SUCCESS) {
-            try r.status(.fromErrno(e));
-            return r.wccData(w.dir.attr, w.post());
-        }
-        return r.created(&w);
+        var e = sys.mkdirIn(w.fd, w.name, s.mode orelse 0o755);
+        if (e == .SUCCESS) e = r.settle(&w, s, .dir);
+        return r.made(&w, e);
     }
 
-    /// MKDIR, SYMLINK, and MKNOD (whose kind is in its arguments).
-    fn make(r: *Request, kind: Ftype) Error!void {
+    fn symlink(r: *Request) Error!void {
+        var w: Where = undefined;
+        const result = try r.where(&w);
+        var s = try decodeSattr(&r.d);
+        var target_buf: [sys.max_path + 1]u8 = undefined;
+        const target = copyZ(&target_buf, try r.d.string(max_path));
+        switch (result) {
+            .failed => |failed| return r.whereFailed(failed),
+            .ok => {},
+        }
+        defer w.close();
+        r.inward(&s);
+        var e = sys.symlinkIn(target, w.fd, w.name);
+        if (e == .SUCCESS) e = r.settle(&w, s, .lnk);
+        return r.made(&w, e);
+    }
+
+    /// MKNOD, whose kind is in its arguments.
+    fn mknod(r: *Request) Error!void {
         var w: Where = undefined;
         const result = try r.where(&w);
         var s: Sattr = .{};
-        var target_buf: [sys.max_path + 1]u8 = undefined;
-        var target: [:0]const u8 = "";
-        var node: struct { kind: Ftype = .fifo, major: u32 = 0, minor: u32 = 0 } = .{};
-        var bad_type = false;
-        switch (kind) {
-            .dir => s = try decodeSattr(&r.d),
-            .lnk => {
+        var major: u32 = 0;
+        var minor: u32 = 0;
+        const kind: ?Ftype = switch (try r.d.u32_()) {
+            @backingInt(Ftype.chr), @backingInt(Ftype.blk) => |raw| device: {
                 s = try decodeSattr(&r.d);
-                const t = try r.d.string(max_path);
-                target = copyZ(&target_buf, t);
+                major = try r.d.u32_();
+                minor = try r.d.u32_();
+                break :device @fromBackingInt(@intCast(raw));
             },
-            else => {
-                const raw = try r.d.u32_();
-                switch (raw) {
-                    @backingInt(Ftype.chr), @backingInt(Ftype.blk) => {
-                        node.kind = @fromBackingInt(@intCast(raw));
-                        s = try decodeSattr(&r.d);
-                        node.major = try r.d.u32_();
-                        node.minor = try r.d.u32_();
-                    },
-                    @backingInt(Ftype.sock), @backingInt(Ftype.fifo) => {
-                        node.kind = @fromBackingInt(@intCast(raw));
-                        s = try decodeSattr(&r.d);
-                    },
-                    else => bad_type = true,
-                }
+            @backingInt(Ftype.sock), @backingInt(Ftype.fifo) => |raw| node: {
+                s = try decodeSattr(&r.d);
+                break :node @fromBackingInt(@intCast(raw));
             },
-        }
+            else => null,
+        };
         switch (result) {
             .failed => |failed| return r.whereFailed(failed),
             .ok => {},
         }
         defer w.close();
         r.inward(&s);
-        if (bad_type) {
+        const k = kind orelse {
             try r.status(.badtype);
             return r.wccData(w.dir.attr, w.post());
-        }
-        var e: sys.E = switch (kind) {
-            .dir => sys.mkdirIn(w.fd, w.name, s.mode orelse 0o755),
-            .lnk => sys.symlinkIn(target, w.fd, w.name),
-            else => sys.mknodIn(w.fd, w.name, @as(u32, switch (node.kind) {
-                .chr => posix.S.IFCHR,
-                .blk => posix.S.IFBLK,
-                .sock => posix.S.IFSOCK,
-                else => posix.S.IFIFO,
-            }) | ((s.mode orelse 0o644) & 0o7777), sys.makeDev(node.major, node.minor)),
         };
-        if (e == .SUCCESS) e = r.settle(&w, s, if (kind == .lnk) .lnk else kind);
+        const format: u32 = switch (k) {
+            .chr => posix.S.IFCHR,
+            .blk => posix.S.IFBLK,
+            .sock => posix.S.IFSOCK,
+            .fifo => posix.S.IFIFO,
+            .reg, .dir, .lnk => unreachable,
+        };
+        var e = sys.mknodIn(w.fd, w.name, format | ((s.mode orelse 0o644) & 0o7777), sys.makeDev(major, minor));
+        if (e == .SUCCESS) e = r.settle(&w, s, k);
+        return r.made(&w, e);
+    }
+
+    /// Replies to a CREATE, MKDIR, SYMLINK, or MKNOD that ended in `e`.
+    fn made(r: *Request, w: *const Where, e: sys.E) Error!void {
         if (e != .SUCCESS) {
             try r.status(.fromErrno(e));
             return r.wccData(w.dir.attr, w.post());
         }
-        return r.created(&w);
+        return r.created(w);
     }
 
     /// Whether a sticky directory stops `c` removing or renaming `target`.
@@ -1117,32 +1232,48 @@ const Request = struct {
         return dir.mode & posix.S.ISVTX != 0 and c.uid != 0 and c.uid != dir.uid and c.uid != target.uid;
     }
 
-    fn remove(r: *Request, directory: bool) Error!void {
+    fn remove(r: *Request) Error!void {
         var w: Where = undefined;
-        const result = try r.where(&w);
-        switch (result) {
+        switch (try r.where(&w)) {
+            .failed => |failed| return r.whereFailed(failed),
+            .ok => {},
+        }
+        defer w.close();
+        var target: sys.Attr = undefined;
+        const e = sys.statIn(w.fd, w.name, &target);
+        const st: Status = if (e != .SUCCESS)
+            .fromErrno(e)
+        else if (ftype(target.mode) == .dir)
+            .isdir
+        else if (sticky(w.dir.attr, target, r.creds(w.dir.match.rule)))
+            .acces
+        else
+            .fromErrno(sys.unlinkIn(w.fd, w.name));
+        try r.status(st);
+        try r.wccData(w.dir.attr, w.post());
+    }
+
+    fn rmdir(r: *Request) Error!void {
+        var w: Where = undefined;
+        switch (try r.where(&w)) {
             .failed => |failed| {
                 // RMDIR of `.` is invalid, not an existing entry.
-                if (directory and failed.status == .exist) return r.whereFailed(.{ .status = Status.inval, .attr = failed.attr });
+                if (failed.status == .exist) return r.whereFailed(.{ .status = Status.inval, .attr = failed.attr });
                 return r.whereFailed(failed);
             },
             .ok => {},
         }
         defer w.close();
         var target: sys.Attr = undefined;
-        var e = sys.statIn(w.fd, w.name, &target);
+        const e = sys.statIn(w.fd, w.name, &target);
         const st: Status = if (e != .SUCCESS)
             .fromErrno(e)
-        else if (directory and ftype(target.mode) != .dir)
+        else if (ftype(target.mode) != .dir)
             .notdir
-        else if (!directory and ftype(target.mode) == .dir)
-            .isdir
         else if (sticky(w.dir.attr, target, r.creds(w.dir.match.rule)))
             .acces
-        else st: {
-            e = sys.unlinkIn(w.fd, w.name, directory);
-            break :st .fromErrno(e);
-        };
+        else
+            .fromErrno(sys.rmdirIn(w.fd, w.name));
         try r.status(st);
         try r.wccData(w.dir.attr, w.post());
     }
@@ -1246,6 +1377,25 @@ const Sattr = struct {
     atime: sys.SetTime = .omit,
     mtime: sys.SetTime = .omit,
 };
+
+/// createhow3: how CREATE treats an existing file, and what it sets.
+const CreateHow = union(enum) {
+    unchecked: Sattr,
+    guarded: Sattr,
+    exclusive: [8]u8,
+
+    fn decode(d: *xdr.Decoder) xdr.DecodeError!CreateHow {
+        const Mode = enum(u32) { unchecked = 0, guarded = 1, exclusive = 2 };
+        return switch (try d.enumeration(Mode)) {
+            .unchecked => .{ .unchecked = try decodeSattr(d) },
+            .guarded => .{ .guarded = try decodeSattr(d) },
+            .exclusive => .{ .exclusive = (try d.fixedOpaque(8))[0..8].* },
+        };
+    }
+};
+
+/// stable_how: UNSTABLE waits for COMMIT; the others are FILE_SYNC.
+const StableHow = enum(u32) { unstable = 0, data_sync = 1, file_sync = 2 };
 
 fn decodeSattr(d: *xdr.Decoder) xdr.DecodeError!Sattr {
     var s: Sattr = .{};

@@ -363,14 +363,26 @@ pub fn setTimesIn(dir: Fd, name: [*:0]const u8, atime: SetTime, mtime: SetTime) 
     return check(c.utimensat(dir, name, &times, c.AT.SYMLINK_NOFOLLOW));
 }
 
+/// Creates a regular file in `dir`, `EXIST` if there's anything there.
+pub fn createIn(dir: Fd, name: [*:0]const u8, mode: u32, fd: *Fd) E {
+    return openCreating(dir, name, .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true }, mode, fd);
+}
+
 /// Opens or creates a regular file in `dir`, never following a link there.
-pub fn createIn(dir: Fd, name: [*:0]const u8, exclusive: bool, mode: u32, fd: *Fd) E {
+pub fn openOrCreateIn(dir: Fd, name: [*:0]const u8, mode: u32, fd: *Fd) E {
     // An existing device or FIFO isn't opened: opening can have effects.
     var existing: Attr = undefined;
-    if (!exclusive and statIn(dir, name, &existing) == .SUCCESS and existing.mode & posix.S.IFMT != posix.S.IFREG) {
+    if (statIn(dir, name, &existing) == .SUCCESS and existing.mode & posix.S.IFMT != posix.S.IFREG) {
         return if (existing.mode & posix.S.IFMT == posix.S.IFDIR) .ISDIR else .INVAL;
     }
-    const o: c.O = .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = exclusive, .NOFOLLOW = true, .CLOEXEC = true, .NONBLOCK = true };
+    return openCreating(dir, name, .{ .ACCMODE = .RDWR, .CREAT = true }, mode, fd);
+}
+
+fn openCreating(dir: Fd, name: [*:0]const u8, flags: c.O, mode: u32, fd: *Fd) E {
+    var o = flags;
+    o.NOFOLLOW = true;
+    o.CLOEXEC = true;
+    o.NONBLOCK = true;
     const r = c.openat(dir, name, o, @as(c.mode_t, @intCast(mode & 0o7777)));
     if (r < 0) return errno();
     fd.* = r;
@@ -397,8 +409,12 @@ pub fn mknodIn(dir: Fd, name: [*:0]const u8, mode: u32, dev: u64) E {
     return check(mknodat(dir, name, @intCast(mode & 0o177777), d));
 }
 
-pub fn unlinkIn(dir: Fd, name: [*:0]const u8, directory: bool) E {
-    return check(c.unlinkat(dir, name, if (directory) c.AT.REMOVEDIR else 0));
+pub fn unlinkIn(dir: Fd, name: [*:0]const u8) E {
+    return check(c.unlinkat(dir, name, 0));
+}
+
+pub fn rmdirIn(dir: Fd, name: [*:0]const u8) E {
+    return check(c.unlinkat(dir, name, c.AT.REMOVEDIR));
 }
 
 pub fn renameIn(from_dir: Fd, from: [*:0]const u8, to_dir: Fd, to: [*:0]const u8) E {
@@ -703,8 +719,8 @@ test "safe opens refuse links in any component; descriptor-relative calls" {
     defer closeFd(dir);
 
     var fd: Fd = undefined;
-    try testing.expectEqual(E.SUCCESS, createIn(dir, "hal", true, 0o600, &fd));
-    try testing.expectEqual(E.EXIST, createIn(dir, "hal", true, 0o600, &fd)); // fd unchanged
+    try testing.expectEqual(E.SUCCESS, createIn(dir, "hal", 0o600, &fd));
+    try testing.expectEqual(E.EXIST, createIn(dir, "hal", 0o600, &fd)); // fd unchanged
     try testing.expectEqual(E.SUCCESS, writeAt(fd, 3, "9000"));
     try testing.expectEqual(E.SUCCESS, sync(fd));
     var out: [16]u8 = undefined;
@@ -741,9 +757,9 @@ test "safe opens refuse links in any component; descriptor-relative calls" {
     try testing.expectEqual(E.SUCCESS, mknodIn(dir, "fifo", std.posix.S.IFIFO | 0o600, 0));
     try testing.expectEqual(E.SUCCESS, statIn(dir, "fifo", &attr));
     try testing.expectEqual(std.posix.S.IFIFO, attr.mode & std.posix.S.IFMT);
-    try testing.expectEqual(E.NOTEMPTY, unlinkIn(dir, "sub", true));
-    try testing.expectEqual(E.SUCCESS, unlinkIn(dir, "sub/hal3", false));
-    try testing.expectEqual(E.SUCCESS, unlinkIn(dir, "sub", true));
+    try testing.expectEqual(E.NOTEMPTY, rmdirIn(dir, "sub"));
+    try testing.expectEqual(E.SUCCESS, unlinkIn(dir, "sub/hal3"));
+    try testing.expectEqual(E.SUCCESS, rmdirIn(dir, "sub"));
 }
 
 test "safe stats and link reads refuse links before the last component" {
@@ -803,16 +819,16 @@ test "act as another user, then revert" {
     try testing.expectEqual(E.SUCCESS, become(.{ .uid = 4242, .gid = 4242 }));
     defer revert();
     var fd: Fd = undefined;
-    try testing.expectEqual(E.SUCCESS, createIn(dir, "theirs", true, 0o600, &fd));
+    try testing.expectEqual(E.SUCCESS, createIn(dir, "theirs", 0o600, &fd));
     closeFd(fd);
     // Acting as 4242, root's directory isn't theirs to change.
     try testing.expectEqual(E.PERM, chmodFd(dir, 0o755));
     const paused = pause();
-    try testing.expectEqual(E.SUCCESS, createIn(dir, "server", true, 0o600, &fd));
+    try testing.expectEqual(E.SUCCESS, createIn(dir, "server", 0o600, &fd));
     closeFd(fd);
     try @"resume"(paused);
     // Root's override is gone: root's private file can't be opened.
-    try testing.expectEqual(E.ACCES, createIn(dir, "server", false, 0o600, &fd));
+    try testing.expectEqual(E.ACCES, openOrCreateIn(dir, "server", 0o600, &fd));
     revert();
 
     var attr: Attr = undefined;
