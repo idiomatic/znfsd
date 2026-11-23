@@ -139,19 +139,25 @@ pub const ConnectionOptions = struct {
     /// in any order, matched by XID. Each holds up to two records' worth of
     /// buffers while it runs.
     max_calls: usize = 16,
-    /// Connections open at once on a listener; more are closed unserved.
-    max_connections: usize = 1024,
+    /// How long a connection may sit with no call in flight and no bytes
+    /// arriving before it's closed; clients reconnect.
+    idle_timeout: Io.Duration = .fromSeconds(360),
     /// How long a reply may take to write before the connection is closed,
     /// as when the peer stops reading.
     write_timeout: Io.Duration = .fromSeconds(120),
-    /// What the connection's calls take their buffers from.
+    /// What the connection counts in, and its calls take buffers from.
     pool: *Pool = &Pool.process,
     /// Told of every call answered.
     observer: ?*const Observer = null,
 };
 
-/// A budget for calls' buffers, shared by the connections that name it.
+/// What the connections naming it share, across listeners: a cap on those
+/// accepted, and a budget for their calls' buffers.
 pub const Pool = struct {
+    /// Connections accepted and open at once; more are closed unserved.
+    /// At most half the soft descriptor limit, leaving the rest for files.
+    max_connections: usize = 1024,
+    open: std.atomic.Value(usize) = .init(0),
     /// Bytes held at once by calls, beyond the small record buffers slots
     /// keep; a call waits for room, though one alone may exceed it.
     max_bytes: usize = 256 * 1024 * 1024,
@@ -161,6 +167,19 @@ pub const Pool = struct {
 
     /// Shared by connections whose options name no other pool.
     pub var process: Pool = .{};
+
+    /// Counts in a connection, unless as many as allowed are open.
+    fn admit(p: *Pool) bool {
+        const cap = @min(p.max_connections, descriptorCap());
+        var n = p.open.load(.monotonic);
+        while (n < cap) n = p.open.cmpxchgWeak(n, n + 1, .monotonic, .monotonic) orelse return true;
+        return false;
+    }
+
+    fn descriptorCap() usize {
+        const limit = std.posix.getrlimit(.NOFILE) catch return std.math.maxInt(usize);
+        return std.math.cast(usize, limit.cur / 2) orelse std.math.maxInt(usize);
+    }
 
     /// Waits for room for `bytes`, then holds them.
     fn reserve(p: *Pool, io: Io, bytes: usize, timeout: Io.Timeout) (Io.Cancelable || Io.Timeout.Error)!void {
@@ -198,32 +217,41 @@ pub fn serveTcp(
 ) Io.Cancelable!void {
     var connections: Io.Group = .init;
     defer connections.cancel(io);
-    var open: std.atomic.Value(usize) = .init(0);
+    const pool = options.pool;
+    var backoff: Io.Duration = .zero;
     while (true) {
         const stream = listener.accept(io) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
+            // Until a descriptor or memory frees up, accepting fails at
+            // once, so wait first.
+            error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded, error.SystemResources => {
+                if (backoff.nanoseconds == 0) log.warn("tcp accept: {t}; backing off", .{err});
+                backoff = .fromNanoseconds(std.math.clamp(backoff.nanoseconds * 2, 10 * std.time.ns_per_ms, std.time.ns_per_s));
+                try io.sleep(backoff, .awake);
+                continue;
+            },
             else => {
                 log.warn("tcp accept: {t}", .{err});
                 continue;
             },
         };
-        if (open.load(.monotonic) >= options.max_connections) {
-            log.warn("tcp: {d} connections open, refusing {f}", .{ options.max_connections, stream.socket.address });
+        backoff = .zero;
+        if (!pool.admit()) {
+            log.warn("tcp: {d} connections open, refusing {f}", .{ pool.open.load(.monotonic), stream.socket.address });
             stream.close(io);
             continue;
         }
-        _ = open.fetchAdd(1, .monotonic);
-        connections.concurrent(io, counted, .{ &open, io, gpa, programs, stream, options }) catch |err| {
-            _ = open.fetchSub(1, .monotonic);
+        connections.concurrent(io, counted, .{ io, gpa, programs, stream, options }) catch |err| {
+            _ = pool.open.fetchSub(1, .monotonic);
             log.warn("tcp connection: {t}", .{err});
             stream.close(io);
         };
     }
 }
 
-/// Serves a connection, counted among those open until it ends.
-fn counted(open: *std.atomic.Value(usize), io: Io, gpa: std.mem.Allocator, programs: []const Program, stream: net.Stream, options: ConnectionOptions) Io.Cancelable!void {
-    defer _ = open.fetchSub(1, .monotonic);
+/// Serves a connection, counted among its pool's open ones until it ends.
+fn counted(io: Io, gpa: std.mem.Allocator, programs: []const Program, stream: net.Stream, options: ConnectionOptions) Io.Cancelable!void {
+    defer _ = options.pool.open.fetchSub(1, .monotonic);
     return serveConnection(io, gpa, programs, stream, options);
 }
 
@@ -282,6 +310,8 @@ fn recordHeld(capacity: usize) usize {
 const Stale = error{
     /// A reply took longer than `write_timeout` to write.
     ReplyStalled,
+    /// No call was in flight, and no bytes came, for `idle_timeout`.
+    Idle,
 };
 
 /// One connection's state, shared by its reader and its calls.
@@ -298,6 +328,10 @@ const Connection = struct {
     /// When the reply being written began, in awake-clock nanoseconds, or
     /// 0 when none is.
     writing_since: std.atomic.Value(i64) = .init(0),
+    /// When bytes last arrived, in awake-clock nanoseconds.
+    read_at: std.atomic.Value(i64),
+    /// Calls read and not yet answered.
+    in_flight: std.atomic.Value(usize) = .init(0),
     /// Slots not busy.
     free: Io.Semaphore,
     slots: []Slot,
@@ -334,6 +368,7 @@ const Connection = struct {
     fn answer(c: *Connection, slot: *Slot) Io.Cancelable!void {
         defer {
             slot.finish(c.io, c.gpa, c.options.pool);
+            _ = c.in_flight.fetchSub(1, .monotonic);
             slot.busy.store(false, .release);
             c.free.post(c.io);
         }
@@ -358,12 +393,15 @@ const Connection = struct {
     /// Fails when the connection should be closed.
     fn watch(c: *Connection) Stale!void {
         const since = c.writing_since.load(.monotonic);
-        if (since != 0 and now(c.io) - since > c.options.write_timeout.nanoseconds) return error.ReplyStalled;
+        const at = now(c.io);
+        if (since != 0 and at - since > c.options.write_timeout.nanoseconds) return error.ReplyStalled;
+        if (c.in_flight.load(.monotonic) == 0 and at - c.read_at.load(.monotonic) > c.options.idle_timeout.nanoseconds) return error.Idle;
     }
 
     /// How often a waiting reader checks the connection.
     fn tick(c: *Connection) Io.Timeout {
-        const nanoseconds = @max(std.time.ns_per_ms, @divTrunc(c.options.write_timeout.nanoseconds, 4));
+        const shortest = @min(c.options.write_timeout.nanoseconds, c.options.idle_timeout.nanoseconds);
+        const nanoseconds = @max(std.time.ns_per_ms, @divTrunc(shortest, 4));
         return .{ .duration = .{ .raw = .fromNanoseconds(nanoseconds), .clock = .awake } };
     }
 
@@ -464,6 +502,7 @@ const StreamReader = struct {
             return error.ReadFailed;
         }).data_len;
         if (n == 0) return error.EndOfStream;
+        c.read_at.store(now(c.io), .monotonic);
         if (n > data_size) {
             io_r.end += n - data_size;
             return data_size;
@@ -504,6 +543,7 @@ pub fn serveConnection(
         .ctx = .{ .io = io, .from = stream.socket.address, .protocol = .tcp, .observer = options.observer },
         .stream = stream,
         .writer = &writer.interface,
+        .read_at = .init(now(io)),
         .free = .{ .permits = slots.len },
         .slots = slots,
     };
@@ -514,7 +554,11 @@ pub fn serveConnection(
     while (true) {
         const slot = c.takeSlot() catch |err| switch (err) {
             error.Canceled => return error.Canceled,
-            else => {
+            error.Idle => {
+                log.info("tcp: {f}: {t}", .{ c.ctx.from, err });
+                break;
+            },
+            error.ReplyStalled => {
                 log.warn("tcp: {f}: {t}", .{ c.ctx.from, err });
                 c.broken();
                 break;
@@ -531,6 +575,7 @@ pub fn serveConnection(
             switch (cause) {
                 error.Canceled => return error.Canceled,
                 error.EndOfStream => {},
+                error.Idle => log.info("tcp: {f}: {t}", .{ c.ctx.from, cause }),
                 error.ReplyStalled => {
                     log.warn("tcp: {f}: {t}", .{ c.ctx.from, cause });
                     c.broken();
@@ -540,6 +585,7 @@ pub fn serveConnection(
             break;
         };
         // Without a task to spare, answer before reading on.
+        _ = c.in_flight.fetchAdd(1, .monotonic);
         calls.concurrent(io, Connection.answer, .{ &c, slot }) catch try c.answer(slot);
     }
     // The peer is gone or misbehaved; let calls already read finish, unless
@@ -856,6 +902,76 @@ test "a peer that stops reading replies is closed" {
     }
     try served.await(io);
     try testing.expectEqual(0, pool.held);
+}
+
+test "an idle connection is closed" {
+    const io = testing.io;
+    var echo: Echo = .{};
+    const programs = [_]Program{echo.program()};
+    const pair = try testPair();
+    defer pair[1].close(io);
+    var pool: Pool = .{};
+    const options: ConnectionOptions = .{ .max_record = 4096, .idle_timeout = .fromMilliseconds(100), .pool = &pool };
+    var group: Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, serveConnection, .{ io, testing.allocator, &programs, pair[0], options });
+
+    // A call answered, then nothing: the server closes its end.
+    var write_buf: [128]u8 = undefined;
+    var writer = pair[1].writer(io, &write_buf);
+    var call_buf: [64]u8 = undefined;
+    try rpc.record.write(&writer.interface, encodeCall(&call_buf, 400000, 1, 1, "art\x00"));
+    try writer.interface.flush();
+    var read_buf: [128]u8 = undefined;
+    var reader = pair[1].reader(io, &read_buf);
+    var reply: std.ArrayList(u8) = .empty;
+    defer reply.deinit(testing.allocator);
+    try rpc.record.read(&reader.interface, testing.allocator, &reply, 4096);
+    const timeout: Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } };
+    var byte: [1]u8 = undefined;
+    var data: [1][]u8 = .{&byte};
+    const closed = try io.operateTimeout(.{ .net_read = .{ .socket_handle = pair[1].socket.handle, .data = &data } }, timeout);
+    try testing.expectEqual(0, (try closed.net_read).data_len);
+}
+
+test "listeners sharing a pool share its connection cap" {
+    const io = testing.io;
+    testing.log_level = .err; // the refusal is logged
+    var echo: Echo = .{};
+    const programs = [_]Program{echo.program()};
+    const any: net.IpAddress = .{ .ip4 = .loopback(0) };
+    var first = try any.listen(io, .{ .reuse_address = true });
+    defer first.deinit(io);
+    var second = try any.listen(io, .{ .reuse_address = true });
+    defer second.deinit(io);
+    var pool: Pool = .{ .max_connections = 1 };
+    var group: Io.Group = .init;
+    defer group.cancel(io);
+    for ([_]*net.Server{ &first, &second }) |l| {
+        try group.concurrent(io, serveTcp, .{ io, testing.allocator, &programs, l, .{ .max_record = 4096, .pool = &pool } });
+    }
+
+    var call_buf: [64]u8 = undefined;
+    const call = encodeCall(&call_buf, 400000, 1, 1, "art\x00");
+    // The first is answered, and stays open, so the second is refused.
+    var replies: [2]?usize = undefined;
+    var streams: [2]net.Stream = undefined;
+    defer for (streams) |s| s.close(io);
+    for ([_]*net.Server{ &first, &second }, &streams, &replies) |l, *stream, *r| {
+        stream.* = try l.socket.address.connect(io, .{ .mode = .stream });
+        const s = stream.*;
+        var write_buf: [128]u8 = undefined;
+        var writer = s.writer(io, &write_buf);
+        try rpc.record.write(&writer.interface, call);
+        try writer.interface.flush();
+        var read_buf: [128]u8 = undefined;
+        var reader = s.reader(io, &read_buf);
+        var reply: std.ArrayList(u8) = .empty;
+        defer reply.deinit(testing.allocator);
+        r.* = if (rpc.record.read(&reader.interface, testing.allocator, &reply, 4096)) reply.items.len else |_| null;
+    }
+    try testing.expectEqual(28, replies[0]);
+    try testing.expectEqual(null, replies[1]);
 }
 
 test "a connection the embedder accepted carries MOUNT and NFS" {

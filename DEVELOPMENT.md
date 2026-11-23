@@ -80,7 +80,6 @@ From the code review of `ee622cc`; each leaves this list when fixed or accepted 
 
 ### Medium
 
-* **Descriptors run out before the connection cap:** 8 listeners × 1024 connections exceed default `RLIMIT_NOFILE`, connections never idle out, and `accept`'s quota error spins ([server.zig:160](src/libnfsd/server.zig:160)). Raise the limit at start, cap connections globally below it, back off on quota errors, and close idle connections.
 * **`_MSG` stalls NLM over UDP:** `_RES` is sent inline, after a GETPORT of up to 4 s ([nlm.zig:210](src/libnfsd/nlm.zig:210), [callback.zig:25](src/libnfsd/callback.zig:25)), and `serveUdp` handles one datagram at a time. Send it in the background, as GRANTED_MSG is; cache ports.
 * **GRANTED_MSG isn't retried:** one lost datagram leaves a client never told of a lock it holds ([nlm.zig:360](src/libnfsd/nlm.zig:360)). Resend until GRANTED_RES; release after a few tries.
 * **No limits on locks, waiters, or monitored hosts:** each grows per request ([locks.zig:59](src/libnfsd/locks.zig:59), [nlm.zig:125](src/libnfsd/nlm.zig:125), [nsm.zig:57](src/libnfsd/nsm.zig:57)), monitored hosts persist, and coalescing is quadratic. Cap them per host and overall (`denied_nolocks`); index locks by file.

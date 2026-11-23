@@ -31,7 +31,7 @@ NFS v3 server daemon with few options and sensible defaults.
 * Host and `*.domain` matching: forward-confirmed reverse DNS, cached, resolved asynchronously; until built, new rules and groups refuse such CLIENTs, since they'd match no one
 * `--bind`: repeatable; default `0.0.0.0` and `::`
 * Ports: fixed; nfs 2049, mount 20048, stat 32765, lock 32803
-* TCP connections: up to 1024 per listener, each up to 16 calls at once; replies in any order, matched by XID; closed when a reply takes over 2 minutes to write
+* TCP connections: up to 1024 across all listeners, and half the descriptor limit, which starts raised to its hard limit; each up to 16 calls at once; replies in any order, matched by XID; closed when a reply takes over 2 minutes to write, or after 6 minutes idle; accepting backs off while descriptors run out
 * Call buffers: sized to each record, held only while its call runs, from a 256 MiB process-wide budget calls wait on
 * `--socket` default: root `/var/run/znfsd.sock`; else `$XDG_RUNTIME_DIR/znfsd.sock` (Linux), `$TMPDIR/znfsd.sock` (macOS)
 * `--db` default: root `/var/lib/znfsd/znfsd.db` (Linux), `/var/db/znfsd/znfsd.db` (macOS); else `$XDG_STATE_HOME/znfsd/znfsd.db`, `$XDG_STATE_HOME` defaulting to `~/.local/state` (Linux), `~/Library/Application Support/znfsd/znfsd.db` (macOS)

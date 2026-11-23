@@ -12,6 +12,8 @@ const daemon = @import("daemon.zig");
 const usage = @embedFile("usage.txt");
 
 pub fn main(init: std.process.Init) !u8 {
+    // Connections and files each take a descriptor.
+    std.process.raiseFileDescriptorLimit();
     const arena = init.arena.allocator();
     const io = init.io;
     const args = try init.minimal.args.toSlice(arena);
