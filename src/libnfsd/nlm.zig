@@ -129,6 +129,10 @@ pub const Nlm = struct {
     nsm: *nsm_.Nsm,
     /// While set and not yet reached, only reclaims are granted.
     grace_end: ?Io.Clock.Timestamp = null,
+    /// Held while taking locks and monitoring their hosts, and while
+    /// unmonitoring hosts that hold none, so no host holding a lock goes
+    /// unmonitored. Taken before `mutex`.
+    monitoring: Io.Mutex = .init,
     mutex: Io.Mutex = .init,
     waiters: std.ArrayList(Waiter) = .empty,
     /// Callbacks in flight, so replies, and UDP's one loop, needn't wait
@@ -213,9 +217,27 @@ pub const Nlm = struct {
 
     /// Unmonitors `host` if it holds no more locks, and grants what can be.
     fn afterRelease(n: *Nlm, io: Io, host: []const u8, count: usize) !usize {
-        if (!try n.locks.hostHolds(io, host)) n.nsm.unmonitor(io, host) catch {};
+        try n.unmonitorIdle(io, host);
         try n.wake(io);
         return count;
+    }
+
+    /// Unmonitors `host` if it holds no locks.
+    fn unmonitorIdle(n: *Nlm, io: Io, host: []const u8) !void {
+        try n.monitoring.lock(io);
+        defer n.monitoring.unlock(io);
+        if (!try n.locks.hostHolds(io, host)) n.nsm.unmonitor(io, host) catch {};
+    }
+
+    /// Takes a lock for LOCK, monitoring its host; returns whether it was
+    /// taken.
+    fn lockMonitored(n: *Nlm, io: Io, file: locks_.File, lock: LockArgs, exclusive: bool, address: net.IpAddress) !bool {
+        var buf: [64]u8 = undefined;
+        try n.monitoring.lock(io);
+        defer n.monitoring.unlock(io);
+        if (!try n.locks.acquire(io, file, lock.owner(nsm_.addressText(address, &buf)), exclusive, lock.range())) return false;
+        n.monitor(io, lock.caller_name, address);
+        return true;
     }
 
     /// Monitors `host` at `address`, unless it still holds locks from where
@@ -322,9 +344,14 @@ pub const Nlm = struct {
                 if (n.inGrace(ctx.io) and !reclaim) return e.enumeration(Stat.denied_grace_period);
                 var located: Nfs.Located = undefined;
                 if (!n.nfs.locate(ctx.io, lock.fh, ctx.from, &located)) return e.enumeration(Stat.stale_fh);
-                if (try n.locks.acquire(ctx.io, located.file, lock.owner(from), exclusive, lock.range())) {
-                    if (proc == .lock) n.monitor(ctx.io, lock.caller_name, ctx.from);
-                    return e.enumeration(Stat.granted);
+                const taken = switch (proc) {
+                    .lock => try n.lockMonitored(ctx.io, located.file, lock, exclusive, ctx.from),
+                    else => try n.locks.acquire(ctx.io, located.file, lock.owner(from), exclusive, lock.range()),
+                };
+                if (taken) {
+                    try e.enumeration(Stat.granted);
+                    // A downgrade or a shrink may free what others wait for.
+                    return n.wake(ctx.io);
                 }
                 if (!block) return e.enumeration(Stat.denied);
                 try n.wait(ctx.io, located.file, exclusive, cookie, lock, ctx.from);
@@ -344,7 +371,7 @@ pub const Nlm = struct {
                 if (!n.nfs.admits(ctx.from)) return e.enumeration(Stat.denied);
                 const h = fh.Handle.decode(lock.fh) catch return e.enumeration(Stat.stale_fh);
                 try n.locks.release(ctx.io, .{ .fsid = h.fsid, .inode = h.inode }, lock.owner(from), lock.range());
-                if (!try n.locks.hostHolds(ctx.io, lock.caller_name)) n.nsm.unmonitor(ctx.io, lock.caller_name) catch {};
+                try n.unmonitorIdle(ctx.io, lock.caller_name);
                 try e.enumeration(Stat.granted);
                 try n.wake(ctx.io);
             },
@@ -388,26 +415,30 @@ pub const Nlm = struct {
     }
 
     /// Grants what waiting requests can now have, in order, and tells
-    /// their clients with GRANTED_MSG.
+    /// their clients with GRANTED_MSG. A failure leaves the rest waiting.
     fn wake(n: *Nlm, io: Io) !void {
         var granted: std.ArrayList(Waiter) = .empty;
         defer granted.deinit(n.gpa);
         {
-            try n.mutex.lock(io);
-            defer n.mutex.unlock(io);
-            var i: usize = 0;
-            while (i < n.waiters.items.len) {
-                const w = &n.waiters.items[i];
-                var buf: [64]u8 = undefined;
-                if (try n.locks.acquire(io, w.file, w.owner(&buf), w.exclusive, w.lock.range())) {
-                    try granted.append(n.gpa, n.waiters.orderedRemove(i));
-                } else i += 1;
+            try n.monitoring.lock(io);
+            defer n.monitoring.unlock(io);
+            {
+                try n.mutex.lock(io);
+                defer n.mutex.unlock(io);
+                var i: usize = 0;
+                while (i < n.waiters.items.len) {
+                    const w = &n.waiters.items[i];
+                    var buf: [64]u8 = undefined;
+                    granted.ensureUnusedCapacity(n.gpa, 1) catch break;
+                    const taken = n.locks.acquire(io, w.file, w.owner(&buf), w.exclusive, w.lock.range()) catch break;
+                    if (taken) {
+                        granted.appendAssumeCapacity(n.waiters.orderedRemove(i));
+                    } else i += 1;
+                }
             }
+            for (granted.items) |w| n.monitor(io, w.lock.caller_name, w.address);
         }
-        for (granted.items) |w| {
-            n.monitor(io, w.lock.caller_name, w.address);
-            n.grant(io, w);
-        }
+        for (granted.items) |w| n.grant(io, w);
     }
 
     /// Tells a client its blocked request was granted: GRANTED_MSG, with
@@ -701,4 +732,40 @@ test "_MSG results go back in the background" {
     var d: xdr.Decoder = .init(args);
     try testing.expectEqualStrings("art1", try d.opaque_(max_netobj));
     try testing.expectEqual(Stat.granted, try d.enumeration(Stat));
+}
+
+test "a holder's downgrade grants what waits" {
+    const io = testing.io;
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const ctx: server.Context = .{ .io = io, .from = try .parse("127.0.0.1", 9), .protocol = .tcp };
+    var a: [512]u8 = undefined;
+    try testing.expectEqual(Stat.granted, try f.run(ctx, .lock, (Request{ .who = "art", .svid = 1 }).lockArgs(&a, &f.handle)));
+    try testing.expectEqual(Stat.blocked, try f.run(ctx, .lock, (Request{ .who = "hal", .svid = 2, .block = true, .exclusive = false }).lockArgs(&a, &f.handle)));
+    try testing.expectEqual(Stat.granted, try f.run(ctx, .lock, (Request{ .who = "art", .svid = 1, .exclusive = false }).lockArgs(&a, &f.handle)));
+    try testing.expectEqual(0, f.nlm.waiters.items.len);
+    try testing.expectEqual(2, f.locks.held.items.len);
+}
+
+test "a failure granting leaves waiters waiting" {
+    const io = testing.io;
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const ctx: server.Context = .{ .io = io, .from = try .parse("127.0.0.1", 9), .protocol = .tcp };
+    var a: [512]u8 = undefined;
+    try testing.expectEqual(Stat.granted, try f.run(ctx, .lock, (Request{ .who = "art", .svid = 1 }).lockArgs(&a, &f.handle)));
+    try testing.expectEqual(Stat.blocked, try f.run(ctx, .lock, (Request{ .who = "hal", .svid = 2, .block = true }).lockArgs(&a, &f.handle)));
+
+    var failing: testing.FailingAllocator = .init(testing.allocator, .{ .fail_index = 0 });
+    f.nlm.gpa = failing.allocator();
+    try testing.expectEqual(Stat.granted, try f.run(ctx, .unlock, (Request{ .who = "art", .svid = 1 }).unlockArgs(&a, &f.handle)));
+    try testing.expectEqual(1, f.nlm.waiters.items.len);
+    try testing.expectEqual(0, f.locks.held.items.len);
+
+    f.nlm.gpa = testing.allocator;
+    try f.nlm.wake(io);
+    try testing.expectEqual(0, f.nlm.waiters.items.len);
+    try testing.expectEqual(1, f.locks.held.items.len);
 }
