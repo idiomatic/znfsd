@@ -495,9 +495,11 @@ const Request = struct {
             try r.status(.inval);
             return r.postOp(f.attr);
         }
-        var buf: [max_path]u8 = undefined;
+        // A byte to spare shows a target too long to send whole.
+        var buf: [sys.max_path + 1]u8 = undefined;
         var target: []const u8 = undefined;
-        const e = sys.readLinkSafe(f.path, &buf, &target);
+        var e = sys.readLinkSafe(f.path, &buf, &target);
+        if (e == .SUCCESS and target.len > sys.max_path) e = .NAMETOOLONG;
         try r.status(.fromErrno(e));
         try r.postOp(f.attr);
         if (e == .SUCCESS) try r.e.string(target);
@@ -1179,14 +1181,18 @@ const Request = struct {
         var w: Where = undefined;
         const result = try r.where(&w);
         var s = try decodeSattr(&r.d);
-        var target_buf: [sys.max_path + 1]u8 = undefined;
-        const target = copyZ(&target_buf, try r.d.string(max_path));
+        // Any length decodes, so a target too long for the host is
+        // NAMETOOLONG, not garbage.
+        const t = try r.d.string(std.math.maxInt(u32));
         switch (result) {
             .failed => |failed| return r.whereFailed(failed),
             .ok => {},
         }
         defer w.close();
         r.inward(&s);
+        if (t.len > sys.max_path) return r.made(&w, .NAMETOOLONG);
+        var target_buf: [sys.max_path + 1]u8 = undefined;
+        const target = copyZ(&target_buf, t);
         var e = sys.symlinkIn(target, w.fd, w.name);
         if (e == .SUCCESS) e = r.settle(&w, s, .lnk);
         return r.made(&w, e);
@@ -1590,7 +1596,7 @@ const Fixture = struct {
         var cw: Io.Writer = .fixed(&cred_buf);
         const auth: rpc.AuthSys = .{ .stamp = 0, .machine_name = "perihelion", .uid = f.uid, .gid = f.gid };
         try auth.encode(.init(&cw));
-        var buf: [2048]u8 = undefined;
+        var buf: [sys.max_path + 4096]u8 = undefined;
         var w: Io.Writer = .fixed(&buf);
         const c: rpc.Call = .{
             .xid = 1,
@@ -1828,7 +1834,7 @@ test "a continued READDIR with a stale verifier is a bad cookie" {
 
 /// Builds arguments: a handle, then XDR items.
 const Args = struct {
-    buf: [4096]u8 = undefined,
+    buf: [sys.max_path + 4096]u8 = undefined,
     w: Io.Writer = undefined,
 
     fn start(a: *Args, h: [fh.size]u8) xdr.Encoder {
@@ -2041,6 +2047,35 @@ test "CREATE UNCHECKED over an existing file applies only the size" {
     try testing.expectEqual(sys.E.SUCCESS, sys.lstat(hal_path, &attr));
     try testing.expectEqual(0o640, attr.mode & 0o7777);
     try testing.expectEqual(3, attr.size);
+}
+
+test "link targets as long as the host allows, and no longer" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const nfs = f.nfs.program();
+    const root = try f.rootHandle();
+    var a: Args = .{};
+    var long: [sys.max_path + 1]u8 = @splat('d');
+
+    // Past the host's limit: NAMETOOLONG, not garbage arguments.
+    var e = a.start(root);
+    try e.string("far");
+    try sattrMode(e, null);
+    try e.string(&long);
+    _ = try expectStatus(.nametoolong, try f.call(nfs, @backingInt(Proc.symlink), a.bytes()));
+
+    // The longest the host takes reads back whole.
+    const target = long[0 .. sys.max_path - 1];
+    e = a.start(root);
+    try e.string("near");
+    try sattrMode(e, null);
+    try e.string(target);
+    const near = try createdHandle(try f.call(nfs, @backingInt(Proc.symlink), a.bytes()));
+    _ = a.start(near);
+    var d = try expectStatus(.ok, try f.call(nfs, @backingInt(Proc.readlink), a.bytes()));
+    _ = try d.fixedOpaque(4 + 84);
+    try testing.expectEqualStrings(target, try d.string(sys.max_path));
 }
 
 test "maps translate callers and owners" {

@@ -23,6 +23,7 @@ NFS v3 server daemon with few options and sensible defaults.
 * READDIR and READDIRPLUS: `NFS3ERR_TOOSMALL` when no entry fits `maxcount`; `dircount` is a hint the first entry may exceed
 * Writes: UNSTABLE ones reach storage by COMMIT, others before the reply
 * CREATE UNCHECKED of an existing file: applies only the size, as Linux does
+* Link targets: up to the host's `PATH_MAX`; READLINK and SYMLINK answer NAMETOOLONG past it
 * fileid: the inode on the export root's file system; elsewhere, the inode with the filesystem ID folded in
 * Commands: `add` is idempotent and merges options into an existing rule, `set` replaces a rule's options, and changes apply immediately; they go through the control socket when the daemon runs, else operate on the database directly
 * Database: WAL mode with a busy timeout
