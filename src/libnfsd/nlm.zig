@@ -848,8 +848,10 @@ test "lock, test, block, unlock, and grace" {
     try testing.expectEqual(Stat.denied, try f.run(ctx, .lock, (Request{ .who = "art", .svid = 1, .exclusive = false }).lockArgs(&a, h)));
 
     // A stale handle, and the grace period after a restart.
+    // Flipping the inode's top bit, not its low byte: that could make
+    // the export root's, one less than hal's, which is always found.
     var stale = f.handle;
-    stale[31] ^= 0xff;
+    stale[24] ^= 0x80;
     try testing.expectEqual(Stat.stale_fh, try f.run(ctx, .lock, (Request{ .who = "art", .svid = 1 }).lockArgs(&a, &stale)));
     try testing.expectEqual(1, try f.nlm.releaseHost(io, "hal", null));
     f.nlm.startGrace(io);
