@@ -218,11 +218,12 @@ pub fn notify(io: Io, hosts: []const Host, state: u32) usize {
     const e: xdr.Encoder = .init(&w);
     e.string(me) catch return 0;
     e.u32_(state) catch return 0;
+    var caller: callback.Caller = .{};
     var told: usize = 0;
     for (hosts) |h| {
         const address = net.IpAddress.parse(h.address, 0) catch continue;
         var reply: [64]u8 = undefined;
-        _ = callback.call(io, address, prog, vers, @backingInt(Proc.notify), w.buffered(), &reply) catch continue;
+        _ = caller.call(io, address, prog, vers, @backingInt(Proc.notify), w.buffered(), &reply) catch continue;
         told += 1;
     }
     return told;

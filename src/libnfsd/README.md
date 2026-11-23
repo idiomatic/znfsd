@@ -184,6 +184,7 @@ File handles are 36 bytes: format version, export ID (a hash of the export path)
 * Reads and writes: up to 1 MiB. UNSTABLE writes reach storage at COMMIT, others before the reply; pass `Nfs.init` a verifier that changes at each start, so clients resend what a restart lost.
 * UDP replies: 65,535 bytes, so large reads need TCP.
 * Callers' supplementary groups: 16, as AUTH_SYS carries.
+* NLM callbacks: 64 in flight (`nlm.max_callbacks`); more are dropped, as lost datagrams would be.
 
 ## Not yet
 

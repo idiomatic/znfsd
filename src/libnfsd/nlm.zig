@@ -29,6 +29,9 @@ pub const max_netobj = 1024;
 /// How long after a restart only reclaims are granted.
 pub const grace_seconds = 90;
 
+/// Callbacks sent at once; more are dropped, as lost datagrams would be.
+pub const max_callbacks = 64;
+
 pub const Proc = enum(u32) {
     null = 0,
     @"test" = 1,
@@ -128,8 +131,12 @@ pub const Nlm = struct {
     grace_end: ?Io.Clock.Timestamp = null,
     mutex: Io.Mutex = .init,
     waiters: std.ArrayList(Waiter) = .empty,
-    /// GRANTED_MSG callbacks in flight, so replies needn't wait for them.
+    /// Callbacks in flight, so replies, and UDP's one loop, needn't wait
+    /// for clients' portmappers.
     callbacks: Io.Group = .init,
+    /// How many, at most `max_callbacks`.
+    in_flight: std.atomic.Value(usize) = .init(0),
+    caller: callback.Caller = .{},
 
     pub fn init(gpa: std.mem.Allocator, nfs: *Nfs, locks: *Locks, nsm: *nsm_.Nsm) Nlm {
         return .{ .gpa = gpa, .nfs = nfs, .locks = locks, .nsm = nsm };
@@ -250,8 +257,7 @@ pub const Nlm = struct {
                 var buf: [max_netobj * 2 + 64]u8 = undefined;
                 var w: Io.Writer = .fixed(&buf);
                 try n.answer(ctx, sync, &d, .init(&w));
-                callback.send(ctx.io, ctx.from, prog, vers, call.proc + 5, w.buffered()) catch |err|
-                    log.warn("nlm: {t} result to {f}: {t}", .{ proc, ctx.from, err });
+                n.sendLater(ctx.io, ctx.from, @fromBackingInt(call.proc + 5), w.buffered());
                 return .none;
             },
             // Clients' answers to our GRANTED_MSG, and other results: nothing to do.
@@ -400,8 +406,7 @@ pub const Nlm = struct {
         }
         for (granted.items) |w| {
             n.monitor(io, w.lock.caller_name, w.address);
-            // The task owns the waiter from here.
-            n.callbacks.concurrent(io, grant, .{ n, io, w }) catch grant(n, io, w);
+            n.grant(io, w);
         }
     }
 
@@ -415,8 +420,37 @@ pub const Nlm = struct {
         e.opaque_(w.cookie) catch return;
         e.boolean(w.exclusive) catch return;
         w.lock.encode(e) catch return;
-        callback.send(io, w.address, prog, vers, @backingInt(Proc.granted_msg), bw.buffered()) catch |err| {
-            if (err != error.Canceled) log.warn("nlm: granting to {s}: {t}", .{ w.lock.caller_name, err });
+        n.sendLater(io, w.address, .granted_msg, bw.buffered());
+    }
+
+    /// Sends a callback in the background, with a copy of `args`, unless
+    /// `max_callbacks` are already in flight.
+    fn sendLater(n: *Nlm, io: Io, host: net.IpAddress, proc: Proc, args: []const u8) void {
+        if (n.in_flight.fetchAdd(1, .monotonic) >= max_callbacks) {
+            _ = n.in_flight.fetchSub(1, .monotonic);
+            log.warn("nlm: {t} to {f}: too many callbacks in flight", .{ proc, host });
+            return;
+        }
+        const owned = n.gpa.dupe(u8, args) catch {
+            _ = n.in_flight.fetchSub(1, .monotonic);
+            log.warn("nlm: {t} to {f}: out of memory", .{ proc, host });
+            return;
+        };
+        // The task owns the copy from here.
+        n.callbacks.concurrent(io, send, .{ n, io, host, proc, owned }) catch |err| {
+            n.gpa.free(owned);
+            _ = n.in_flight.fetchSub(1, .monotonic);
+            log.warn("nlm: {t} to {f}: {t}", .{ proc, host, err });
+        };
+    }
+
+    fn send(n: *Nlm, io: Io, host: net.IpAddress, proc: Proc, args: []u8) void {
+        defer {
+            n.gpa.free(args);
+            _ = n.in_flight.fetchSub(1, .monotonic);
+        }
+        n.caller.send(io, host, prog, vers, @backingInt(proc), args) catch |err| {
+            if (err != error.Canceled) log.warn("nlm: {t} to {f}: {t}", .{ proc, host, err });
         };
     }
 
@@ -429,128 +463,242 @@ pub const Nlm = struct {
 };
 
 const testing = std.testing;
+const exports = @import("exports.zig");
+const Files = @import("files.zig").Files;
+const sys = @import("sys.zig");
+
+/// A server exporting a directory that holds the file `hal`, for NLM's tests.
+const Fixture = struct {
+    tmp: testing.TmpDir,
+    root: []u8,
+    rules: [1]exports.Rule,
+    table: exports.Table,
+    files: Files,
+    nfs: Nfs,
+    locks: Locks,
+    status: nsm_.Nsm,
+    nlm: Nlm,
+    programs: [1]server.Program,
+    /// `hal`'s handle.
+    handle: [fh.size]u8,
+
+    fn init(f: *Fixture) !void {
+        const io = testing.io;
+        f.tmp = testing.tmpDir(.{});
+        errdefer f.tmp.cleanup();
+        try f.tmp.dir.writeFile(io, .{ .sub_path = "hal", .data = "9000" });
+        var buf: [sys.max_path]u8 = undefined;
+        f.root = try testing.allocator.dupe(u8, buf[0..try f.tmp.dir.realPath(io, &buf)]);
+        errdefer testing.allocator.free(f.root);
+        const hal_path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/hal", .{f.root}, 0);
+        defer testing.allocator.free(hal_path);
+
+        f.rules = .{.{ .path = f.root, .client = .any, .options = .{} }};
+        f.table = .{ .rules = &f.rules };
+        f.files = .init(testing.allocator);
+        errdefer f.files.deinit();
+        f.nfs = .init(testing.allocator, &f.table, &f.files, @splat(0));
+        var attr: sys.Attr = undefined;
+        try testing.expectEqual(sys.E.SUCCESS, sys.lstat(hal_path, &attr));
+        const h: fh.Handle = .fromAttr(@import("mount.zig").exportId(f.root), attr);
+        try f.files.remember(io, h, hal_path);
+        f.handle = h.encode();
+        f.locks = .init(testing.allocator);
+        f.status = .init(testing.allocator, 1);
+        f.nlm = .init(testing.allocator, &f.nfs, &f.locks, &f.status);
+        f.programs = .{f.nlm.program()};
+    }
+
+    fn deinit(f: *Fixture) void {
+        f.nlm.deinit(testing.io);
+        f.status.deinit();
+        f.locks.deinit();
+        f.files.deinit();
+        testing.allocator.free(f.root);
+        f.tmp.cleanup();
+    }
+
+    /// Dispatches `proc` from `from`; returns the reply, or null for none.
+    fn dispatch(f: *Fixture, from: server.Context, proc: Proc, args: []const u8, out: []u8) !?[]const u8 {
+        var b: [max_string + 512]u8 = undefined;
+        var w: Io.Writer = .fixed(&b);
+        const m: rpc.Call = .{ .xid = 1, .prog = prog, .vers = vers, .proc = @backingInt(proc), .cred = .none, .verf = .none, .args = args };
+        try m.encode(.init(&w));
+        return server.dispatch(&f.programs, from, w.buffered(), out);
+    }
+
+    /// Calls a synchronous procedure from `from`; returns its status.
+    fn run(f: *Fixture, from: server.Context, proc: Proc, args: []const u8) !Stat {
+        var out: [512]u8 = undefined;
+        const reply = (try f.dispatch(from, proc, args, &out)).?;
+        var d: xdr.Decoder = .init(reply[24..]);
+        _ = try d.opaque_(max_netobj);
+        return d.enumeration(Stat);
+    }
+};
+
+/// A request's lock, as a test sends it.
+const Request = struct {
+    cookie: []const u8 = "c",
+    who: []const u8,
+    svid: i32,
+    block: bool = false,
+    exclusive: bool = true,
+    reclaim: bool = false,
+    offset: u64 = 0,
+    len: u64 = 0,
+
+    fn lockArgs(r: Request, b: []u8, fh_bytes: []const u8) []const u8 {
+        var w: Io.Writer = .fixed(b);
+        const e: xdr.Encoder = .init(&w);
+        e.opaque_(r.cookie) catch unreachable;
+        e.boolean(r.block) catch unreachable;
+        e.boolean(r.exclusive) catch unreachable;
+        r.lock(fh_bytes).encode(e) catch unreachable;
+        e.boolean(r.reclaim) catch unreachable;
+        e.i32_(1) catch unreachable;
+        return w.buffered();
+    }
+
+    /// CANCEL's arguments, as LOCK's but for the reclaim and state.
+    fn cancelArgs(r: Request, b: []u8, fh_bytes: []const u8) []const u8 {
+        var w: Io.Writer = .fixed(b);
+        const e: xdr.Encoder = .init(&w);
+        e.opaque_(r.cookie) catch unreachable;
+        e.boolean(r.block) catch unreachable;
+        e.boolean(r.exclusive) catch unreachable;
+        r.lock(fh_bytes).encode(e) catch unreachable;
+        return w.buffered();
+    }
+
+    fn testArgs(r: Request, b: []u8, fh_bytes: []const u8) []const u8 {
+        var w: Io.Writer = .fixed(b);
+        const e: xdr.Encoder = .init(&w);
+        e.opaque_(r.cookie) catch unreachable;
+        e.boolean(r.exclusive) catch unreachable;
+        r.lock(fh_bytes).encode(e) catch unreachable;
+        return w.buffered();
+    }
+
+    fn unlockArgs(r: Request, b: []u8, fh_bytes: []const u8) []const u8 {
+        var w: Io.Writer = .fixed(b);
+        const e: xdr.Encoder = .init(&w);
+        e.opaque_(r.cookie) catch unreachable;
+        r.lock(fh_bytes).encode(e) catch unreachable;
+        return w.buffered();
+    }
+
+    fn lock(r: Request, fh_bytes: []const u8) LockArgs {
+        return .{ .caller_name = r.who, .fh = fh_bytes, .oh = r.who, .svid = r.svid, .offset = r.offset, .len = r.len };
+    }
+};
 
 test "lock, test, block, unlock, and grace" {
     const io = testing.io;
-    const exports = @import("exports.zig");
-    const Files = @import("files.zig").Files;
-    const sys = @import("sys.zig");
-
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(io, .{ .sub_path = "hal", .data = "9000" });
-    var buf: [sys.max_path]u8 = undefined;
-    const root = try std.fmt.allocPrint(testing.allocator, "{s}", .{buf[0..try tmp.dir.realPath(io, &buf)]});
-    defer testing.allocator.free(root);
-    const hal_path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/hal", .{root}, 0);
-    defer testing.allocator.free(hal_path);
-
-    const rules = [_]exports.Rule{.{ .path = root, .client = .any, .options = .{} }};
-    const table: exports.Table = .{ .rules = &rules };
-    var files: Files = .init(testing.allocator);
-    defer files.deinit();
-    var nfs: Nfs = .init(testing.allocator, &table, &files, @splat(0));
-    var attr: sys.Attr = undefined;
-    try testing.expectEqual(sys.E.SUCCESS, sys.lstat(hal_path, &attr));
-    const h: fh.Handle = .fromAttr(@import("mount.zig").exportId(root), attr);
-    try files.remember(io, h, hal_path);
-    const handle_bytes = h.encode();
-
-    var locks: Locks = .init(testing.allocator);
-    defer locks.deinit();
-    var status: nsm_.Nsm = .init(testing.allocator, 1);
-    defer status.deinit();
-    var nlm: Nlm = .init(testing.allocator, &nfs, &locks, &status);
-    defer nlm.deinit(io);
-    const programs = [_]server.Program{nlm.program()};
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const h = &f.handle;
     // An address whose portmapper nobody answers, so GRANTED_MSG goes nowhere.
     const ctx: server.Context = .{ .io = io, .from = try .parse("127.0.0.1", 9), .protocol = .tcp };
-
-    const Call = struct {
-        fn run(p: []const server.Program, c: server.Context, proc: Proc, args: []const u8, out: []u8) !Stat {
-            var b: [512]u8 = undefined;
-            var w: Io.Writer = .fixed(&b);
-            const m: rpc.Call = .{ .xid = 1, .prog = prog, .vers = vers, .proc = @backingInt(proc), .cred = .none, .verf = .none, .args = args };
-            try m.encode(.init(&w));
-            const reply = server.dispatch(p, c, w.buffered(), out).?;
-            var d: xdr.Decoder = .init(reply[24..]);
-            _ = try d.opaque_(max_netobj);
-            return d.enumeration(Stat);
-        }
-    };
-    const Args = struct {
-        fn lockArgs(b: []u8, who: []const u8, svid: i32, block: bool, exclusive: bool, fh_bytes: []const u8, reclaim: bool) []const u8 {
-            var w: Io.Writer = .fixed(b);
-            const e: xdr.Encoder = .init(&w);
-            e.opaque_("c") catch unreachable;
-            e.boolean(block) catch unreachable;
-            e.boolean(exclusive) catch unreachable;
-            (LockArgs{ .caller_name = who, .fh = fh_bytes, .oh = who, .svid = svid, .offset = 0, .len = 0 }).encode(e) catch unreachable;
-            e.boolean(reclaim) catch unreachable;
-            e.i32_(1) catch unreachable;
-            return w.buffered();
-        }
-        fn unlockArgs(b: []u8, who: []const u8, svid: i32, fh_bytes: []const u8) []const u8 {
-            var w: Io.Writer = .fixed(b);
-            const e: xdr.Encoder = .init(&w);
-            e.opaque_("c") catch unreachable;
-            (LockArgs{ .caller_name = who, .fh = fh_bytes, .oh = who, .svid = svid, .offset = 0, .len = 0 }).encode(e) catch unreachable;
-            return w.buffered();
-        }
-    };
     var a: [512]u8 = undefined;
-    var out: [512]u8 = undefined;
 
-    try testing.expectEqual(Stat.granted, try Call.run(&programs, ctx, .lock, Args.lockArgs(&a, "art", 1, false, true, &handle_bytes, false), &out));
-    try testing.expect(status.hosts.contains("art"));
+    try testing.expectEqual(Stat.granted, try f.run(ctx, .lock, (Request{ .who = "art", .svid = 1 }).lockArgs(&a, h)));
+    try testing.expect(f.status.hosts.contains("art"));
 
     // Another address giving art's name and process can't unlock art's
     // lock, nor, by locking another range as art, take over art's monitor
     // and free art's locks with FREE_ALL.
     const skynet: server.Context = .{ .io = io, .from = try .parse("127.0.0.66", 9), .protocol = .tcp };
-    try testing.expectEqual(Stat.granted, try Call.run(&programs, skynet, .unlock, Args.unlockArgs(&a, "art", 1, &handle_bytes), &out));
-    try testing.expectEqual(1, locks.held.items.len);
-    try testing.expectEqualStrings("127.0.0.1", status.hosts.get("art").?);
-    var free_all: [64]u8 = undefined;
+    try testing.expectEqual(Stat.granted, try f.run(skynet, .unlock, (Request{ .who = "art", .svid = 1 }).unlockArgs(&a, h)));
+    try testing.expectEqual(1, f.locks.held.items.len);
+    try testing.expectEqualStrings("127.0.0.1", f.status.hosts.get("art").?);
+    var free_all: [max_string + 16]u8 = undefined;
     var fw: Io.Writer = .fixed(&free_all);
     try xdr.Encoder.init(&fw).string("art");
     try xdr.Encoder.init(&fw).i32_(3);
-    var b: [512]u8 = undefined;
-    var w: Io.Writer = .fixed(&b);
-    const m: rpc.Call = .{ .xid = 1, .prog = prog, .vers = vers, .proc = @backingInt(Proc.free_all), .cred = .none, .verf = .none, .args = fw.buffered() };
-    try m.encode(.init(&w));
-    _ = server.dispatch(&programs, skynet, w.buffered(), &out);
-    try testing.expectEqual(1, locks.held.items.len);
+    var out: [512]u8 = undefined;
+    _ = try f.dispatch(skynet, .free_all, fw.buffered(), &out);
+    try testing.expectEqual(1, f.locks.held.items.len);
 
     // FREE_ALL names are limited as other calls' are.
-    var long_free_all: [max_string + 16]u8 = undefined;
-    fw = .fixed(&long_free_all);
+    fw = .fixed(&free_all);
     try xdr.Encoder.init(&fw).string(&@as([max_string + 1]u8, @splat('a')));
     try xdr.Encoder.init(&fw).i32_(3);
-    var long_b: [max_string + 128]u8 = undefined;
-    w = .fixed(&long_b);
-    const long_m: rpc.Call = .{ .xid = 1, .prog = prog, .vers = vers, .proc = @backingInt(Proc.free_all), .cred = .none, .verf = .none, .args = fw.buffered() };
-    try long_m.encode(.init(&w));
-    try testing.expectEqual(4, std.mem.readInt(u32, server.dispatch(&programs, ctx, w.buffered(), &out).?[20..24], .big)); // GARBAGE_ARGS
+    try testing.expectEqual(4, std.mem.readInt(u32, (try f.dispatch(ctx, .free_all, fw.buffered(), &out)).?[20..24], .big)); // GARBAGE_ARGS
 
-    try testing.expectEqual(Stat.denied, try Call.run(&programs, ctx, .lock, Args.lockArgs(&a, "hal", 2, false, true, &handle_bytes, false), &out));
-    try testing.expectEqual(Stat.blocked, try Call.run(&programs, ctx, .lock, Args.lockArgs(&a, "hal", 2, true, true, &handle_bytes, false), &out));
-    try testing.expectEqual(Stat.blocked, try Call.run(&programs, ctx, .lock, Args.lockArgs(&a, "hal", 2, true, true, &handle_bytes, false), &out));
-    try testing.expectEqual(1, nlm.waiters.items.len);
+    try testing.expectEqual(Stat.denied, try f.run(ctx, .lock, (Request{ .who = "hal", .svid = 2 }).lockArgs(&a, h)));
+    try testing.expectEqual(Stat.blocked, try f.run(ctx, .lock, (Request{ .who = "hal", .svid = 2, .block = true }).lockArgs(&a, h)));
+    try testing.expectEqual(Stat.blocked, try f.run(ctx, .lock, (Request{ .who = "hal", .svid = 2, .block = true }).lockArgs(&a, h)));
+    try testing.expectEqual(1, f.nlm.waiters.items.len);
 
     // Unlocking grants the waiter its lock.
-    try testing.expectEqual(Stat.granted, try Call.run(&programs, ctx, .unlock, Args.unlockArgs(&a, "art", 1, &handle_bytes), &out));
-    try testing.expectEqual(0, nlm.waiters.items.len);
-    try testing.expect(!status.hosts.contains("art"));
-    try testing.expect(status.hosts.contains("hal"));
-    try testing.expectEqual(Stat.denied, try Call.run(&programs, ctx, .lock, Args.lockArgs(&a, "art", 1, false, false, &handle_bytes, false), &out));
+    try testing.expectEqual(Stat.granted, try f.run(ctx, .unlock, (Request{ .who = "art", .svid = 1 }).unlockArgs(&a, h)));
+    try testing.expectEqual(0, f.nlm.waiters.items.len);
+    try testing.expect(!f.status.hosts.contains("art"));
+    try testing.expect(f.status.hosts.contains("hal"));
+    try testing.expectEqual(Stat.denied, try f.run(ctx, .lock, (Request{ .who = "art", .svid = 1, .exclusive = false }).lockArgs(&a, h)));
 
     // A stale handle, and the grace period after a restart.
-    var stale = handle_bytes;
+    var stale = f.handle;
     stale[31] ^= 0xff;
-    try testing.expectEqual(Stat.stale_fh, try Call.run(&programs, ctx, .lock, Args.lockArgs(&a, "art", 1, false, true, &stale, false), &out));
-    try testing.expectEqual(1, try nlm.releaseHost(io, "hal", null));
-    nlm.startGrace(io);
-    try testing.expectEqual(Stat.denied_grace_period, try Call.run(&programs, ctx, .lock, Args.lockArgs(&a, "art", 1, false, true, &handle_bytes, false), &out));
-    try testing.expectEqual(Stat.granted, try Call.run(&programs, ctx, .lock, Args.lockArgs(&a, "art", 1, false, true, &handle_bytes, true), &out));
+    try testing.expectEqual(Stat.stale_fh, try f.run(ctx, .lock, (Request{ .who = "art", .svid = 1 }).lockArgs(&a, &stale)));
+    try testing.expectEqual(1, try f.nlm.releaseHost(io, "hal", null));
+    f.nlm.startGrace(io);
+    try testing.expectEqual(Stat.denied_grace_period, try f.run(ctx, .lock, (Request{ .who = "art", .svid = 1 }).lockArgs(&a, h)));
+    try testing.expectEqual(Stat.granted, try f.run(ctx, .lock, (Request{ .who = "art", .svid = 1, .reclaim = true }).lockArgs(&a, h)));
+}
+
+/// A client's lock manager on loopback, whose port NLM remembers.
+const Client = struct {
+    socket: net.Socket,
+
+    fn init(n: *Nlm) !Client {
+        const io = testing.io;
+        const loopback: net.IpAddress = .{ .ip4 = .loopback(0) };
+        const socket = try loopback.bind(io, .{ .mode = .dgram, .protocol = .udp });
+        n.caller.remember(io, loopback, prog, vers, socket.address.getPort());
+        return .{ .socket = socket };
+    }
+
+    fn deinit(c: Client) void {
+        c.socket.close(testing.io);
+    }
+
+    /// The next callback: its procedure and arguments, in `buf`.
+    fn next(c: Client, buf: []u8) !struct { Proc, []const u8 } {
+        const in = try c.socket.receiveTimeout(testing.io, buf, .{ .duration = .{ .raw = .fromSeconds(2), .clock = .awake } });
+        const call = switch (rpc.decodeCall(in.data)) {
+            .call => |c_| c_,
+            else => return error.NotACall,
+        };
+        return .{ @fromBackingInt(call.proc), call.args };
+    }
+};
+
+test "_MSG results go back in the background" {
+    const io = testing.io;
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const client: Client = try .init(&f.nlm);
+    defer client.deinit();
+    const ctx: server.Context = .{ .io = io, .from = .{ .ip4 = .loopback(800) }, .protocol = .udp };
+    var a: [512]u8 = undefined;
+    var out: [512]u8 = undefined;
+
+    // An address that answers nothing: its portmapper's silence doesn't
+    // hold up the reply.
+    const silent: server.Context = .{ .io = io, .from = try .parse("192.0.2.1", 800), .protocol = .udp };
+    const started: Io.Clock.Timestamp = .now(io, .awake);
+    try testing.expectEqual(null, try f.dispatch(silent, .test_msg, (Request{ .who = "art", .svid = 1 }).testArgs(&a, &f.handle), &out));
+    try testing.expect(started.untilNow(io).raw.toMilliseconds() < 1000);
+
+    try testing.expectEqual(null, try f.dispatch(ctx, .lock_msg, (Request{ .who = "art", .svid = 1, .cookie = "art1" }).lockArgs(&a, &f.handle), &out));
+    var buf: [512]u8 = undefined;
+    const proc, const args = try client.next(&buf);
+    try testing.expectEqual(Proc.lock_res, proc);
+    var d: xdr.Decoder = .init(args);
+    try testing.expectEqualStrings("art1", try d.opaque_(max_netobj));
+    try testing.expectEqual(Stat.granted, try d.enumeration(Stat));
 }
