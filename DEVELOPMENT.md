@@ -76,10 +76,22 @@ Each covers only what changed since the commit it last looked at.
 
 ## Review findings
 
-From the code review of `ee622cc`; each leaves this list when fixed or accepted as a limit.
+From the code review of `ee622cc` and its fixes; each leaves this list when fixed or accepted as a limit.
 
 ### Low
 
+* **`mount del HOST PATH` forgets the host's statd monitor** even while it has other mounts or locks; forget it only once none remain.
+* **Spec ahead of code:** [AGENTS.md](AGENTS.md) states host and `*.domain` matching by forward-confirmed reverse DNS as built; it isn't (see To do).
+* **Names past 1024 bytes** in LOOKUP and other procedures answer GARBAGE_ARGS (`nfs.max_path`), not NAMETOOLONG.
+* **Reply buffers:** every call reserves a full `max_record` reply buffer, even GETATTR; size them per procedure.
+* **Adopted connections** (`serveConnection`) don't count against the connection cap.
+* **Lock limits:** a host at its limit can't take a lock that would merge with its own; splitting a lock can exceed it by one.
+* **Maps:** a stored rule can name a map only the daemon's `--map` provides, so starting without it fails.
+* **CIDR keys** don't mask host bits, so `10.0.0.1/8` and `10.0.0.0/8` are separate rules.
+* **`portmap.Client.call`** accepts replies from any address, unlike callbacks.
+* **`control.listen`** checks the file type, then unlinks, so the file can be swapped between.
+* **Anti-patterns:** nullable-means-all in [db.zig](src/znfsd/db.zig)'s `mounts(?path)` and `deleteMapEntries(?remote)`.
+* **Tests:** nothing covers a failed `resume` through `Files` and a request (needs fault injection); the control socket's silent-peer test adds 5 s to `zig build test`.
 
 ## To do
 
