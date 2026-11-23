@@ -360,20 +360,11 @@ pub fn setTimesIn(dir: Fd, name: [*:0]const u8, atime: SetTime, mtime: SetTime) 
 
 /// Creates a regular file in `dir`, `EXIST` if there's anything there.
 pub fn createIn(dir: Fd, name: [*:0]const u8, mode: u32, fd: *Fd) E {
-    return openCreating(dir, name, .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true }, mode, fd);
+    return openIn(dir, name, .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true }, mode, fd);
 }
 
-/// Opens or creates a regular file in `dir`, never following a link there.
-pub fn openOrCreateIn(dir: Fd, name: [*:0]const u8, mode: u32, fd: *Fd) E {
-    // An existing device or FIFO isn't opened: opening can have effects.
-    var existing: Attr = undefined;
-    if (statAt(dir, name, &existing) == .SUCCESS and existing.mode & posix.S.IFMT != posix.S.IFREG) {
-        return if (existing.mode & posix.S.IFMT == posix.S.IFDIR) .ISDIR else .INVAL;
-    }
-    return openCreating(dir, name, .{ .ACCMODE = .RDWR, .CREAT = true }, mode, fd);
-}
-
-fn openCreating(dir: Fd, name: [*:0]const u8, flags: c.O, mode: u32, fd: *Fd) E {
+/// Opens an entry of `dir`, never following a link there.
+fn openIn(dir: Fd, name: [*:0]const u8, flags: c.O, mode: u32, fd: *Fd) E {
     var o = flags;
     o.NOFOLLOW = true;
     o.CLOEXEC = true;
@@ -823,7 +814,7 @@ test "act as another user, then revert" {
     closeFd(fd);
     try @"resume"(paused);
     // Root's override is gone: root's private file can't be opened.
-    try testing.expectEqual(E.ACCES, openOrCreateIn(dir, "server", 0o600, &fd));
+    try testing.expectEqual(E.ACCES, openIn(dir, "server", .{ .ACCMODE = .RDWR }, 0, &fd));
     revert();
 
     var attr: Attr = undefined;

@@ -1084,7 +1084,8 @@ const Request = struct {
         switch (how) {
             .unchecked => |*s| {
                 r.inward(s);
-                return r.made(&w, r.createOrOpen(&w, s.*));
+                const e = r.createNew(&w, s.*);
+                return r.made(&w, if (e == .EXIST) truncateExisting(&w, s.size) else e);
             },
             .guarded => |*s| {
                 r.inward(s);
@@ -1094,13 +1095,28 @@ const Request = struct {
         }
     }
 
-    /// Creates a regular file, or opens an existing one, and applies `s`.
-    fn createOrOpen(r: *Request, w: *const Where, s: Sattr) sys.E {
+    /// Truncates the existing regular file UNCHECKED names to `size`, if
+    /// given; the rest of its attributes stay, as with Linux's server, so
+    /// a non-owner's CREATE isn't refused for want of changing them.
+    fn truncateExisting(w: *const Where, size: ?u64) sys.E {
+        var existing: sys.Attr = undefined;
+        var e = sys.statAt(w.fd, w.name, &existing);
+        if (e != .SUCCESS) return e;
+        // An existing device or FIFO isn't opened: opening can have effects.
+        switch (ftype(existing.mode)) {
+            .reg => {},
+            .dir => return .ISDIR,
+            else => return .INVAL,
+        }
+        const to = size orelse return .SUCCESS;
+        var buf: [sys.max_path + 1]u8 = undefined;
+        const path = w.path(&buf) orelse return .NAMETOOLONG;
         var fd: sys.Fd = undefined;
-        const e = sys.openOrCreateIn(w.fd, w.name, s.mode orelse 0o600, &fd);
+        var now: sys.Attr = undefined;
+        e = sys.openOwned(path, .{ .ACCMODE = .WRONLY }, existing.ino, &fd, &now);
         if (e != .SUCCESS) return e;
         defer sys.closeFd(fd);
-        return r.settleFile(w, fd, s);
+        return sys.truncateFd(fd, to);
     }
 
     /// Creates a new regular file and applies `s`.
@@ -1112,7 +1128,7 @@ const Request = struct {
         return r.settleFile(w, fd, s);
     }
 
-    /// Applies `s` to the regular file open at `fd`, just created or opened.
+    /// Applies `s` to the regular file just created at `fd`.
     fn settleFile(r: *Request, w: *const Where, fd: sys.Fd, s: Sattr) sys.E {
         var e: sys.E = .SUCCESS;
         if (s.size) |size| e = sys.truncateFd(fd, size);
@@ -1992,6 +2008,39 @@ test "create, write, set attributes, rename, link, and remove" {
     try e.string("..");
     try sattrMode(e, null);
     _ = try expectStatus(.exist, try f.call(nfs, @backingInt(Proc.mkdir), a.bytes()));
+}
+
+test "CREATE UNCHECKED over an existing file applies only the size" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const root = try f.rootHandle();
+    var a: Args = .{};
+    const hal_path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/hal", .{f.root}, 0);
+    defer testing.allocator.free(hal_path);
+    var fd: sys.Fd = undefined;
+    try testing.expectEqual(sys.E.SUCCESS, sys.openSafe(hal_path, .{}, 0, &fd));
+    try testing.expectEqual(sys.E.SUCCESS, sys.chmodFd(fd, 0o640));
+    sys.closeFd(fd);
+
+    // Mode 0600 and size 3: the mode stays 0640.
+    const e = a.start(root);
+    try e.string("hal");
+    try e.u32_(0);
+    try e.boolean(true);
+    try e.u32_(0o600);
+    try e.boolean(false); // uid
+    try e.boolean(false); // gid
+    try e.boolean(true);
+    try e.u64_(3);
+    try e.u32_(0); // atime: don't change
+    try e.u32_(0); // mtime: don't change
+    const hal = try createdHandle(try f.call(f.nfs.program(), @backingInt(Proc.create), a.bytes()));
+    try testing.expectEqualSlices(u8, &(try f.lookup(root, "hal")).ok, &hal);
+    var attr: sys.Attr = undefined;
+    try testing.expectEqual(sys.E.SUCCESS, sys.lstat(hal_path, &attr));
+    try testing.expectEqual(0o640, attr.mode & 0o7777);
+    try testing.expectEqual(3, attr.size);
 }
 
 test "maps translate callers and owners" {
