@@ -46,7 +46,7 @@ NFS v3 server daemon with few options and sensible defaults.
 * File handles: ≤64 bytes: format version, export ID, filesystem ID (volume UUID where available), inode, and generation (0 when unreadable)
 * Paths from clients or handles: opened, stated, read as links, and queried for capacity through descriptors that follow no symbolic link in any component, so none reaches outside its export
 * Handle resolution: `open_by_handle_at` (Linux), `fsgetpath` (macOS), else the stored last-known path if its inode matches; else `NFS3ERR_STALE`; NFS renames update stored paths
-* Control: Unix socket at `--socket`, mode 0600; `serve` claims it before changing stored state, so a second `serve` changes nothing
+* Control: Unix socket at `--socket`, mode 0600; `serve` claims it before changing stored state, so a second `serve` changes nothing; replaces only a stale socket, nothing else; a peer has 5 s to send its request, and 5 s to take the reply
 * Admin web server: `--web`, default `127.0.0.1:8049`; live activity monitor only, no auth
 * `activity`: the monitor's snapshot as JSON, from the running daemon
 

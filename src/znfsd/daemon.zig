@@ -136,6 +136,7 @@ pub fn serve(
     var socket = control.listen(io, socket_path) catch |err| {
         switch (err) {
             error.InUse => try stderr.print("znfsd: another znfsd is running, with control socket {s}\n", .{socket_path}),
+            error.NotSocket => try stderr.print("znfsd: {s} isn't a socket; remove it or use --socket PATH\n", .{socket_path}),
             else => try stderr.print("znfsd: control socket {s}: {t}\n", .{ socket_path, err }),
         }
         return 1;

@@ -9,11 +9,16 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 const net = Io.net;
+const sys = @import("libnfsd").sys;
 
 const log = std.log.scoped(.znfsd);
 
 /// The largest request or reply part.
 const max_part = 16 * 1024 * 1024;
+
+/// How long a peer has to send its request, and then to take the reply,
+/// so a silent one can't hold up every other command.
+const deadline: Io.Duration = .fromSeconds(5);
 
 /// The default socket path: per the user unless root, per the OS.
 pub fn defaultPath(arena: std.mem.Allocator, environ: *const std.process.Environ.Map, root: bool) error{ OutOfMemory, NoRuntimeDir }![]const u8 {
@@ -32,6 +37,10 @@ pub const Reply = struct {
 /// Sends `words` to the daemon at `path`; null when no daemon answers.
 pub fn send(io: Io, arena: std.mem.Allocator, path: []const u8, words: []const []const u8) !?Reply {
     const address = net.UnixAddress.init(path) catch return null;
+    var z: [net.UnixAddress.max_len + 1]u8 = undefined;
+    @memcpy(z[0..path.len], path);
+    z[path.len] = 0;
+    if (kindAt(z[0..path.len :0]) != .socket) return null;
     const stream = address.connect(io) catch return null;
     defer stream.close(io);
 
@@ -52,6 +61,14 @@ pub fn send(io: Io, arena: std.mem.Allocator, path: []const u8, words: []const [
     return .{ .status = @intCast(@min(status, 255)), .out = try readPart(r, arena), .err = try readPart(r, arena) };
 }
 
+/// What is at a socket path. Connecting to anything but a socket is
+/// refused, and on macOS fails as a bug in `std.Io.Threaded`.
+fn kindAt(path: [:0]const u8) enum { absent, socket, other } {
+    var attr: sys.Attr = undefined;
+    if (sys.lstat(path, &attr) != .SUCCESS) return .absent;
+    return if (attr.mode & std.c.S.IFMT == std.c.S.IFSOCK) .socket else .other;
+}
+
 fn readPart(r: *Io.Reader, arena: std.mem.Allocator) ![]const u8 {
     const len = try r.takeInt(u32, .big);
     if (len > max_part) return error.TooLong;
@@ -66,20 +83,26 @@ pub const Handler = struct {
     handle: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, words: []const []const u8, out: *Io.Writer, err: *Io.Writer) u8,
 };
 
-pub const ListenError = error{ InUse, SocketPath } || net.UnixAddress.ListenError;
+pub const ListenError = error{ InUse, SocketPath, NotSocket } || net.UnixAddress.ListenError;
 
 /// Listens at `path`, replacing a stale socket but not a live daemon's,
-/// with mode 0600.
+/// nor anything else there, with mode 0600.
 pub fn listen(io: Io, path: []const u8) ListenError!net.Server {
     const address = net.UnixAddress.init(path) catch return error.SocketPath;
-    if (address.connect(io)) |stream| {
-        stream.close(io);
-        return error.InUse;
-    } else |_| {}
     var z: [net.UnixAddress.max_len + 1]u8 = undefined;
     @memcpy(z[0..path.len], path);
     z[path.len] = 0;
-    _ = std.c.unlink(z[0..path.len :0]);
+    switch (kindAt(z[0..path.len :0])) {
+        .absent => {},
+        .other => return error.NotSocket,
+        .socket => {
+            if (address.connect(io)) |stream| {
+                stream.close(io);
+                return error.InUse;
+            } else |_| {}
+            _ = std.c.unlink(z[0..path.len :0]);
+        },
+    }
     // Only the owner may connect, from the moment the socket exists.
     const old = std.c.umask(0o177);
     defer _ = std.c.umask(old);
@@ -117,18 +140,25 @@ fn answer(io: Io, gpa: std.mem.Allocator, stream: net.Stream, handler: Handler) 
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var read_buf: [4096]u8 = undefined;
-    var reader = stream.reader(io, &read_buf);
-    const r = &reader.interface;
-    const count = try r.takeInt(u32, .big);
-    if (count > 4096) return error.TooLong;
-    const words = try arena.alloc([]const u8, count);
-    for (words) |*word| word.* = try readPart(r, arena);
+    const words = words: {
+        var timer = try io.concurrent(watchdog, .{ io, stream });
+        defer timer.cancel(io) catch {};
+        var read_buf: [4096]u8 = undefined;
+        var reader = stream.reader(io, &read_buf);
+        const r = &reader.interface;
+        const count = try r.takeInt(u32, .big);
+        if (count > 4096) return error.TooLong;
+        const words = try arena.alloc([]const u8, count);
+        for (words) |*word| word.* = try readPart(r, arena);
+        break :words words;
+    };
 
     var out: Io.Writer.Allocating = .init(arena);
     var err: Io.Writer.Allocating = .init(arena);
     const status = handler.handle(handler.ptr, arena, words, &out.writer, &err.writer);
 
+    var timer = try io.concurrent(watchdog, .{ io, stream });
+    defer timer.cancel(io) catch {};
     var write_buf: [4096]u8 = undefined;
     var writer = stream.writer(io, &write_buf);
     const w = &writer.interface;
@@ -138,6 +168,13 @@ fn answer(io: Io, gpa: std.mem.Allocator, stream: net.Stream, handler: Handler) 
         try w.writeAll(part);
     }
     try w.flush();
+}
+
+/// Shuts `stream` down once `deadline` passes, unless canceled first,
+/// ending any read or write waiting on it.
+fn watchdog(io: Io, stream: net.Stream) Io.Cancelable!void {
+    try io.sleep(deadline, .awake);
+    stream.shutdown(io, .both) catch {};
 }
 
 const testing = std.testing;
@@ -175,4 +212,33 @@ test "send a command to a listening daemon" {
     try testing.expectEqualStrings("hal", reply.err);
 
     try testing.expectEqual(null, try send(io, arena_state.allocator(), "/nonexistent/skynet.sock", &.{"stop"}));
+
+    // A peer that never sends a request is dropped, and others answered.
+    const address = try net.UnixAddress.init(path);
+    const silent = try address.connect(io);
+    defer silent.close(io);
+    const again = (try send(io, arena_state.allocator(), path, &.{"stop"})).?;
+    try testing.expectEqualStrings("stop;", again.out);
+}
+
+test "listen replaces only a socket" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [256]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+    var path_buf: [300]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/c.sock", .{dir});
+    try tmp.dir.writeFile(io, .{ .sub_path = "c.sock", .data = "hal" });
+    try testing.expectError(error.NotSocket, listen(io, path));
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    try testing.expectEqual(null, try send(io, arena_state.allocator(), path, &.{"stop"}));
+    try tmp.dir.deleteFile(io, "c.sock");
+
+    // A stale socket, nobody answering on it, is replaced.
+    var stale = try listen(io, path);
+    stale.deinit(io);
+    var server = try listen(io, path);
+    server.deinit(io);
 }
