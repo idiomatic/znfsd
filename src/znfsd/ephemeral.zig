@@ -78,6 +78,16 @@ pub fn parseGroup(arena: std.mem.Allocator, text: []const u8) Error!Group {
     return .{ .name = text[0..colon], .clients = clients.items };
 }
 
+/// Adds `g` to `groups`, merged into an earlier group of its name, so
+/// `--group` repeats as `--map` does.
+pub fn mergeGroup(arena: std.mem.Allocator, groups: *std.ArrayList(Group), g: Group) error{OutOfMemory}!void {
+    for (groups.items) |*existing| if (std.mem.eql(u8, existing.name, g.name)) {
+        existing.clients = try std.mem.concat(arena, exports.Client, &.{ existing.clients, g.clients });
+        return;
+    };
+    try groups.append(arena, g);
+}
+
 pub const MapArg = struct {
     name: []const u8,
     entries: []const exports.MapEntry,
@@ -154,4 +164,11 @@ test "groups" {
     try testing.expectEqual(2, g.clients.len);
     try testing.expectError(error.BadGroup, parseGroup(arena_state.allocator(), "lab"));
     try testing.expectError(error.BadGroup, parseGroup(arena_state.allocator(), "lab:@ops"));
+
+    var groups: std.ArrayList(Group) = .empty;
+    try mergeGroup(arena_state.allocator(), &groups, g);
+    try mergeGroup(arena_state.allocator(), &groups, try parseGroup(arena_state.allocator(), "ops:10.2.0.0/16"));
+    try mergeGroup(arena_state.allocator(), &groups, try parseGroup(arena_state.allocator(), "lab:10.3.0.0/16"));
+    try testing.expectEqual(2, groups.items.len);
+    try testing.expectEqual(3, groups.items[0].clients.len);
 }

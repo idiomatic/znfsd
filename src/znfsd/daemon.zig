@@ -74,7 +74,7 @@ pub fn serve(
     }
     var groups: std.ArrayList(ephemeral.Group) = .empty;
     for (options.groups) |text| {
-        try groups.append(arena, ephemeral.parseGroup(arena, text) catch |err| {
+        try ephemeral.mergeGroup(arena, &groups, ephemeral.parseGroup(arena, text) catch |err| {
             try stderr.print("znfsd: --group {s}: {t}\n", .{ text, err });
             return 2;
         });

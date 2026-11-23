@@ -38,7 +38,7 @@ NFS v3 server daemon with few options and sensible defaults.
 * Database files: each a file of its own (no symbolic or hard links), so none aims znfsd's writes elsewhere
 * Maps: at most one per export rule, via `map=MAP`; translate UIDs and GIDs independently; requests map REMOTE to LOCAL, replies map LOCAL to its first REMOTE; local names resolve to numbers on `add`; a rule must name an existing map (stored, or the running daemon's), and `map del` refuses to leave a map that stored rules, or the daemon's, name with no entries
 * Anon: a map's REMOTE-less entry; unmapped IDs and squash use it; without one, unmapped IDs pass through and squash uses the host's `nobody`
-* `serve` ephemera: exports, `--group`, and `--map` shadow stored rules, groups, and maps of the same key while serving, without being stored; `--group` and `--map` repeat, one entry each
+* `serve` ephemera: exports, `--group`, and `--map` shadow stored rules, groups, and maps of the same key while serving, without being stored; `--group` and `--map` repeat, one entry each, merging by name
 * Ephemeral export: `PATH[:OPTIONS[:CLIENTS]]`; escape `:` in PATH as `\:`; OPTIONS and CLIENTS comma-separated; CLIENTS defaults to `*`
 * State: SQLite at `--db` (exports, groups, maps, file handles, mount records, statd monitor list, NSM state number); locks aren't stored
 * Restart: increment the NSM state number; once every service is bound and registered, send SM_NOTIFY to monitored hosts and grant only lock reclaims during a ~90 s grace period
