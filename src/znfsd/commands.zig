@@ -283,6 +283,9 @@ fn mountCommand(c: Context, verb: cli.Verb, args: []const []const u8) !u8 {
                 try c.err.print("znfsd: no such mount record\n", .{});
                 return 1;
             }
+            // Its statd monitor goes too; a running daemon then forgets it
+            // in memory.
+            try c.db.forgetMonitors(args[0]);
         },
         .add, .set => unreachable,
     }
@@ -360,4 +363,19 @@ test "rules name only maps that exist, and maps in use stay" {
     try testing.expectEqual(0, try run(live, .@"export", .add, &.{ s.dir, "*", "map=perihelion" }));
     try testing.expectEqual(0, try run(live, .map, .add, &.{ "hal", "501" }));
     try testing.expectEqual(1, try run(live, .map, .del, &.{"hal"}));
+}
+
+test "mount del forgets the host's monitor, by name or address" {
+    var s: Scratch = undefined;
+    try s.init();
+    defer s.deinit();
+    const c = s.context();
+    const store = s.db.nsmStore();
+    store.monitor(store.ptr, .{ .name = "art", .address = "192.168.213.11" });
+    store.monitor(store.ptr, .{ .name = "hal", .address = "192.168.213.12" });
+    try s.db.addMount("art", "/srv");
+    try s.db.addMount("192.168.213.12", "/srv");
+    try testing.expectEqual(0, try run(c, .mount, .del, &.{"art"}));
+    try testing.expectEqual(0, try run(c, .mount, .del, &.{ "192.168.213.12", "/srv" }));
+    try testing.expectEqual(0, (try s.db.monitors(c.arena)).len);
 }

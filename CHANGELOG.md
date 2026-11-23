@@ -16,6 +16,7 @@ All notable changes to znfsd are documented here. The format follows [Keep a Cha
 * READDIR and READDIRPLUS answer `NFS3ERR_TOOSMALL` when no entry fits `maxcount`, and send one entry even past `dircount`, so a client is never sent an empty, unfinished listing to ask for again forever
 * MNT answers ACCES for any path not inside an export admitting the caller without links, so it no longer tells which paths exist elsewhere
 * Handles' stats, link reads, and file-system queries refuse symbolic links mid-path, as opens do, so a client racing a RENAME and SYMLINK can't read metadata outside its export
+* `mount del HOST` without the daemon drops HOST, by name or address, from the stored statd monitor list too, as it does with the daemon
 * SM_NOTIFY and the grace period start once every service is bound and registered, not after a fixed 2 seconds and before binding, so clients told of a restart find NLM and NSM, and the grace period isn't spent waiting for macOS's portmapper
 * `export add|set` refuse `map=` for a map that doesn't exist, and `map del` refuses to empty a map rules name, so the running daemon never maps nothing and the next start doesn't fail
 * A second `serve` exits before changing anything stored, rather than advancing the running daemon's NSM state number and, with `--no-portmap`, deleting its monitored hosts

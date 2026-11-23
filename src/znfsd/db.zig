@@ -409,6 +409,12 @@ pub const Db = struct {
         _ = try db.run("DELETE FROM monitors WHERE name = ?1", &.{name});
     }
 
+    /// Stops monitoring hosts named `key`, or at address `key`, as
+    /// `Nsm.forget` does in a running daemon.
+    pub fn forgetMonitors(db: *Db, key: []const u8) Error!void {
+        _ = try db.run("DELETE FROM monitors WHERE name = ?1 OR address = ?1", &.{key});
+    }
+
     /// Keeps NSM's monitored hosts here, for notifying after a restart.
     pub fn nsmStore(db: *Db) libnfsd.nsm.Store {
         const S = struct {
