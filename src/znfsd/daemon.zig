@@ -158,7 +158,8 @@ pub fn serve(
     var nfs: libnfsd.nfs.Nfs = .init(gpa, table, &files, verifier);
 
     // Locking: a new NSM state number at each start; hosts that held locks
-    // before are told, and get a grace period to reclaim them.
+    // before are told, once our services are registered, and get a grace
+    // period to reclaim them.
     const state = try db.advanceNsmState();
     const previous = try db.monitors(arena);
     var locks: libnfsd.locks.Locks = .init(gpa);
@@ -171,7 +172,7 @@ pub fn serve(
     status.rebooted = nlm.rebooted();
     const locking = !options.no_portmap;
     if (!locking) for (previous) |h| try db.deleteMonitor(h.name);
-    if (locking and previous.len > 0) nlm.startGrace(io);
+    var started: Started = .{ .io = io, .recovering = if (locking and previous.len > 0) &nlm else null };
 
     d.mount = &mount;
     d.nfs = &nfs;
@@ -197,8 +198,9 @@ pub fn serve(
 
     if (drop) |*dr| {
         dr.nfs = &nfs;
-        config.after_bind = dr.hook();
+        started.drop = dr;
     }
+    config.after_bind = started.hook();
     config.observer = d.activity.observer();
 
     // The activity monitor: wanted, not needed, so a taken port only warns.
@@ -216,7 +218,7 @@ pub fn serve(
     var result: Outcome = .running;
     var service = try io.concurrent(runService, .{ io, gpa, config, registrations.items, &diag, &result });
     var controller = try io.concurrent(control.serve, .{ io, gpa, &socket, d.handler() });
-    var notifier = try io.concurrent(notifyRestart, .{ io, gpa, db, if (locking) previous else &.{}, state });
+    var notifier = try io.concurrent(notifyRestart, .{ io, gpa, db, if (locking) previous else &.{}, state, &started.registered });
     var monitor: ?Io.Future(Io.Cancelable!void) = if (web_server) |*w|
         try io.concurrent(web.serve, .{ io, gpa, w, d.provider() })
     else
@@ -435,6 +437,30 @@ const Daemon = struct {
     }
 };
 
+/// Once every port is bound and registered, and before any request is
+/// served: drops root for --run-as, then starts restart recovery, so hosts
+/// told of the restart find our services.
+const Started = struct {
+    io: Io,
+    drop: ?*Drop = null,
+    /// The lock manager, when hosts held locks before the restart.
+    recovering: ?*libnfsd.nlm.Nlm,
+    /// Set once registered, for `notifyRestart`.
+    registered: Io.Event = .unset,
+
+    fn hook(s: *Started) libnfsd.service.AfterBind {
+        return .{ .ptr = s, .call = call };
+    }
+
+    fn call(ptr: *anyopaque, diag: *libnfsd.service.Diagnostic) bool {
+        const s: *Started = @ptrCast(@alignCast(ptr));
+        if (s.drop) |d| if (!d.apply(diag)) return false;
+        if (s.recovering) |n| n.startGrace(s.io);
+        s.registered.set(s.io);
+        return true;
+    }
+};
+
 /// Dropping root for --run-as: the user, and what must become theirs first.
 const Drop = struct {
     name: [:0]const u8,
@@ -450,12 +476,7 @@ const Drop = struct {
         return .{ .name = name, .uid = pw.uid, .gid = pw.gid, .db_path = db_path, .socket_path = socket_path };
     }
 
-    fn hook(d: *Drop) libnfsd.service.AfterBind {
-        return .{ .ptr = d, .call = call };
-    }
-
-    fn call(ptr: *anyopaque, diag: *libnfsd.service.Diagnostic) bool {
-        const d: *Drop = @ptrCast(@alignCast(ptr));
+    fn apply(d: *Drop, diag: *libnfsd.service.Diagnostic) bool {
         // The database's directory and files, and the control socket.
         if (!d.giveDatabase(diag)) return false;
         var buf: [libnfsd.sys.max_path + 1]u8 = undefined;
@@ -557,15 +578,16 @@ fn fileOf(path: []const u8) ?libnfsd.locks.File {
 }
 
 /// After a restart, tells the hosts that held locks, once our services are
-/// registered, retrying those that don't answer.
+/// `registered`, retrying those that don't answer.
 /// A host stays in the database until told, or until retries run out, so
 /// a crash meanwhile doesn't lose it.
-fn notifyRestart(io: Io, gpa: std.mem.Allocator, db: *dbm.Db, hosts: []const libnfsd.nsm.Host, state: u32) void {
+fn notifyRestart(io: Io, gpa: std.mem.Allocator, db: *dbm.Db, hosts: []const libnfsd.nsm.Host, state: u32, registered: *Io.Event) void {
     const pending = gpa.alloc(bool, hosts.len) catch return;
     defer gpa.free(pending);
     @memset(pending, true);
-    for (0..5) |_| {
-        io.sleep(.fromSeconds(2), .awake) catch return;
+    registered.wait(io) catch return;
+    for (0..5) |attempt| {
+        if (attempt > 0) io.sleep(.fromSeconds(2), .awake) catch return;
         var left: usize = 0;
         for (hosts, pending) |h, *p| {
             if (!p.*) continue;

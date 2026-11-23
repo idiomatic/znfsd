@@ -73,7 +73,7 @@ Handles name a file without its path, so they survive renames. They're distinct 
 
 NLM locks live only in memory, with POSIX byte-range semantics per owner (client host, by the name it gives and the address it calls from, process ID, and owner handle, so no host can pass for another); they coordinate NFS clients with each other, not with processes on the server, since one server process can't hold host locks for many owners. Linux clients use NLM's synchronous procedures; macOS clients use the `_MSG` ones, whose results go back as `_RES` calls to the client's lock manager, found through its portmapper. A blocked request waits in a queue and is granted with a `GRANTED_MSG` callback, sent in the background. A host's monitored address moves only once it holds no locks from the old one, and FREE_ALL and SM_NOTIFY release only what a host holds from the address they come from. With `--no-portmap`, NLM and NSM aren't served.
 
-NLM locks live only in memory. NSM records which clients hold state, and that list persists with an NSM state number. At startup, znfsd increments the number, notifies each listed client with SM_NOTIFY, and for about 90 seconds grants only lock reclaims, so clients recover their locks before new ones compete.
+NLM locks live only in memory. NSM records which clients hold state, and that list persists with an NSM state number. At startup, znfsd increments the number; then, once every service is bound and registered (libnfsd's `Config.after_bind`, however long the portmapper probe took), it notifies each listed client with SM_NOTIFY and for about 90 seconds grants only lock reclaims, so clients recover their locks before new ones compete.
 
 ## State
 

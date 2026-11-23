@@ -40,7 +40,7 @@ NFS v3 server daemon with few options and sensible defaults.
 * `serve` ephemera: exports, `--group`, and `--map` shadow stored rules, groups, and maps of the same key while serving, without being stored; `--group` and `--map` repeat, one entry each
 * Ephemeral export: `PATH[:OPTIONS[:CLIENTS]]`; escape `:` in PATH as `\:`; OPTIONS and CLIENTS comma-separated; CLIENTS defaults to `*`
 * State: SQLite at `--db` (exports, groups, maps, file handles, mount records, statd monitor list, NSM state number); locks aren't stored
-* Restart: increment the NSM state number, send SM_NOTIFY to monitored hosts, then grant only lock reclaims during a ~90 s grace period
+* Restart: increment the NSM state number; once every service is bound and registered, send SM_NOTIFY to monitored hosts and grant only lock reclaims during a ~90 s grace period
 * `mount del` and `lock del`: also drop the host from the statd monitor list
 * File handles: ≤64 bytes: format version, export ID, filesystem ID (volume UUID where available), inode, and generation (0 when unreadable)
 * Paths from clients or handles: opened, stated, read as links, and queried for capacity through descriptors that follow no symbolic link in any component, so none reaches outside its export
