@@ -26,6 +26,7 @@ NFS v3 server daemon with few options and sensible defaults.
 * Database: WAL mode with a busy timeout
 * `lock` commands: need the daemon; without it, `list` is empty and `del` fails
 * `mount` commands: work with or without the daemon
+* CLIENT keys: stored canonical, so `10.0.0.1`, `10.0.0.1/32`, and `::ffff:10.0.0.1` name one rule or member
 * Rule matching: the most specific CLIENT wins, whole, without merging: host, longest CIDR, longest `*.domain`, `@GROUP`, `*`
 * Host and `*.domain` matching: forward-confirmed reverse DNS, cached, resolved asynchronously; until built, new rules and groups refuse such CLIENTs, since they'd match no one
 * `--bind`: repeatable; default `0.0.0.0` and `::`

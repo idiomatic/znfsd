@@ -50,7 +50,7 @@ fn exportPath(c: Context, path: []const u8, must_exist: bool) !?[]const u8 {
     return null;
 }
 
-/// Checks a client's syntax and returns it as written.
+/// Checks a client's syntax and returns it as stored.
 fn client(c: Context, text: []const u8) !?[]const u8 {
     const parsed = exports.Client.parse(text) catch {
         try c.err.print("znfsd: {s}: not a host, *.domain, CIDR, @group, or *\n", .{text});
@@ -60,7 +60,7 @@ fn client(c: Context, text: []const u8) !?[]const u8 {
         try c.err.print("znfsd: {s}: host names aren't matched yet; use an address, CIDR, @group, or *\n", .{text});
         return null;
     }
-    return text;
+    return try dbm.clientKey(c.arena, text);
 }
 
 fn exportCommand(c: Context, verb: cli.Verb, args: []const []const u8) !u8 {
@@ -100,7 +100,8 @@ fn exportCommand(c: Context, verb: cli.Verb, args: []const []const u8) !u8 {
         .del => {
             if (args.len < 1 or args.len > 2) return usage(c, "export del PATH [CLIENT]");
             const path = try exportPath(c, args[0], false) orelse return 1;
-            if (try c.db.deleteRules(path, if (args.len == 2) args[1] else null) == 0) {
+            const who = if (args.len == 2) try dbm.clientKey(c.arena, args[1]) else null;
+            if (try c.db.deleteRules(path, who) == 0) {
                 try c.err.print("znfsd: no such rule\n", .{});
                 return 1;
             }
@@ -119,14 +120,16 @@ fn groupCommand(c: Context, verb: cli.Verb, args: []const []const u8) !u8 {
         },
         .add => {
             if (args.len < 2) return usage(c, "group add GROUP CLIENT ...");
+            var members: std.ArrayList([]const u8) = .empty;
             for (args[1..]) |text| {
                 const who = try client(c, text) orelse return 2;
                 if (who[0] == '@') {
                     try c.err.print("znfsd: {s}: groups can't contain groups\n", .{who});
                     return 2;
                 }
+                try members.append(c.arena, who);
             }
-            for (args[1..]) |who| try c.db.addMember(args[0], who);
+            for (members.items) |who| try c.db.addMember(args[0], who);
         },
         .del => {
             if (args.len < 1) return usage(c, "group del GROUP [CLIENT ...]");
@@ -134,7 +137,7 @@ fn groupCommand(c: Context, verb: cli.Verb, args: []const []const u8) !u8 {
             if (args.len == 1) {
                 removed = try c.db.deleteMembers(args[0], null);
             } else for (args[1..]) |who| {
-                removed += try c.db.deleteMembers(args[0], who);
+                removed += try c.db.deleteMembers(args[0], try dbm.clientKey(c.arena, who));
             }
             if (removed == 0) {
                 try c.err.print("znfsd: no such group or member\n", .{});
@@ -378,4 +381,18 @@ test "mount del forgets the host's monitor, by name or address" {
     try testing.expectEqual(0, try run(c, .mount, .del, &.{"art"}));
     try testing.expectEqual(0, try run(c, .mount, .del, &.{ "192.168.213.12", "/srv" }));
     try testing.expectEqual(0, (try s.db.monitors(c.arena)).len);
+}
+
+test "clients are one key however they're written" {
+    var s: Scratch = undefined;
+    try s.init();
+    defer s.deinit();
+    const c = s.context();
+    try testing.expectEqual(0, try run(c, .@"export", .add, &.{ s.dir, "10.0.0.1/32", "ro" }));
+    try testing.expectEqual(0, try run(c, .@"export", .set, &.{ s.dir, "::ffff:10.0.0.1", "rw" }));
+    try testing.expectEqual(1, (try s.db.rules(c.arena, null)).len);
+    try testing.expectEqual(0, try run(c, .@"export", .del, &.{ s.dir, "10.0.0.1" }));
+    try testing.expectEqual(0, try run(c, .group, .add, &.{ "lab", "10.1.0.0/16", "::ffff:10.1.0.0/112" }));
+    try testing.expectEqual(1, (try s.db.members(c.arena, "lab")).len);
+    try testing.expectEqual(0, try run(c, .group, .del, &.{ "lab", "::ffff:10.1.0.0/112" }));
 }

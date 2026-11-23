@@ -33,8 +33,9 @@ const sqlite = struct {
 
 pub const Error = error{ Sqlite, OutOfMemory };
 
-/// The schema's version, in `PRAGMA user_version`.
-const schema_version = 4;
+/// The schema's version, in `PRAGMA user_version`. Version 5 keys rules
+/// and group members by `clientKey`.
+const schema_version = 5;
 const schema =
     \\CREATE TABLE IF NOT EXISTS export_rules (
     \\  path TEXT NOT NULL,
@@ -111,10 +112,45 @@ pub const Db = struct {
         try db.exec("PRAGMA synchronous = NORMAL");
         try db.exec("PRAGMA foreign_keys = ON");
         try db.exec("BEGIN IMMEDIATE");
+        const version = try db.userVersion();
         try db.exec(schema);
+        if (version < 5) {
+            try db.canonicalizeClients("export_rules", "path");
+            try db.canonicalizeClients("group_members", "name");
+        }
         try db.exec(std.fmt.comptimePrint("PRAGMA user_version = {d}", .{schema_version}));
         try db.exec("COMMIT");
         return db;
+    }
+
+    fn userVersion(db: *Db) Error!i64 {
+        var stmt = try db.prepare("PRAGMA user_version", &.{});
+        defer stmt.finish();
+        return if (try stmt.next()) stmt.int(0) else 0;
+    }
+
+    /// Rekeys `table`'s rows by `clientKey`; where two rows meet, the one
+    /// already canonical stays.
+    fn canonicalizeClients(db: *Db, comptime table_name: []const u8, comptime key: []const u8) Error!void {
+        var arena_state: std.heap.ArenaAllocator = .init(std.heap.smp_allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const Row = struct { key: []const u8, client: []const u8 };
+        var rows: std.ArrayList(Row) = .empty;
+        {
+            var stmt = try db.prepare("SELECT " ++ key ++ ", client FROM " ++ table_name, &.{});
+            defer stmt.finish();
+            while (try stmt.next()) try rows.append(arena, .{
+                .key = try arena.dupe(u8, stmt.text(0)),
+                .client = try arena.dupe(u8, stmt.text(1)),
+            });
+        }
+        for (rows.items) |r| {
+            const canonical = try clientKey(arena, r.client);
+            if (std.mem.eql(u8, canonical, r.client)) continue;
+            _ = try db.run("UPDATE OR IGNORE " ++ table_name ++ " SET client = ?3 WHERE " ++ key ++ " = ?1 AND client = ?2", &.{ r.key, r.client, canonical });
+            _ = try db.run("DELETE FROM " ++ table_name ++ " WHERE " ++ key ++ " = ?1 AND client = ?2", &.{ r.key, r.client });
+        }
     }
 
     pub fn close(db: *Db) void {
@@ -495,6 +531,15 @@ pub const Stmt = struct {
     }
 };
 
+/// A client as stored, so each is one key however it's written:
+/// `Client.format`'s form, or the text as given if it doesn't parse.
+pub fn clientKey(arena: std.mem.Allocator, text: []const u8) error{OutOfMemory}![]const u8 {
+    const parsed = exports.Client.parse(text) catch return text;
+    var w: std.Io.Writer.Allocating = .init(arena);
+    parsed.format(&w.writer) catch return error.OutOfMemory;
+    return w.written();
+}
+
 /// Parses stored or given `OPTION` words, comma- or space-separated.
 pub fn parseOptions(text: []const u8) exports.Options.ParseError!exports.Options {
     var o: exports.Options = .{};
@@ -612,4 +657,40 @@ test "options round trip" {
     try formatOptions(try parseOptions("ro map=art"), &w);
     try testing.expectEqualStrings("ro,squash=root,map=art", w.buffered());
     try testing.expectError(error.UnknownOption, parseOptions("rw,skynet"));
+}
+
+test "clients are keyed canonically, and older rows rekeyed" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [libnfsd.sys.max_path]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(testing.io, &buf)];
+    const path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/znfsd.db", .{dir}, 0);
+    defer testing.allocator.free(path);
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try testing.expectEqualStrings("10.0.0.1", try clientKey(arena, "::ffff:10.0.0.1"));
+    try testing.expectEqualStrings("10.0.0.1", try clientKey(arena, "10.0.0.1/32"));
+    try testing.expectEqualStrings("fd00::/8", try clientKey(arena, "fd00:0::/8"));
+
+    // A version 4 database, keyed as typed.
+    var db: Db = try .open(path);
+    try db.putRule("/srv", "10.0.0.1/32", "ro,squash=root");
+    try db.putRule("/srv", "10.0.0.1", "rw,squash=root");
+    try db.putRule("/srv", "::ffff:10.0.0.2", "rw,squash=all");
+    try db.addMember("lab", "10.1.0.0/16");
+    try db.addMember("lab", "::ffff:10.1.0.0/112");
+    try db.exec("PRAGMA user_version = 4");
+    db.close();
+
+    db = try .open(path);
+    defer db.close();
+    const rules_ = try db.rules(arena, null);
+    try testing.expectEqual(2, rules_.len);
+    try testing.expectEqualStrings("10.0.0.1", rules_[0].client);
+    try testing.expectEqualStrings("rw,squash=root", rules_[0].options);
+    try testing.expectEqualStrings("10.0.0.2", rules_[1].client);
+    const lab = try db.members(arena, "lab");
+    try testing.expectEqual(1, lab.len);
+    try testing.expectEqualStrings("10.1.0.0/16", lab[0].client);
 }

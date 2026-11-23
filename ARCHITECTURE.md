@@ -77,7 +77,7 @@ NLM locks live only in memory. NSM records which clients hold state, and that li
 
 ## State
 
-znfsd stores exports, groups, maps, file handles, mount records, the NSM monitor list, and the NSM state number in SQLite, using WAL mode and a busy timeout. Built so far: export rules (path, client, and every option written out, defaults included), group members, mount records (through `mount.Store`, restored at startup), file handles' paths (through `files.Store`), the NSM state number, and monitored hosts (through `nsm.Store`). `serve` lays its ephemeral rules over the stored ones by path and client, and its groups by name. While the daemon runs, commands reach it through the control socket and it writes the database; otherwise commands open the database themselves.
+znfsd stores exports, groups, maps, file handles, mount records, the NSM monitor list, and the NSM state number in SQLite, using WAL mode and a busy timeout. Built so far: export rules (path, client, and every option written out, defaults included), group members (both keyed by the client's canonical form, as `Client.format` writes it), mount records (through `mount.Store`, restored at startup), file handles' paths (through `files.Store`), the NSM state number, and monitored hosts (through `nsm.Store`). `serve` lays its ephemeral rules over the stored ones by path and client, and its groups by name. While the daemon runs, commands reach it through the control socket and it writes the database; otherwise commands open the database themselves.
 
 ## Control socket
 
