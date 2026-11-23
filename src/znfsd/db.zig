@@ -334,16 +334,23 @@ pub const Db = struct {
                 const d: *Db = @ptrCast(@alignCast(ptr));
                 d.addMount(host, path) catch {};
             }
-            fn unmounted(ptr: *anyopaque, host: []const u8, path: ?[]const u8) void {
+            fn unmounted(ptr: *anyopaque, host: []const u8, path: []const u8) void {
                 const d: *Db = @ptrCast(@alignCast(ptr));
-                _ = d.deleteMounts(host, path) catch {};
+                _ = d.deleteMount(host, path) catch {};
+            }
+            fn unmountedAll(ptr: *anyopaque, host: []const u8) void {
+                const d: *Db = @ptrCast(@alignCast(ptr));
+                _ = d.deleteHostMounts(host) catch {};
             }
         };
-        return .{ .ptr = db, .mounted = S.mounted, .unmounted = S.unmounted };
+        return .{ .ptr = db, .mounted = S.mounted, .unmounted = S.unmounted, .unmountedAll = S.unmountedAll };
     }
 
-    pub fn deleteMounts(db: *Db, host: []const u8, path: ?[]const u8) Error!usize {
-        if (path) |p| return db.run("DELETE FROM mounts WHERE host = ?1 AND path = ?2", &.{ host, p });
+    pub fn deleteMount(db: *Db, host: []const u8, path: []const u8) Error!usize {
+        return db.run("DELETE FROM mounts WHERE host = ?1 AND path = ?2", &.{ host, path });
+    }
+
+    pub fn deleteHostMounts(db: *Db, host: []const u8) Error!usize {
         return db.run("DELETE FROM mounts WHERE host = ?1", &.{host});
     }
 

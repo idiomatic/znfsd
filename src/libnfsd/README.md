@@ -161,7 +161,7 @@ Locks live only in memory. After a restart, clients reclaim them:
 3. If there were any, call `nlm.startGrace(io)`: for about 90 seconds only reclaims are granted.
 4. Once serving, call `nsm.notify(io, hosts, state)` (it returns how many answered), so their clients reclaim.
 
-`nlm.releaseHost` releases a host's locks, on one file or all, as for an administrator; `locks.snapshot` lists them. `Nfs.locate` turns a file handle into the lock table's key.
+`nlm.releaseHost` releases a host's locks, and `nlm.releaseHostFile` its locks on one file, as for an administrator; `locks.snapshot` lists them. `Nfs.locate` turns a file handle into the lock table's key.
 
 ## Persistence hooks
 
@@ -170,7 +170,7 @@ Without hooks, file handles go stale and mounts and monitors are forgotten when 
 | Hook | Field | Calls |
 |---|---|---|
 | `files.Store` | `Files.store` | `remember` (a file's path by file-system ID and inode), optional `rememberMany` (one transaction), `lookup`, and `renamePrefix` (a directory moved) |
-| `mount.Store` | `Mount.store` | `mounted` and `unmounted`; at start, `Mount.restore` re-adds records without storing them again |
+| `mount.Store` | `Mount.store` | `mounted`, `unmounted`, and `unmountedAll`; at start, `Mount.restore` re-adds records without storing them again |
 | `nsm.Store` | `Nsm.store` | `monitor` and `unmonitor` |
 
 File handles are 36 bytes: format version, export ID (a hash of the export path), file-system ID (the device number), inode, and generation. A handle resolves to its file's last-known path, from memory or else `files.Store`, while that path's device and inode still match; otherwise it's stale, except for export roots. MNT, LOOKUP, READDIRPLUS, and creation record paths, and renames move them. Fileids are inodes on the export root's own file system; elsewhere, inodes with the file system's ID folded in, since clients see one device per mount.

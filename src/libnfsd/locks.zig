@@ -278,20 +278,26 @@ pub const Locks = struct {
         }
     }
 
-    /// Releases every lock `host` holds, or only those on `file`; returns
-    /// how many.
-    pub fn releaseHost(l: *Locks, io: Io, host: []const u8, file: ?File) !usize {
+    /// Releases every lock `host` holds; returns how many.
+    pub fn releaseHost(l: *Locks, io: Io, host: []const u8) !usize {
         try l.mutex.lock(io);
         defer l.mutex.unlock(io);
-        const Match = struct {
-            host: []const u8,
-            fn matches(m: @This(), o: Owner) bool {
-                return std.mem.eql(u8, o.host, m.host);
-            }
-        };
-        if (file) |f| return l.releaseWhereIn(f, Match{ .host = host });
-        return l.releaseWhere(Match{ .host = host });
+        return l.releaseWhere(HostMatch{ .host = host });
     }
+
+    /// Releases the locks `host` holds on `file`; returns how many.
+    pub fn releaseHostFile(l: *Locks, io: Io, host: []const u8, file: File) !usize {
+        try l.mutex.lock(io);
+        defer l.mutex.unlock(io);
+        return l.releaseWhereIn(file, HostMatch{ .host = host });
+    }
+
+    const HostMatch = struct {
+        host: []const u8,
+        fn matches(m: HostMatch, o: Owner) bool {
+            return std.mem.eql(u8, o.host, m.host);
+        }
+    };
 
     /// Releases every lock `host` holds from `address`; returns how many.
     pub fn releaseHostAt(l: *Locks, io: Io, host: []const u8, address: []const u8) !usize {
@@ -431,9 +437,9 @@ test "release a host's locks" {
     try testing.expect(try l.acquire(io, file_a, hal, true, .fromLength(0, 10)));
     try testing.expect(try l.acquire(io, file_b, hal, true, .fromLength(0, 10)));
     try testing.expect(try l.acquire(io, file_b, art, true, .fromLength(20, 10)));
-    try testing.expectEqual(1, try l.releaseHost(io, "hal", file_b));
+    try testing.expectEqual(1, try l.releaseHostFile(io, "hal", file_b));
     try testing.expect(try l.hostHolds(io, "hal"));
-    try testing.expectEqual(1, try l.releaseHost(io, "hal", null));
+    try testing.expectEqual(1, try l.releaseHost(io, "hal"));
     try testing.expect(!try l.hostHolds(io, "hal"));
     try testing.expectEqual(1, l.count);
 }
@@ -466,7 +472,7 @@ test "limits, per address and in all" {
     try l.release(io, file_a, hal, .fromLength(4, 2));
     try testing.expectEqual(3, l.count);
     try testing.expectError(error.TooManyLocks, l.acquire(io, file_a, art, true, .fromLength(20, 10)));
-    try testing.expectEqual(3, try l.releaseHost(io, "hal", null));
+    try testing.expectEqual(3, try l.releaseHost(io, "hal"));
     try testing.expectEqual(0, l.files.count());
     try testing.expectEqual(0, l.by_name.count());
     try testing.expectEqual(0, l.by_address.count());

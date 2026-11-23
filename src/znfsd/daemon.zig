@@ -381,7 +381,7 @@ const Daemon = struct {
                 if (status != 0 or c.verb.? == .list) return status;
                 switch (c.noun) {
                     .mount => {
-                        try d.mount.unmount(d.io, c.args[0], if (c.args.len > 1) c.args[1] else null);
+                        if (c.args.len > 1) try d.mount.unmount(d.io, c.args[0], c.args[1]) else try d.mount.unmountAll(d.io, c.args[0]);
                         try d.nsm.forget(d.io, c.args[0]);
                     },
                     else => {
@@ -422,15 +422,18 @@ const Daemon = struct {
             },
             .del => {
                 if (args.len < 1 or args.len > 2) return usage(err, "lock del HOST [PATH]");
-                const file: ?libnfsd.locks.File = if (args.len == 2) fileOf(args[1]) orelse {
-                    try err.print("znfsd: {s}: no such file\n", .{args[1]});
-                    return 1;
-                } else null;
-                if (try d.nlm.releaseHost(d.io, args[0], file) == 0) {
+                const released = if (args.len == 2) released: {
+                    const file = fileOf(args[1]) orelse {
+                        try err.print("znfsd: {s}: no such file\n", .{args[1]});
+                        return 1;
+                    };
+                    break :released try d.nlm.releaseHostFile(d.io, args[0], file);
+                } else try d.nlm.releaseHost(d.io, args[0]);
+                if (released == 0) {
                     try err.writeAll("znfsd: no such locks\n");
                     return 1;
                 }
-                if (file == null) try d.nsm.forget(d.io, args[0]);
+                if (args.len == 1) try d.nsm.forget(d.io, args[0]);
                 return 0;
             },
             .add, .set => unreachable,

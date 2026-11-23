@@ -209,28 +209,32 @@ pub const Nlm = struct {
         return .{ .ptr = n, .call = S.call };
     }
 
-    /// Releases `host`'s locks and waits, on `file` or everywhere, then
-    /// grants what waited on them. Returns how many locks went.
-    pub fn releaseHost(n: *Nlm, io: Io, host: []const u8, file: ?locks_.File) !usize {
-        const released = try n.locks.releaseHost(io, host, file);
-        {
-            try n.mutex.lock(io);
-            defer n.mutex.unlock(io);
-            var i: usize = 0;
-            while (i < n.waiters.items.len) {
-                const w = n.waiters.items[i];
-                if (std.mem.eql(u8, w.lock.caller_name, host) and (file == null or std.meta.eql(w.file, file.?))) {
-                    n.freeWaiter(n.waiters.orderedRemove(i));
-                } else i += 1;
+    /// Releases `host`'s locks and waits everywhere, then grants what
+    /// waited on them. Returns how many locks went.
+    pub fn releaseHost(n: *Nlm, io: Io, host: []const u8) !usize {
+        const released = try n.locks.releaseHost(io, host);
+        const Match = struct {
+            host: []const u8,
+            fn matches(m: @This(), w: Waiter) bool {
+                return std.mem.eql(u8, w.lock.caller_name, m.host);
             }
-            i = 0;
-            while (i < n.grants.items.len) {
-                const w = n.grants.items[i].waiter;
-                if (std.mem.eql(u8, w.lock.caller_name, host) and (file == null or std.meta.eql(w.file, file.?))) {
-                    n.freeGrant(n.grants.orderedRemove(i));
-                } else i += 1;
+        };
+        try n.dropWaits(io, Match{ .host = host });
+        return n.afterRelease(io, host, released);
+    }
+
+    /// Releases `host`'s locks and waits on `file`, then grants what waited
+    /// on them. Returns how many locks went.
+    pub fn releaseHostFile(n: *Nlm, io: Io, host: []const u8, file: locks_.File) !usize {
+        const released = try n.locks.releaseHostFile(io, host, file);
+        const Match = struct {
+            host: []const u8,
+            file: locks_.File,
+            fn matches(m: @This(), w: Waiter) bool {
+                return std.mem.eql(u8, w.lock.caller_name, m.host) and std.meta.eql(w.file, m.file);
             }
-        }
+        };
+        try n.dropWaits(io, Match{ .host = host, .file = file });
         return n.afterRelease(io, host, released);
     }
 
@@ -239,26 +243,35 @@ pub const Nlm = struct {
     /// locks went.
     fn releaseHostAt(n: *Nlm, io: Io, host: []const u8, address: []const u8) !usize {
         const released = try n.locks.releaseHostAt(io, host, address);
-        {
-            try n.mutex.lock(io);
-            defer n.mutex.unlock(io);
-            var i: usize = 0;
-            while (i < n.waiters.items.len) {
-                const w = n.waiters.items[i];
+        const Match = struct {
+            host: []const u8,
+            address: []const u8,
+            fn matches(m: @This(), w: Waiter) bool {
                 var buf: [64]u8 = undefined;
-                if (w.owner(&buf).of(host, address)) {
-                    n.freeWaiter(n.waiters.orderedRemove(i));
-                } else i += 1;
+                return w.owner(&buf).of(m.host, m.address);
             }
-            i = 0;
-            while (i < n.grants.items.len) {
-                var buf: [64]u8 = undefined;
-                if (n.grants.items[i].waiter.owner(&buf).of(host, address)) {
-                    n.freeGrant(n.grants.orderedRemove(i));
-                } else i += 1;
-            }
-        }
+        };
+        try n.dropWaits(io, Match{ .host = host, .address = address });
         return n.afterRelease(io, host, released);
+    }
+
+    /// Drops the waits, and the grants awaiting confirmation, whose waiter
+    /// `match.matches`.
+    fn dropWaits(n: *Nlm, io: Io, match: anytype) !void {
+        try n.mutex.lock(io);
+        defer n.mutex.unlock(io);
+        var i: usize = 0;
+        while (i < n.waiters.items.len) {
+            if (match.matches(n.waiters.items[i])) {
+                n.freeWaiter(n.waiters.orderedRemove(i));
+            } else i += 1;
+        }
+        i = 0;
+        while (i < n.grants.items.len) {
+            if (match.matches(n.grants.items[i].waiter)) {
+                n.freeGrant(n.grants.orderedRemove(i));
+            } else i += 1;
+        }
     }
 
     /// Unmonitors `host` if it holds no more locks, and grants what can be.
@@ -888,7 +901,7 @@ test "lock, test, block, unlock, and grace" {
     var stale = f.handle;
     stale[24] ^= 0x80;
     try testing.expectEqual(Stat.stale_fh, try f.run(ctx, .lock, (Request{ .who = "art", .svid = 1 }).lockArgs(&a, &stale)));
-    try testing.expectEqual(1, try f.nlm.releaseHost(io, "hal", null));
+    try testing.expectEqual(1, try f.nlm.releaseHost(io, "hal"));
     f.nlm.startGrace(io);
     try testing.expectEqual(Stat.denied_grace_period, try f.run(ctx, .lock, (Request{ .who = "art", .svid = 1 }).lockArgs(&a, h)));
     try testing.expectEqual(Stat.granted, try f.run(ctx, .lock, (Request{ .who = "art", .svid = 1, .reclaim = true }).lockArgs(&a, h)));
@@ -1104,7 +1117,7 @@ test "limits refuse with denied_nolocks" {
 
     // Monitored names, per address.
     f.locks.limits = .{};
-    try testing.expectEqual(2, try f.nlm.releaseHost(io, "skynet", null));
+    try testing.expectEqual(2, try f.nlm.releaseHost(io, "skynet"));
     try testing.expectEqual(Stat.granted, try f.run(skynet, .lock, (Request{ .who = "skynet1", .svid = 1, .offset = 30, .len = 1 }).lockArgs(&a, &f.handle)));
     try testing.expectEqual(Stat.granted, try f.run(skynet, .lock, (Request{ .who = "skynet2", .svid = 1, .offset = 40, .len = 1 }).lockArgs(&a, &f.handle)));
     try testing.expectEqual(Stat.denied_nolocks, try f.run(skynet, .lock, (Request{ .who = "skynet3", .svid = 1, .offset = 50, .len = 1 }).lockArgs(&a, &f.handle)));

@@ -282,7 +282,8 @@ fn mountCommand(c: Context, verb: cli.Verb, args: []const []const u8) !u8 {
         },
         .del => {
             if (args.len < 1 or args.len > 2) return usage(c, "mount del HOST [PATH]");
-            if (try c.db.deleteMounts(args[0], if (args.len == 2) args[1] else null) == 0) {
+            const deleted = if (args.len == 2) try c.db.deleteMount(args[0], args[1]) else try c.db.deleteHostMounts(args[0]);
+            if (deleted == 0) {
                 try c.err.print("znfsd: no such mount record\n", .{});
                 return 1;
             }

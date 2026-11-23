@@ -55,8 +55,10 @@ pub const Record = struct {
 pub const Store = struct {
     ptr: *anyopaque,
     mounted: *const fn (ptr: *anyopaque, host: []const u8, path: []const u8) void,
-    /// Forgets `host`'s mount of `path`, or of everything when null.
-    unmounted: *const fn (ptr: *anyopaque, host: []const u8, path: ?[]const u8) void,
+    /// Forgets `host`'s mount of `path`.
+    unmounted: *const fn (ptr: *anyopaque, host: []const u8, path: []const u8) void,
+    /// Forgets all of `host`'s mounts.
+    unmountedAll: *const fn (ptr: *anyopaque, host: []const u8) void,
 };
 
 pub const Mount = struct {
@@ -81,10 +83,29 @@ pub const Mount = struct {
         return @atomicLoad(*const exports.Table, &m.table, .acquire);
     }
 
-    /// Forgets `host`'s mount of `path`, or of everything when null, as
-    /// UMNT and UMNTALL do.
-    pub fn unmount(m: *Mount, io: Io, host: []const u8, path: ?[]const u8) !void {
-        try m.forget(io, host, path);
+    /// Forgets `host`'s mount of `path`, as UMNT does.
+    pub fn unmount(m: *Mount, io: Io, host: []const u8, path: []const u8) !void {
+        if (m.store) |s| s.unmounted(s.ptr, host, path);
+        const Match = struct {
+            host: []const u8,
+            path: []const u8,
+            fn matches(k: @This(), r: Record) bool {
+                return std.mem.eql(u8, r.host, k.host) and std.mem.eql(u8, r.path, k.path);
+            }
+        };
+        try m.forgetWhere(io, Match{ .host = host, .path = path });
+    }
+
+    /// Forgets all of `host`'s mounts, as UMNTALL does.
+    pub fn unmountAll(m: *Mount, io: Io, host: []const u8) !void {
+        if (m.store) |s| s.unmountedAll(s.ptr, host);
+        const Match = struct {
+            host: []const u8,
+            fn matches(k: @This(), r: Record) bool {
+                return std.mem.eql(u8, r.host, k.host);
+            }
+        };
+        try m.forgetWhere(io, Match{ .host = host });
     }
 
     /// A copy of the mount records, in `arena`.
@@ -152,9 +173,9 @@ pub const Mount = struct {
             },
             .umnt => {
                 const path = try d.string(max_path);
-                try m.forget(ctx.io, host, path);
+                try m.unmount(ctx.io, host, path);
             },
-            .umntall => try m.forget(ctx.io, host, null),
+            .umntall => try m.unmountAll(ctx.io, host),
             .@"export" => {
                 var arena_state: std.heap.ArenaAllocator = .init(m.gpa);
                 defer arena_state.deinit();
@@ -235,15 +256,13 @@ pub const Mount = struct {
         return true;
     }
 
-    /// Forgets `host`'s mount of `path`, or of everything when null.
-    fn forget(m: *Mount, io: Io, host: []const u8, path: ?[]const u8) !void {
-        if (m.store) |s| s.unmounted(s.ptr, host, path);
+    /// Drops the records `match.matches`, without storing that.
+    fn forgetWhere(m: *Mount, io: Io, match: anytype) !void {
         try m.mutex.lock(io);
         defer m.mutex.unlock(io);
         var i: usize = 0;
         while (i < m.records.items.len) {
-            const r = m.records.items[i];
-            if (std.mem.eql(u8, r.host, host) and (path == null or std.mem.eql(u8, r.path, path.?))) {
+            if (match.matches(m.records.items[i])) {
                 m.freeRecord(m.records.orderedRemove(i));
             } else i += 1;
         }
