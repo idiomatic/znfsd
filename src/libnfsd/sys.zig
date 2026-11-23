@@ -293,11 +293,6 @@ pub fn setTimesFd(fd: Fd, atime: SetTime, mtime: SetTime) E {
     return check(c.futimens(fd, &times));
 }
 
-/// `fstatat` relative to `dir` without following a final symbolic link.
-pub fn statIn(dir: Fd, name: [*:0]const u8, attr: *Attr) E {
-    return statAt(dir, name, attr);
-}
-
 pub fn chownIn(dir: Fd, name: [*:0]const u8, uid: ?u32, gid: ?u32) E {
     return check(c.fchownat(dir, name, uid orelse std.math.maxInt(u32), gid orelse std.math.maxInt(u32), c.AT.SYMLINK_NOFOLLOW));
 }
@@ -338,7 +333,7 @@ pub fn openOwned(path: [*:0]const u8, flags: c.O, ino: u64, fd: *Fd, attr: *Attr
     name_buf[base.len] = 0;
     const name = name_buf[0..base.len :0];
     var before: Attr = undefined;
-    if (statIn(dir, name, &before) != .SUCCESS or before.ino != ino) return .STALE;
+    if (statAt(dir, name, &before) != .SUCCESS or before.ino != ino) return .STALE;
     if (before.uid != owner or before.mode & std.posix.S.IFMT != std.posix.S.IFREG) return e;
     const mode = before.mode & 0o7777;
     if (chmodIn(dir, name, mode | 0o600) != .SUCCESS) return e;
@@ -372,7 +367,7 @@ pub fn createIn(dir: Fd, name: [*:0]const u8, mode: u32, fd: *Fd) E {
 pub fn openOrCreateIn(dir: Fd, name: [*:0]const u8, mode: u32, fd: *Fd) E {
     // An existing device or FIFO isn't opened: opening can have effects.
     var existing: Attr = undefined;
-    if (statIn(dir, name, &existing) == .SUCCESS and existing.mode & posix.S.IFMT != posix.S.IFREG) {
+    if (statAt(dir, name, &existing) == .SUCCESS and existing.mode & posix.S.IFMT != posix.S.IFREG) {
         return if (existing.mode & posix.S.IFMT == posix.S.IFDIR) .ISDIR else .INVAL;
     }
     return openCreating(dir, name, .{ .ACCMODE = .RDWR, .CREAT = true }, mode, fd);
@@ -751,11 +746,11 @@ test "safe opens refuse links in any component; descriptor-relative calls" {
     try testing.expectEqual(E.SUCCESS, setTimesIn(dir, "link", .now, .now));
     try testing.expectEqual(E.SUCCESS, chmodIn(dir, "sub", 0o700));
     try testing.expectEqual(E.SUCCESS, linkIn(dir, "hal", dir, "hal2"));
-    try testing.expectEqual(E.SUCCESS, statIn(dir, "hal2", &attr));
+    try testing.expectEqual(E.SUCCESS, statAt(dir, "hal2", &attr));
     try testing.expectEqual(2, attr.nlink);
     try testing.expectEqual(E.SUCCESS, renameIn(dir, "hal2", dir, "sub/hal3"));
     try testing.expectEqual(E.SUCCESS, mknodIn(dir, "fifo", std.posix.S.IFIFO | 0o600, 0));
-    try testing.expectEqual(E.SUCCESS, statIn(dir, "fifo", &attr));
+    try testing.expectEqual(E.SUCCESS, statAt(dir, "fifo", &attr));
     try testing.expectEqual(std.posix.S.IFIFO, attr.mode & std.posix.S.IFMT);
     try testing.expectEqual(E.NOTEMPTY, rmdirIn(dir, "sub"));
     try testing.expectEqual(E.SUCCESS, unlinkIn(dir, "sub/hal3"));
@@ -832,9 +827,9 @@ test "act as another user, then revert" {
     revert();
 
     var attr: Attr = undefined;
-    try testing.expectEqual(E.SUCCESS, statIn(dir, "theirs", &attr));
+    try testing.expectEqual(E.SUCCESS, statAt(dir, "theirs", &attr));
     try testing.expectEqual(4242, attr.uid);
-    try testing.expectEqual(E.SUCCESS, statIn(dir, "server", &attr));
+    try testing.expectEqual(E.SUCCESS, statAt(dir, "server", &attr));
     try testing.expectEqual(0, attr.uid);
 }
 

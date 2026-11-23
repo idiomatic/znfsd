@@ -588,7 +588,7 @@ const Request = struct {
             var path_buf: [sys.max_path + 1]u8 = undefined;
             const dot = std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..");
             const path = if (dot) null else join(&path_buf, l.dir.path, entry.name);
-            if (path != null and sys.statIn(l.fd, entry.name, &attr) == .SUCCESS) {
+            if (path != null and sys.statAt(l.fd, entry.name, &attr) == .SUCCESS) {
                 const h: fh.Handle = .fromAttr(export_id, attr);
                 try entries.append(arena_state.allocator(), .{
                     .fsid = h.fsid,
@@ -890,7 +890,7 @@ const Request = struct {
         var e = sys.openSafe(copyZ(&dir_buf, dir), .{ .DIRECTORY = true }, 0, &p.fd);
         if (e != .SUCCESS) return .stale;
         var attr: sys.Attr = undefined;
-        e = sys.statIn(p.fd, p.name, &attr);
+        e = sys.statAt(p.fd, p.name, &attr);
         if (e != .SUCCESS or attr.ino != f.handle.inode) {
             sys.closeFd(p.fd);
             return .stale;
@@ -1052,7 +1052,7 @@ const Request = struct {
     fn created(r: *Request, w: *const Where) Error!void {
         var attr: sys.Attr = undefined;
         var buf: [sys.max_path + 1]u8 = undefined;
-        const have = sys.statIn(w.fd, w.name, &attr) == .SUCCESS;
+        const have = sys.statAt(w.fd, w.name, &attr) == .SUCCESS;
         try r.status(.ok);
         if (have) {
             const h: fh.Handle = .fromAttr(exportId(w.dir.match.path), attr);
@@ -1130,7 +1130,7 @@ const Request = struct {
         var e = sys.createIn(w.fd, w.name, 0o600, &fd);
         if (e == .EXIST) {
             var existing: sys.Attr = undefined;
-            if (sys.statIn(w.fd, w.name, &existing) == .SUCCESS and
+            if (sys.statAt(w.fd, w.name, &existing) == .SUCCESS and
                 existing.atime.sec == atime.sec and existing.mtime.sec == mtime.sec)
             {
                 return r.created(w);
@@ -1240,7 +1240,7 @@ const Request = struct {
         }
         defer w.close();
         var target: sys.Attr = undefined;
-        const e = sys.statIn(w.fd, w.name, &target);
+        const e = sys.statAt(w.fd, w.name, &target);
         const st: Status = if (e != .SUCCESS)
             .fromErrno(e)
         else if (ftype(target.mode) == .dir)
@@ -1265,7 +1265,7 @@ const Request = struct {
         }
         defer w.close();
         var target: sys.Attr = undefined;
-        const e = sys.statIn(w.fd, w.name, &target);
+        const e = sys.statAt(w.fd, w.name, &target);
         const st: Status = if (e != .SUCCESS)
             .fromErrno(e)
         else if (ftype(target.mode) != .dir)
@@ -1299,13 +1299,13 @@ const Request = struct {
         const c = r.creds(from.dir.match.rule);
         var source: sys.Attr = undefined;
         var existing: sys.Attr = undefined;
-        var e = sys.statIn(from.fd, from.name, &source);
+        var e = sys.statAt(from.fd, from.name, &source);
         const st: Status = if (!std.mem.eql(u8, from.dir.match.path, to.dir.match.path))
             .xdev
         else if (e != .SUCCESS)
             .fromErrno(e)
         else if (sticky(from.dir.attr, source, c) or
-            (sys.statIn(to.fd, to.name, &existing) == .SUCCESS and sticky(to.dir.attr, existing, c)))
+            (sys.statAt(to.fd, to.name, &existing) == .SUCCESS and sticky(to.dir.attr, existing, c)))
             .acces
         else st: {
             e = sys.renameIn(from.fd, from.name, to.fd, to.name);
@@ -1361,7 +1361,7 @@ const Request = struct {
             }
         }
         var post: sys.Attr = undefined;
-        const have = sys.statIn(w.fd, w.name, &post) == .SUCCESS and post.ino == f.handle.inode;
+        const have = sys.statAt(w.fd, w.name, &post) == .SUCCESS and post.ino == f.handle.inode;
         try r.status(st);
         try r.postOp(if (have) post else f.attr);
         try r.wccData(w.dir.attr, w.post());
