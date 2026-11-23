@@ -7,19 +7,48 @@ const net = Io.net;
 const rpc = @import("rpc.zig");
 const portmap = @import("portmap.zig");
 
-pub const Error = error{ NoPortmapper, NotRegistered, NoReply, BadReply } || net.IpAddress.BindError || net.Socket.SendError;
+pub const Error = error{ NoPortmapper, NotRegistered, NoReply, BadReply, TooLong } || net.IpAddress.BindError || net.Socket.SendError;
 
-/// Calls `prog` on `host` over UDP. With `reply`, waits for the reply and
-/// returns its results there; otherwise sends once and returns nothing.
-pub fn call(
-    io: Io,
-    host: net.IpAddress,
-    prog: u32,
-    vers: u32,
-    proc: u32,
-    args: []const u8,
-    reply: ?[]u8,
-) Error!?[]const u8 {
+/// The largest arguments a callback carries; GRANTED_MSG's can reach about
+/// 4 KiB.
+pub const max_args = 8192;
+
+/// Sends `proc` of `prog` to `host` over UDP once, expecting no reply.
+pub fn send(io: Io, host: net.IpAddress, prog: u32, vers: u32, proc: u32, args: []const u8) Error!void {
+    const target = try locate(io, host, prog, vers);
+    const socket = try bind(io, host);
+    defer socket.close(io);
+    var buf: [max_args + 256]u8 = undefined;
+    try socket.send(io, &target, (try encode(io, &buf, prog, vers, proc, args)).message);
+}
+
+/// Calls `proc` of `prog` on `host` over UDP, waiting for its reply, and
+/// returns its results in `reply`. Only replies from where it was sent count.
+pub fn call(io: Io, host: net.IpAddress, prog: u32, vers: u32, proc: u32, args: []const u8, reply: []u8) Error![]const u8 {
+    const target = try locate(io, host, prog, vers);
+    const socket = try bind(io, host);
+    defer socket.close(io);
+    var buf: [max_args + 256]u8 = undefined;
+    const encoded = try encode(io, &buf, prog, vers, proc, args);
+    for (0..3) |_| {
+        try socket.send(io, &target, encoded.message);
+        while (true) {
+            const in = socket.receiveTimeout(io, reply, .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } }) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => break,
+            };
+            if (!in.from.eql(&target)) continue;
+            if (in.data.len < 24 or std.mem.readInt(u32, in.data[0..4], .big) != encoded.xid) continue;
+            const accepted_success: [20]u8 = .{ 0, 0, 0, 1 } ++ @as([16]u8, @splat(0));
+            if (!std.mem.eql(u8, in.data[4..24], &accepted_success)) return error.BadReply;
+            return in.data[24..];
+        }
+    }
+    return error.NoReply;
+}
+
+/// Where `host` serves `prog`, asked of its portmapper.
+fn locate(io: Io, host: net.IpAddress, prog: u32, vers: u32) Error!net.IpAddress {
     var pmap_address = host;
     pmap_address.setPort(portmap.port);
     var pmap = portmap.Client.init(io, pmap_address, .{ .raw = .fromSeconds(2), .clock = .awake }) catch |err| return err;
@@ -29,25 +58,31 @@ pub fn call(
         else => error.NoPortmapper,
     };
     if (port == 0 or port > std.math.maxInt(u16)) return error.NotRegistered;
-
     var target = host;
     target.setPort(@intCast(port));
+    return target;
+}
+
+fn bind(io: Io, host: net.IpAddress) net.IpAddress.BindError!net.Socket {
     const local: net.IpAddress = switch (host) {
         .ip4 => .{ .ip4 = .unspecified(0) },
         .ip6 => .{ .ip6 = .unspecified(0) },
     };
-    const socket = try local.bind(io, .{ .mode = .dgram, .protocol = .udp });
-    defer socket.close(io);
+    return local.bind(io, .{ .mode = .dgram, .protocol = .udp });
+}
 
-    // AUTH_SYS as root, as lock managers call each other.
+const Encoded = struct { xid: u32, message: []const u8 };
+
+/// Encodes a call, with AUTH_SYS as root, as lock managers call each other.
+fn encode(io: Io, buf: []u8, prog: u32, vers: u32, proc: u32, args: []const u8) error{TooLong}!Encoded {
+    if (args.len > max_args) return error.TooLong;
     var cred_buf: [64]u8 = undefined;
     var cw: Io.Writer = .fixed(&cred_buf);
     const auth: rpc.AuthSys = .{ .stamp = 0, .machine_name = "znfsd", .uid = 0, .gid = 0 };
     auth.encode(.init(&cw)) catch unreachable;
 
     const xid: u32 = @truncate(@as(u64, @bitCast(@as(i64, @truncate(Io.Clock.real.now(io).nanoseconds)))));
-    var message_buf: [2048]u8 = undefined;
-    var mw: Io.Writer = .fixed(&message_buf);
+    var mw: Io.Writer = .fixed(buf);
     const message: rpc.Call = .{
         .xid = xid,
         .prog = prog,
@@ -57,26 +92,8 @@ pub fn call(
         .verf = .none,
         .args = args,
     };
-    message.encode(.init(&mw)) catch return error.BadReply;
-
-    const out = reply orelse {
-        try socket.send(io, &target, mw.buffered());
-        return null;
-    };
-    for (0..3) |_| {
-        try socket.send(io, &target, mw.buffered());
-        while (true) {
-            const in = socket.receiveTimeout(io, out, .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } }) catch |err| switch (err) {
-                error.Canceled => return error.Canceled,
-                else => break,
-            };
-            if (in.data.len < 24 or std.mem.readInt(u32, in.data[0..4], .big) != xid) continue;
-            const accepted_success: [20]u8 = .{ 0, 0, 0, 1 } ++ @as([16]u8, @splat(0));
-            if (!std.mem.eql(u8, in.data[4..24], &accepted_success)) return error.BadReply;
-            return in.data[24..];
-        }
-    }
-    return error.NoReply;
+    message.encode(.init(&mw)) catch return error.TooLong;
+    return .{ .xid = xid, .message = mw.buffered() };
 }
 
 const testing = std.testing;
@@ -110,8 +127,12 @@ test "call a program registered with a host's portmapper" {
     defer _ = probe.unset(0x20000777, 1) catch {};
 
     var reply: [128]u8 = undefined;
-    const results = (try call(io, loopback, 0x20000777, 1, 1, "hal\x00", &reply)).?;
-    try testing.expectEqualStrings("hal\x00", results);
-    try testing.expectEqual(null, try call(io, loopback, 0x20000777, 1, 1, "art\x00", null));
+    try testing.expectEqualStrings("hal\x00", try call(io, loopback, 0x20000777, 1, 1, "hal\x00", &reply));
+    try send(io, loopback, 0x20000777, 1, 1, "art\x00");
     try testing.expectError(error.NotRegistered, call(io, loopback, 0x20000778, 1, 1, "", &reply));
+    // GRANTED_MSG's largest arguments fit; more than `max_args` don't.
+    const big: [4200]u8 = @splat(0);
+    try send(io, loopback, 0x20000777, 1, 1, &big);
+    const too_big: [max_args + 4]u8 = @splat(0);
+    try testing.expectError(error.TooLong, send(io, loopback, 0x20000777, 1, 1, &too_big));
 }

@@ -250,7 +250,7 @@ pub const Nlm = struct {
                 var buf: [max_netobj * 2 + 64]u8 = undefined;
                 var w: Io.Writer = .fixed(&buf);
                 try n.answer(ctx, sync, &d, .init(&w));
-                _ = callback.call(ctx.io, ctx.from, prog, vers, call.proc + 5, w.buffered(), null) catch |err|
+                callback.send(ctx.io, ctx.from, prog, vers, call.proc + 5, w.buffered()) catch |err|
                     log.warn("nlm: {t} result to {f}: {t}", .{ proc, ctx.from, err });
                 return .none;
             },
@@ -271,7 +271,7 @@ pub const Nlm = struct {
                 return .success;
             },
             .free_all => {
-                const name = try d.string(max_string + 1);
+                const name = try d.string(max_string);
                 _ = try d.i32_();
                 // A host frees its own locks, from where it holds them.
                 var buf: [64]u8 = undefined;
@@ -415,7 +415,7 @@ pub const Nlm = struct {
         e.opaque_(w.cookie) catch return;
         e.boolean(w.exclusive) catch return;
         w.lock.encode(e) catch return;
-        _ = callback.call(io, w.address, prog, vers, @backingInt(Proc.granted_msg), bw.buffered(), null) catch |err| {
+        callback.send(io, w.address, prog, vers, @backingInt(Proc.granted_msg), bw.buffered()) catch |err| {
             if (err != error.Canceled) log.warn("nlm: granting to {s}: {t}", .{ w.lock.caller_name, err });
         };
     }
@@ -521,6 +521,17 @@ test "lock, test, block, unlock, and grace" {
     try m.encode(.init(&w));
     _ = server.dispatch(&programs, skynet, w.buffered(), &out);
     try testing.expectEqual(1, locks.held.items.len);
+
+    // FREE_ALL names are limited as other calls' are.
+    var long_free_all: [max_string + 16]u8 = undefined;
+    fw = .fixed(&long_free_all);
+    try xdr.Encoder.init(&fw).string(&@as([max_string + 1]u8, @splat('a')));
+    try xdr.Encoder.init(&fw).i32_(3);
+    var long_b: [max_string + 128]u8 = undefined;
+    w = .fixed(&long_b);
+    const long_m: rpc.Call = .{ .xid = 1, .prog = prog, .vers = vers, .proc = @backingInt(Proc.free_all), .cred = .none, .verf = .none, .args = fw.buffered() };
+    try long_m.encode(.init(&w));
+    try testing.expectEqual(4, std.mem.readInt(u32, server.dispatch(&programs, ctx, w.buffered(), &out).?[20..24], .big)); // GARBAGE_ARGS
 
     try testing.expectEqual(Stat.denied, try Call.run(&programs, ctx, .lock, Args.lockArgs(&a, "hal", 2, false, true, &handle_bytes, false), &out));
     try testing.expectEqual(Stat.blocked, try Call.run(&programs, ctx, .lock, Args.lockArgs(&a, "hal", 2, true, true, &handle_bytes, false), &out));

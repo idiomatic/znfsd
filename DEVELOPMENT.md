@@ -93,9 +93,8 @@ From the code review of `ee622cc`; each leaves this list when fixed or accepted 
 * **`sys.resume` ignores a failed switch back** ([sys.zig:468](src/libnfsd/sys.zig:468)), so the request would go on as the server; fail it.
 * **Server groups past 32 are dropped** by `saveServerGroups`, and `restoreLinux` restores fsgid 0, not the process's own ([sys.zig:391](src/libnfsd/sys.zig:391)).
 * **Races:** UNLOCK's `hostHolds` then `unmonitor` can unmonitor a host that just locked ([nlm.zig:295](src/libnfsd/nlm.zig:295)); an error in `wake` strands waiters already granted ([nlm.zig:346](src/libnfsd/nlm.zig:346)); a downgrade or shrink by a holder doesn't wake waiters ([nlm.zig:273](src/libnfsd/nlm.zig:273)).
-* **Callbacks:** a `GRANTED_MSG` argument can exceed `callback.zig`'s 2048-byte buffer ([callback.zig:49](src/libnfsd/callback.zig:49)); replies aren't checked against the address called; FREE_ALL decodes `max_string + 1` ([nlm.zig:231](src/libnfsd/nlm.zig:231)).
 * **`dispatch` asserts 24 bytes of `out` but may write 32** ([server.zig:60](src/libnfsd/server.zig:60)).
-* **Anti-patterns:** control flags in `readdir(plus)`, `remove(directory)`, `make(kind)`, `unlinkIn(directory)`, `createIn(exclusive)`, `callback.call(reply: ?…)`, and nullable-means-all in `releaseHost(?File)`, `unmount(?path)`, and `forget(?path)`; boolean blindness in CREATE's raw `how`, WRITE's stability as a bool, and `server_groups_state` as 0/1/2.
+* **Anti-patterns:** control flags in `readdir(plus)`, `remove(directory)`, `make(kind)`, `unlinkIn(directory)`, `createIn(exclusive)`, and nullable-means-all in `releaseHost(?File)`, `unmount(?path)`, and `forget(?path)`; boolean blindness in CREATE's raw `how`, WRITE's stability as a bool, and `server_groups_state` as 0/1/2.
 * **Clarity:** `statIn` duplicates `statAt`, and `if (kind == .lnk) .lnk else kind` ([nfs.zig:1096](src/libnfsd/nfs.zig:1096)).
 * **Spec ahead of code:** [AGENTS.md](AGENTS.md) states handle resolution by `open_by_handle_at` and `fsgetpath`, and volume UUIDs in handles, which aren't built; mark them unbuilt there until they ship.
 
