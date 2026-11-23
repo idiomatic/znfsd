@@ -134,7 +134,7 @@ The test "a connection the embedder accepted carries MOUNT and NFS" in `server.z
 * `Options`: `read_only`, `squash` (`.root`, the default, `.all`, or `.none`), and `map`, a name in `Table.maps`. `Options.apply` parses `rw`, `ro`, `squash=…`, and `map=…`.
 * `Map`: entries that translate client IDs to host IDs, UIDs and GIDs independently; requests map remote to local, replies local to its first remote. An entry with no remote IDs is the anon, which unmapped IDs and squashing use; without one, unmapped IDs pass through and squashing uses the host's `nobody`.
 
-Exports are always synchronous, cross mount points, skip subtree checks, and take AUTH_SYS only. Paths can't escape an export: every file is opened component by component without following symbolic links.
+Exports are always synchronous, cross mount points, skip subtree checks, and take AUTH_SYS only. Paths can't escape an export: every file is opened, stated, and has its link read without following symbolic links in any component.
 
 To change exports while serving, build a new table and call `setTable` on `Mount` and `Nfs`. Keep the old table alive: requests already running may still read it. znfsd keeps every table in an arena until exit.
 

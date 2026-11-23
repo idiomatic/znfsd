@@ -41,6 +41,7 @@ NFS v3 server daemon with few options and sensible defaults.
 * Restart: increment the NSM state number, send SM_NOTIFY to monitored hosts, then grant only lock reclaims during a ~90 s grace period
 * `mount del` and `lock del`: also drop the host from the statd monitor list
 * File handles: ≤64 bytes: format version, export ID, filesystem ID (volume UUID where available), inode, and generation (0 when unreadable)
+* Paths from clients or handles: opened, stated, read as links, and queried for capacity through descriptors that follow no symbolic link in any component, so none reaches outside its export
 * Handle resolution: `open_by_handle_at` (Linux), `fsgetpath` (macOS), else the stored last-known path if its inode matches; else `NFS3ERR_STALE`; NFS renames update stored paths
 * Control: Unix socket at `--socket`, mode 0600
 * Admin web server: `--web`, default `127.0.0.1:8049`; live activity monitor only, no auth

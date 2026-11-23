@@ -144,8 +144,8 @@ pub const Files = struct {
 
     pub const ResolveError = error{Stale} || Io.Cancelable;
 
-    /// Copies `h`'s path into `out`, NUL-terminated, and stats it; the file
-    /// there must still be `h`'s.
+    /// Copies `h`'s path into `out`, NUL-terminated, and stats it without
+    /// following links; the file there must still be `h`'s.
     pub fn resolve(f: *Files, io: Io, h: fh.Handle, out: *[sys.max_path + 1]u8, attr: *sys.Attr) ResolveError![:0]const u8 {
         const cached = cached: {
             try f.mutex.lock(io);
@@ -165,7 +165,7 @@ pub const Files = struct {
         } else return error.Stale;
         out[len] = 0;
         const path = out[0..len :0];
-        if (sys.lstat(path, attr) != .SUCCESS) return error.Stale;
+        if (sys.lstatSafe(path, attr) != .SUCCESS) return error.Stale;
         if (attr.ino != h.inode or !h.eql(fh.Handle.fromAttr(h.export_id, attr.*))) return error.Stale;
         if (!cached) f.remember(io, h, path) catch {};
         return path;

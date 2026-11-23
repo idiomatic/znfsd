@@ -36,10 +36,42 @@ pub const Attr = struct {
     gen: u32,
 };
 
-/// `stat` without following a final symbolic link.
+/// `stat` without following a final symbolic link, but following any
+/// before it: for the server's own paths. Clients' go through `lstatSafe`.
 pub fn lstat(path: [*:0]const u8, attr: *Attr) E {
     return statAt(c.AT.FDCWD, path, attr);
 }
+
+/// `lstat` refusing symbolic links before the last component, as
+/// `openSafe` does, so a path can't be redirected outside an export.
+pub fn lstatSafe(path: [*:0]const u8, attr: *Attr) E {
+    var parent: Parent = undefined;
+    const e = parent.open(path);
+    if (e != .SUCCESS) return e;
+    defer closeFd(parent.fd);
+    return statAt(parent.fd, parent.name, attr);
+}
+
+/// The directory holding a path's last component, opened for lookups
+/// only, and that component (`.` when the path ends in `/`).
+const Parent = struct {
+    fd: Fd,
+    name: [:0]const u8,
+    dir_buf: [max_path + 1]u8,
+
+    /// Opens the directory refusing symbolic links on the way; `path` must
+    /// be absolute and outlive `name`.
+    fn open(p: *Parent, path: [*:0]const u8) E {
+        const full = std.mem.span(path);
+        const slash = std.mem.lastIndexOfScalar(u8, full, '/') orelse return .INVAL;
+        const dir = if (slash + 1 == full.len) full else if (slash == 0) "/" else full[0..slash];
+        p.name = if (slash + 1 == full.len) "." else full[slash + 1 ..];
+        if (dir.len > max_path) return .NAMETOOLONG;
+        @memcpy(p.dir_buf[0..dir.len], dir);
+        p.dir_buf[dir.len] = 0;
+        return openDirSafe(p.dir_buf[0..dir.len :0], &p.fd);
+    }
+};
 
 /// `fstatat` relative to `dir`, without following a final symbolic link.
 pub fn statAt(dir: c.fd_t, path: [*:0]const u8, attr: *Attr) E {
@@ -130,6 +162,20 @@ pub fn openSafe(path: [*:0]const u8, flags: c.O, mode: u32, fd: *Fd) E {
     if (r < 0) return errno();
     fd.* = r;
     return .SUCCESS;
+}
+
+/// Opens the directory `path` safely, for lookups and metadata only, so
+/// it needs search permission, not read: `O_PATH` on Linux, `O_SEARCH` on
+/// macOS.
+pub fn openDirSafe(path: [*:0]const u8, fd: *Fd) E {
+    var o: c.O = .{ .DIRECTORY = true };
+    if (builtin.os.tag == .linux) {
+        o.PATH = true;
+    } else {
+        const O_EXEC: u32 = 0x40000000; // with O_DIRECTORY, O_SEARCH
+        o = @bitCast(@as(u32, @bitCast(o)) | O_EXEC);
+    }
+    return openSafe(path, o, 0, fd);
 }
 
 /// Opens `path` safely and checks it's still the file with inode `ino`.
@@ -521,34 +567,59 @@ const LinuxStatvfs = extern struct {
     spare: [16]c_int,
 };
 
-const statfs_symbol = if (builtin.os.tag.isDarwin() and builtin.cpu.arch == .x86_64) "statfs$INODE64" else "statfs";
-const macStatfs = @extern(*const fn ([*:0]const u8, *MacStatfs) callconv(.c) c_int, .{ .name = statfs_symbol });
-extern "c" fn statvfs(path: [*:0]const u8, buf: *LinuxStatvfs) c_int;
+const fstatfs_symbol = if (builtin.os.tag.isDarwin() and builtin.cpu.arch == .x86_64) "fstatfs$INODE64" else "fstatfs";
+const macFstatfs = @extern(*const fn (Fd, *MacStatfs) callconv(.c) c_int, .{ .name = fstatfs_symbol });
+extern "c" fn fstatvfs(fd: Fd, buf: *LinuxStatvfs) c_int;
 
+/// Opens, safely, a directory on the file system holding `path`: the
+/// directory itself, else (a file or a link) the one holding it.
+fn openFsOf(path: [*:0]const u8, fd: *Fd) E {
+    const e = openDirSafe(path, fd);
+    if (e != .NOTDIR and e != .LOOP) return e;
+    var parent: Parent = undefined;
+    const pe = parent.open(path);
+    fd.* = parent.fd;
+    return pe;
+}
+
+/// The capacity of the file system holding `path`, reached safely.
 pub fn fsStat(path: [*:0]const u8, out: *FsStat) E {
+    var fd: Fd = undefined;
+    const e = openFsOf(path, &fd);
+    if (e != .SUCCESS) return e;
+    defer closeFd(fd);
     if (builtin.os.tag.isDarwin()) {
         var s: MacStatfs = undefined;
-        if (macStatfs(path, &s) != 0) return errno();
+        if (macFstatfs(fd, &s) != 0) return errno();
         out.* = .{ .block_size = s.bsize, .blocks = s.blocks, .blocks_free = s.bfree, .blocks_avail = s.bavail, .files = s.files, .files_free = s.ffree };
     } else {
         var s: LinuxStatvfs = undefined;
-        if (statvfs(path, &s) != 0) return errno();
+        if (fstatvfs(fd, &s) != 0) return errno();
         out.* = .{ .block_size = s.frsize, .blocks = s.blocks, .blocks_free = s.bfree, .blocks_avail = s.bavail, .files = s.files, .files_free = s.ffree };
     }
     return .SUCCESS;
 }
 
-/// Whether names on the file system holding `path` are case-sensitive.
+/// Whether names on the file system holding `path`, reached safely, are
+/// case-sensitive.
 pub fn caseSensitive(path: [*:0]const u8) bool {
     if (!builtin.os.tag.isDarwin()) return true;
+    var fd: Fd = undefined;
+    if (openFsOf(path, &fd) != .SUCCESS) return true;
+    defer closeFd(fd);
     const _PC_CASE_SENSITIVE = 11;
-    return pathconf(path, _PC_CASE_SENSITIVE) != 0;
+    return fpathconf(fd, _PC_CASE_SENSITIVE) != 0;
 }
-extern "c" fn pathconf(path: [*:0]const u8, name: c_int) c_long;
+extern "c" fn fpathconf(fd: Fd, name: c_int) c_long;
 
-/// Reads the target of the symbolic link at `path` into `out`.
-pub fn readLink(path: [*:0]const u8, out: []u8, result: *[]const u8) E {
-    const n = c.readlink(path, out.ptr, out.len);
+/// Reads the target of the symbolic link at `path` into `out`, refusing
+/// links before it as `lstatSafe` does.
+pub fn readLinkSafe(path: [*:0]const u8, out: []u8, result: *[]const u8) E {
+    var parent: Parent = undefined;
+    const e = parent.open(path);
+    if (e != .SUCCESS) return e;
+    defer closeFd(parent.fd);
+    const n = c.readlinkat(parent.fd, parent.name, out.ptr, out.len);
     if (n < 0) return errno();
     result.* = out[0..@intCast(n)];
     return .SUCCESS;
@@ -572,11 +643,11 @@ pub const DirReader = struct {
         _ = c.closedir(r.dir);
     }
 
-    pub const Entry = struct { ino: u64, name: []const u8 };
+    pub const Entry = struct { ino: u64, name: [:0]const u8 };
 
     pub fn next(r: *DirReader) ?Entry {
         const ent = c.readdir(r.dir) orelse return null;
-        return .{ .ino = ent.ino, .name = std.mem.sliceTo(&ent.name, 0) };
+        return .{ .ino = ent.ino, .name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&ent.name)), 0) };
     }
 };
 
@@ -665,6 +736,47 @@ test "safe opens refuse links in any component; descriptor-relative calls" {
     try testing.expectEqual(E.NOTEMPTY, unlinkIn(dir, "sub", true));
     try testing.expectEqual(E.SUCCESS, unlinkIn(dir, "sub/hal3", false));
     try testing.expectEqual(E.SUCCESS, unlinkIn(dir, "sub", true));
+}
+
+test "safe stats and link reads refuse links before the last component" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "real");
+    try tmp.dir.writeFile(io, .{ .sub_path = "real/hal", .data = "9000" });
+    try tmp.dir.symLink(io, "hal", "real/link", .{});
+    try tmp.dir.symLink(io, "real", "alias", .{});
+    var root_buf: [max_path]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+    var buf: [max_path + 1]u8 = undefined;
+    var attr: Attr = undefined;
+    var out: [16]u8 = undefined;
+    var target: []const u8 = undefined;
+    var s: FsStat = undefined;
+
+    // Direct paths work, and a final link is the link itself.
+    var path = try std.fmt.bufPrintSentinel(&buf, "{s}/real/link", .{root}, 0);
+    try testing.expectEqual(E.SUCCESS, lstatSafe(path, &attr));
+    try testing.expectEqual(posix.S.IFLNK, attr.mode & posix.S.IFMT);
+    try testing.expectEqual(E.SUCCESS, readLinkSafe(path, &out, &target));
+    try testing.expectEqualStrings("hal", target);
+    try testing.expectEqual(E.SUCCESS, fsStat(path, &s));
+    path = try std.fmt.bufPrintSentinel(&buf, "{s}/real", .{root}, 0);
+    try testing.expectEqual(E.SUCCESS, fsStat(path, &s));
+    try testing.expectEqual(E.SUCCESS, lstatSafe("/", &attr));
+    try testing.expectEqual(posix.S.IFDIR, attr.mode & posix.S.IFMT);
+
+    // Through a link mid-path, all are refused, though `lstat` follows it.
+    for ([_][]const u8{ "hal", "link" }) |name| {
+        path = try std.fmt.bufPrintSentinel(&buf, "{s}/alias/{s}", .{ root, name }, 0);
+        try testing.expectEqual(E.SUCCESS, lstat(path, &attr));
+        try testing.expectEqual(E.LOOP, lstatSafe(path, &attr));
+        try testing.expectEqual(E.LOOP, readLinkSafe(path, &out, &target));
+        try testing.expectEqual(E.LOOP, fsStat(path, &s));
+    }
+    path = try std.fmt.bufPrintSentinel(&buf, "{s}/alias/", .{root}, 0);
+    try testing.expectEqual(E.LOOP, lstatSafe(path, &attr));
+    try testing.expectEqual(E.LOOP, fsStat(path, &s));
 }
 
 test "act as another user, then revert" {

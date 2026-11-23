@@ -51,7 +51,7 @@ Writes asked for as FILE_SYNC or DATA_SYNC reach storage (`fsync`) before the re
 
 Every attribute in a reply goes through one function that maps owners back to client IDs and folds the file system into the fileid; the encoders accept nothing else, so no reply, failure or not, can carry host owners.
 
-Files are reached through descriptors, never bare paths: a handle's cached path is opened refusing symbolic links in every component (`O_NOFOLLOW_ANY` on macOS, `openat2` with `RESOLVE_NO_SYMLINKS` on Linux) and its inode checked, then entries are changed relative to that descriptor (`openat`, `mkdirat`, `renameat`, and so on), so a client swapping a directory for a link can't redirect an operation outside its export. A renamed directory's cached descendants move with it.
+Files are reached through descriptors, never bare paths: a handle's cached path is opened refusing symbolic links in every component (`O_NOFOLLOW_ANY` on macOS, `openat2` with `RESOLVE_NO_SYMLINKS` on Linux) and its inode checked, then entries are changed relative to that descriptor (`openat`, `mkdirat`, `renameat`, and so on), so a client swapping a directory for a link can't redirect an operation outside its export. Metadata goes the same way: stats, link reads, and file-system queries (resolving a handle, LOOKUP, READLINK, FSSTAT, PATHCONF) go through the parent directory opened for search only (`O_PATH` on Linux, `O_SEARCH` on macOS) under the same no-links rule, and READDIRPLUS stats entries relative to the directory it reads. A renamed directory's cached descendants move with it.
 
 ## Maps
 

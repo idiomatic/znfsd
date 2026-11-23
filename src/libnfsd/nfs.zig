@@ -439,7 +439,7 @@ const Request = struct {
         } else join(&target_buf, dir.path, name) orelse return fail(r, .nametoolong, dir.attr);
 
         var attr: sys.Attr = undefined;
-        const e = sys.lstat(target, &attr);
+        const e = sys.lstatSafe(target, &attr);
         if (e != .SUCCESS) return fail(r, .fromErrno(e), dir.attr);
         const h: fh.Handle = .fromAttr(exportId(dir.match.path), attr);
         try r.n.files.remember(r.ctx.io, h, target);
@@ -495,7 +495,7 @@ const Request = struct {
         }
         var buf: [max_path]u8 = undefined;
         var target: []const u8 = undefined;
-        const e = sys.readLink(f.path, &buf, &target);
+        const e = sys.readLinkSafe(f.path, &buf, &target);
         try r.status(.fromErrno(e));
         try r.postOp(f.attr);
         if (e == .SUCCESS) try r.e.string(target);
@@ -624,7 +624,7 @@ const Request = struct {
                 var path_buf: [sys.max_path + 1]u8 = undefined;
                 const dot = std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..");
                 const path = if (dot) null else join(&path_buf, dir.path, entry.name);
-                if (path != null and sys.lstat(path.?, &attr) == .SUCCESS) {
+                if (path != null and sys.statIn(dir_fd, entry.name, &attr) == .SUCCESS) {
                     const h: fh.Handle = .fromAttr(export_id, attr);
                     try entries.append(arena_state.allocator(), .{
                         .fsid = h.fsid,
@@ -727,7 +727,7 @@ const Request = struct {
         r.inward(&mapped);
         const st = r.applySattr(f, mapped, guard);
         var post: sys.Attr = undefined;
-        const have_post = sys.lstat(f.path, &post) == .SUCCESS;
+        const have_post = sys.lstatSafe(f.path, &post) == .SUCCESS;
         try r.status(st);
         try r.wccData(f.attr, if (have_post) post else null);
     }
@@ -1279,7 +1279,7 @@ fn wcc(e: xdr.Encoder, pre: ?sys.Attr, post: ?Outward) Error!void {
 fn rootDev(path: []const u8) ?u64 {
     var buf: [sys.max_path + 1]u8 = undefined;
     var attr: sys.Attr = undefined;
-    if (path.len > sys.max_path or sys.lstat(copyZ(&buf, path), &attr) != .SUCCESS) return null;
+    if (path.len > sys.max_path or sys.lstatSafe(copyZ(&buf, path), &attr) != .SUCCESS) return null;
     return attr.dev;
 }
 
@@ -1289,7 +1289,7 @@ fn exportRootPath(files: *Files, table: *const exports.Table, io: Io, h: fh.Hand
     for (table.rules) |rule| {
         if (exportId(rule.path) != h.export_id or rule.path.len > sys.max_path) continue;
         const path = copyZ(buf, rule.path);
-        if (sys.lstat(path, attr) != .SUCCESS) continue;
+        if (sys.lstatSafe(path, attr) != .SUCCESS) continue;
         if (!h.eql(fh.Handle.fromAttr(h.export_id, attr.*))) continue;
         files.remember(io, h, path) catch {};
         return path;
@@ -1553,6 +1553,29 @@ test "read directories, plain and plus, across several calls" {
     try testing.expectEqual(5, names.items.len);
     // Entries found by READDIRPLUS resolve without a LOOKUP.
     try testing.expect((try f.lookup(root, "dir")) == .ok);
+}
+
+test "handles don't reach through links put mid-path" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const io = testing.io;
+    const root = try f.rootHandle();
+    const dir = (try f.lookup(root, "dir")).ok;
+    const art = (try f.lookup(dir, "art")).ok;
+    try f.tmp.dir.symLink(io, "art", "share/dir/soft", .{});
+    const soft = (try f.lookup(dir, "soft")).ok;
+
+    // Behind the server's back, `dir` becomes a link to where it went.
+    try f.tmp.dir.rename("share/dir", f.tmp.dir, "share/real", io);
+    try f.tmp.dir.symLink(io, "real", "share/dir", .{});
+    var args: [128]u8 = undefined;
+    for ([_][fh.size]u8{ art, soft }) |h| {
+        _ = try expectStatus(.stale, try f.call(f.nfs.program(), @backingInt(Proc.getattr), handleArgs(&args, h, "")));
+    }
+    _ = try expectStatus(.stale, try f.call(f.nfs.program(), @backingInt(Proc.readlink), handleArgs(&args, soft, "")));
+    // `dir`'s own handle is the link now: stale, as `dir` isn't a link.
+    try testing.expectEqual(Status.stale, (try f.lookup(dir, "art")).err);
 }
 
 test "a continued READDIR with a stale verifier is a bad cookie" {
