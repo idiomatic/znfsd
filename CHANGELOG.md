@@ -15,6 +15,7 @@ All notable changes to znfsd are documented here. The format follows [Keep a Cha
 
 * `server.dispatch` asserts that `out` holds its largest status reply, `server.max_status_reply` bytes, not just a success header, so a smaller buffer fails at the assertion rather than mid-reply
 * UMNT canonicalizes its path as MNT does, so unmounting `/srv/share/` or a since-removed directory forgets its mount record
+* On Linux, a thread done acting as a caller gets back all the server's supplementary groups, not just the first 32, and file-system IDs that follow its effective ones rather than root's
 * A request whose thread can't act as its caller again after a path-cache database write fails, rather than going on as the server
 * READDIR and READDIRPLUS answer `NFS3ERR_TOOSMALL` when no entry fits `maxcount`, and send one entry even past `dircount`, so a client is never sent an empty, unfinished listing to ask for again forever
 * MNT answers ACCES for any path not inside an export admitting the caller without links, so it no longer tells which paths exist elsewhere

@@ -431,21 +431,24 @@ const max_groups = 32;
 /// The identity this thread is acting as, if any; per thread.
 threadlocal var acting: ?struct { uid: u32, gid: u32, gids: [max_groups]u32, n: u8 } = null;
 
-/// The server's supplementary groups, restored after acting as a caller.
-var server_groups: [max_groups]u32 = undefined;
+/// Linux's NGROUPS_MAX, the most supplementary groups a thread can have.
+const ngroups_max = 65536;
+
+/// The server's supplementary groups, all of them, restored after acting as
+/// a caller; untouched pages cost nothing.
+var server_groups: [if (builtin.os.tag == .linux) ngroups_max else 0]u32 = undefined;
 var server_groups_len: usize = 0;
-/// 0: not saved; 1: saving; 2: saved.
-var server_groups_state: std.atomic.Value(u8) = .init(0);
+var server_groups_state: std.atomic.Value(enum(u8) { unsaved, saving, saved }) = .init(.unsaved);
 
 fn saveServerGroups() void {
-    if (server_groups_state.load(.acquire) == 2) return;
-    if (server_groups_state.cmpxchgStrong(0, 1, .acquire, .acquire) == null) {
-        const n = std.os.linux.getgroups(max_groups, @ptrCast(&server_groups));
+    if (server_groups_state.load(.acquire) == .saved) return;
+    if (server_groups_state.cmpxchgStrong(.unsaved, .saving, .acquire, .acquire) == null) {
+        const n = std.os.linux.getgroups(server_groups.len, &server_groups);
         server_groups_len = if (std.os.linux.errno(n) == .SUCCESS) n else 0;
-        server_groups_state.store(2, .release);
+        server_groups_state.store(.saved, .release);
         return;
     }
-    while (server_groups_state.load(.acquire) != 2) std.atomic.spinLoopHint();
+    while (server_groups_state.load(.acquire) != .saved) std.atomic.spinLoopHint();
 }
 
 extern "c" fn pthread_setugid_np(uid: c.uid_t, gid: c.gid_t) c_int;
@@ -480,11 +483,12 @@ pub fn become(id: Identity) E {
     return .SUCCESS;
 }
 
-/// Puts this thread's Linux identity back to the server's, returning `e`.
+/// Puts this thread's Linux identity back to the server's, returning `e`:
+/// its file-system IDs follow its effective ones again.
 fn restoreLinux(e: E) E {
     const linux = std.os.linux;
-    _ = linux.syscall1(.setfsuid, 0);
-    _ = linux.syscall1(.setfsgid, 0);
+    _ = linux.syscall1(.setfsuid, linux.geteuid());
+    _ = linux.syscall1(.setfsgid, linux.getegid());
     _ = linux.syscall2(.setgroups, server_groups_len, @intFromPtr(&server_groups));
     return e;
 }
@@ -816,6 +820,35 @@ test "act as another user, then revert" {
     try testing.expectEqual(4242, attr.uid);
     try testing.expectEqual(E.SUCCESS, statIn(dir, "server", &attr));
     try testing.expectEqual(0, attr.uid);
+}
+
+test "reverting restores all the server's groups and its own IDs" {
+    if (builtin.os.tag != .linux or !isRoot()) return error.SkipZigTest;
+    const linux = std.os.linux;
+    const none = std.math.maxInt(u32);
+    // This thread alone, through raw system calls, takes many groups and an
+    // effective GID other than 0, and saves them afresh.
+    var original: [64]u32 = undefined;
+    const n = linux.getgroups(original.len, &original);
+    try testing.expectEqual(E.SUCCESS, linux.errno(n));
+    var many: [40]u32 = undefined;
+    for (&many, 0..) |*g, i| g.* = @intCast(5000 + i);
+    try testing.expectEqual(E.SUCCESS, linux.errno(linux.setgroups(many.len, &many)));
+    defer _ = linux.setgroups(n, &original);
+    const egid = linux.getegid();
+    try testing.expectEqual(E.SUCCESS, linux.errno(linux.setresgid(none, 4243, none)));
+    defer _ = linux.setresgid(none, egid, none);
+    server_groups_state.store(.unsaved, .release);
+    defer server_groups_state.store(.unsaved, .release);
+
+    try testing.expectEqual(E.SUCCESS, become(.{ .uid = 4242, .gid = 4242 }));
+    revert();
+    var now: [64]u32 = undefined;
+    const got = linux.getgroups(now.len, &now);
+    try testing.expectEqualSlices(u32, &many, now[0..got]);
+    // An invalid ID changes nothing, reporting the current one.
+    try testing.expectEqual(4243, linux.syscall1(.setfsgid, none));
+    try testing.expectEqual(linux.geteuid(), linux.syscall1(.setfsuid, none));
 }
 
 test "a failed resume is an error" {

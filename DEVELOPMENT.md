@@ -83,8 +83,7 @@ From the code review of `ee622cc`; each leaves this list when fixed or accepted 
 * **CREATE UNCHECKED reapplies mode (and, on macOS, group) to an existing file** ([nfs.zig:1034](src/libnfsd/nfs.zig:1034)), failing with PERM for non-owners; apply only the size, as Linux does.
 * **READLINK and SYMLINK cap targets at 1024 bytes** ([nfs.zig:496](src/libnfsd/nfs.zig:496), [nfs.zig:1056](src/libnfsd/nfs.zig:1056)): READLINK truncates silently, SYMLINK answers GARBAGE_ARGS. Use `sys.max_path`; answer NAMETOOLONG.
 * **FSSTAT's `afiles` is the free count, not the available count** ([nfs.zig:666](src/libnfsd/nfs.zig:666)); report `f_favail` on Linux.
-* **Server groups past 32 are dropped** by `saveServerGroups`, and `restoreLinux` restores fsgid 0, not the process's own ([sys.zig:391](src/libnfsd/sys.zig:391)).
-* **Anti-patterns:** control flags in `readdir(plus)`, `remove(directory)`, `make(kind)`, `unlinkIn(directory)`, and `createIn(exclusive)`; boolean blindness in CREATE's raw `how`, WRITE's stability as a bool, and `server_groups_state` as 0/1/2.
+* **Anti-patterns:** control flags in `readdir(plus)`, `remove(directory)`, `make(kind)`, `unlinkIn(directory)`, and `createIn(exclusive)`; boolean blindness in CREATE's raw `how` and WRITE's stability as a bool.
 * **Clarity:** `statIn` duplicates `statAt`, and `if (kind == .lnk) .lnk else kind` ([nfs.zig:1096](src/libnfsd/nfs.zig:1096)).
 
 ## To do
