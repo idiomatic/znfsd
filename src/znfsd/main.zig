@@ -69,9 +69,19 @@ fn run(
             try stderr.print("znfsd: no daemon answers at {s}\n", .{socket});
             return 1;
         },
-        .lock => {
-            try stderr.print("znfsd: lock: needs the running daemon; none answers at {s}\n", .{socket});
-            return 1;
+        // Locks live in the daemon: without it, there are none.
+        .lock => switch (c.verb.?) {
+            .list => {
+                if (c.args.len > 1) {
+                    try stderr.writeAll("znfsd: usage: znfsd lock list [PATH]\n");
+                    return 2;
+                }
+                return 0;
+            },
+            else => {
+                try stderr.print("znfsd: lock: needs the running daemon; none answers at {s}\n", .{socket});
+                return 1;
+            },
         },
         .@"export", .group, .mount, .map => {
             var db = try openDb(io, arena, invocation.globals, environ, stderr) orelse return 1;
@@ -114,6 +124,20 @@ fn openDb(io: Io, arena: std.mem.Allocator, globals: cli.Globals, environ: *cons
         try stderr.print("znfsd: {s}: can't open the database\n", .{path});
         return null;
     };
+}
+
+test "without the daemon, lock list is empty and lock del fails" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var environ: std.process.Environ.Map = .init(arena);
+    var out: Io.Writer.Allocating = .init(arena);
+    var err: Io.Writer.Allocating = .init(arena);
+    const socket = "/nonexistent/skynet.sock";
+    try std.testing.expectEqual(0, try run(std.testing.io, std.testing.allocator, arena, &environ, &.{ "--socket", socket, "lock", "list" }, &out.writer, &err.writer));
+    try std.testing.expectEqualStrings("", out.written());
+    try std.testing.expectEqualStrings("", err.written());
+    try std.testing.expectEqual(1, try run(std.testing.io, std.testing.allocator, arena, &environ, &.{ "--socket", socket, "lock", "del", "art" }, &out.writer, &err.writer));
 }
 
 test {
