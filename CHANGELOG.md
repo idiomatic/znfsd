@@ -13,6 +13,7 @@ All notable changes to znfsd are documented here. The format follows [Keep a Cha
 
 ### Fixed
 
+* An IPv4-mapped CLIENT (`::ffff:10.1.2.3`, or a CIDR of at least `/96`) is IPv4; one no longer crashes the daemon at the next IPv4 request
 * TCP listeners serve at most 1024 connections (`ConnectionOptions.max_connections`), and the web monitor drops requests with over 100 header lines
 * Owner overrides work for files directly under `/`; CREATE UNCHECKED doesn't open an existing device or FIFO
 * READ replies carry the attributes and end-of-file seen at the read; ACCESS grants owners read and write as READ and WRITE do; FSSTAT sizes saturate

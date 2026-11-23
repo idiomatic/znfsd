@@ -53,7 +53,7 @@ pub const Client = union(enum) {
         }
         if (std.mem.indexOfScalar(u8, text, '/') != null) return .{ .cidr = try .parse(text) };
         if (net.IpAddress.parse(text, 0)) |address| {
-            return .{ .cidr = .{ .address = normalize(address), .prefix = if (address == .ip4) 32 else 128 } };
+            return .{ .cidr = try .of(address, if (address == .ip4) 32 else 128) };
         } else |_| {}
         return .{ .host = text };
     }
@@ -110,8 +110,17 @@ pub const Cidr = struct {
         const slash = std.mem.indexOfScalar(u8, text, '/') orelse return error.BadClient;
         const address = net.IpAddress.parse(text[0..slash], 0) catch return error.BadClient;
         const prefix = std.fmt.parseInt(u8, text[slash + 1 ..], 10) catch return error.BadClient;
-        const c: Cidr = .{ .address = normalize(address), .prefix = prefix };
-        if (prefix > c.bits()) return error.BadClient;
+        return .of(address, prefix);
+    }
+
+    /// The range of `prefix` bits from `address`; an IPv4-mapped one
+    /// becomes IPv4, its prefix counting only the IPv4 bits.
+    fn of(address: net.IpAddress, prefix: u8) Client.ParseError!Cidr {
+        const plain = normalize(address);
+        const mapped = address == .ip6 and plain == .ip4;
+        if (mapped and prefix < 96) return error.BadClient;
+        const c: Cidr = .{ .address = plain, .prefix = if (mapped) prefix - 96 else prefix };
+        if (c.prefix > c.bits()) return error.BadClient;
         return c;
     }
 
@@ -319,6 +328,10 @@ test "parse clients" {
     try testing.expectEqual(8, (try Client.parse("fd00::/8")).cidr.prefix);
     try testing.expectEqual(32, (try Client.parse("192.168.64.4")).cidr.prefix);
     try testing.expectError(error.BadClient, Client.parse("10.0.0.0/33"));
+    try testing.expectEqual(32, (try Client.parse("::ffff:10.1.2.3")).cidr.prefix);
+    try testing.expectEqual(8, (try Client.parse("::ffff:10.0.0.0/104")).cidr.prefix);
+    try testing.expectError(error.BadClient, Client.parse("::ffff:10.0.0.0/80"));
+    try testing.expectError(error.BadClient, Client.parse("::ffff:10.0.0.0/129"));
     try testing.expectError(error.BadClient, Client.parse("@"));
     try testing.expectError(error.BadClient, Client.parse(""));
 }
@@ -354,6 +367,11 @@ test "CIDRs contain addresses, including IPv4-mapped ones" {
     try testing.expect(!odd.contains(ip("192.168.80.0")));
     try testing.expect((try Cidr.parse("fd00::/8")).contains(ip("fd12::1")));
     try testing.expect(!(try Cidr.parse("fd00::/8")).contains(ip("10.0.0.1")));
+    const mapped = (try Client.parse("::ffff:10.1.2.3")).cidr;
+    try testing.expect(mapped.contains(ip("10.1.2.3")));
+    try testing.expect(mapped.contains(ip("::ffff:10.1.2.3")));
+    try testing.expect(!mapped.contains(ip("10.1.2.4")));
+    try testing.expect((try Cidr.parse("::ffff:10.1.0.0/112")).contains(ip("10.1.9.9")));
 }
 
 test "the most specific client wins, whole" {

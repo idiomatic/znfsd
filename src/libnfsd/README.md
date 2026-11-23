@@ -130,7 +130,7 @@ The test "a connection the embedder accepted carries MOUNT and NFS" in `server.z
 
 `exports.Table` holds `rules`, and the `groups` and `maps` they name. A `Rule` is a canonical path, a `Client`, and `Options`:
 
-* `Client.parse`: `host`, `*.domain`, an address or CIDR (IPv4-mapped peers match IPv4), `@GROUP`, or `*`. For a path, the most specific matching client's rule wins, whole: host, longest CIDR, longest domain, group, then `*`.
+* `Client.parse`: `host`, `*.domain`, an address or CIDR (IPv4-mapped peers, addresses, and CIDRs match as IPv4), `@GROUP`, or `*`. For a path, the most specific matching client's rule wins, whole: host, longest CIDR, longest domain, group, then `*`.
 * `Options`: `read_only`, `squash` (`.root`, the default, `.all`, or `.none`), and `map`, a name in `Table.maps`. `Options.apply` parses `rw`, `ro`, `squash=…`, and `map=…`.
 * `Map`: entries that translate client IDs to host IDs, UIDs and GIDs independently; requests map remote to local, replies local to its first remote. An entry with no remote IDs is the anon, which unmapped IDs and squashing use; without one, unmapped IDs pass through and squashing uses the host's `nobody`.
 
