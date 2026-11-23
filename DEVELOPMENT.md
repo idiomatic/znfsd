@@ -80,7 +80,6 @@ From the code review of `ee622cc`; each leaves this list when fixed or accepted 
 
 ### Medium
 
-* **GRANTED_MSG isn't retried:** one lost datagram leaves a client never told of a lock it holds ([nlm.zig:360](src/libnfsd/nlm.zig:360)). Resend until GRANTED_RES; release after a few tries.
 * **No limits on locks, waiters, or monitored hosts:** each grows per request ([locks.zig:59](src/libnfsd/locks.zig:59), [nlm.zig:125](src/libnfsd/nlm.zig:125), [nsm.zig:57](src/libnfsd/nsm.zig:57)), monitored hosts persist, and coalescing is quadratic. Cap them per host and overall (`denied_nolocks`); index locks by file.
 
 ### Low

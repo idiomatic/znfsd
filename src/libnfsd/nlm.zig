@@ -32,6 +32,9 @@ pub const grace_seconds = 90;
 /// Callbacks sent at once; more are dropped, as lost datagrams would be.
 pub const max_callbacks = 64;
 
+/// GRANTED_MSG sends before an unconfirmed grant is released.
+pub const grant_sends = 5;
+
 pub const Proc = enum(u32) {
     null = 0,
     @"test" = 1,
@@ -122,6 +125,17 @@ const Waiter = struct {
     }
 };
 
+/// A granted request its client hasn't confirmed with GRANTED_RES.
+const Grant = struct {
+    waiter: Waiter,
+    /// GRANTED_MSG's arguments, owned.
+    args: []u8,
+    /// GRANTED_MSGs sent so far.
+    sent: u8,
+    /// When to send again, or, after the last send, to give up.
+    due: Io.Clock.Timestamp,
+};
+
 pub const Nlm = struct {
     gpa: std.mem.Allocator,
     nfs: *Nfs,
@@ -135,6 +149,12 @@ pub const Nlm = struct {
     monitoring: Io.Mutex = .init,
     mutex: Io.Mutex = .init,
     waiters: std.ArrayList(Waiter) = .empty,
+    /// Grants resent until confirmed, and after `grant_sends` released.
+    grants: std.ArrayList(Grant) = .empty,
+    /// Whether a task is resending grants.
+    resending: bool = false,
+    /// The wait before a grant is first resent, doubling after each send.
+    grant_interval: Io.Clock.Duration = .{ .raw = .fromSeconds(1), .clock = .awake },
     /// Callbacks in flight, so replies, and UDP's one loop, needn't wait
     /// for clients' portmappers.
     callbacks: Io.Group = .init,
@@ -150,6 +170,8 @@ pub const Nlm = struct {
         n.callbacks.cancel(io);
         for (n.waiters.items) |w| n.freeWaiter(w);
         n.waiters.deinit(n.gpa);
+        for (n.grants.items) |g| n.freeGrant(g);
+        n.grants.deinit(n.gpa);
     }
 
     pub fn program(n: *Nlm) server.Program {
@@ -191,6 +213,13 @@ pub const Nlm = struct {
                     n.freeWaiter(n.waiters.orderedRemove(i));
                 } else i += 1;
             }
+            i = 0;
+            while (i < n.grants.items.len) {
+                const w = n.grants.items[i].waiter;
+                if (std.mem.eql(u8, w.lock.caller_name, host) and (file == null or std.meta.eql(w.file, file.?))) {
+                    n.freeGrant(n.grants.orderedRemove(i));
+                } else i += 1;
+            }
         }
         return n.afterRelease(io, host, released);
     }
@@ -209,6 +238,13 @@ pub const Nlm = struct {
                 var buf: [64]u8 = undefined;
                 if (w.owner(&buf).of(host, address)) {
                     n.freeWaiter(n.waiters.orderedRemove(i));
+                } else i += 1;
+            }
+            i = 0;
+            while (i < n.grants.items.len) {
+                var buf: [64]u8 = undefined;
+                if (n.grants.items[i].waiter.owner(&buf).of(host, address)) {
+                    n.freeGrant(n.grants.orderedRemove(i));
                 } else i += 1;
             }
         }
@@ -282,8 +318,14 @@ pub const Nlm = struct {
                 n.sendLater(ctx.io, ctx.from, @fromBackingInt(call.proc + 5), w.buffered());
                 return .none;
             },
-            // Clients' answers to our GRANTED_MSG, and other results: nothing to do.
-            .test_res, .lock_res, .cancel_res, .unlock_res, .granted_res, .granted_msg => return .none,
+            .granted_res => {
+                const cookie = try d.opaque_(max_netobj);
+                const stat = d.enumeration(Stat) catch Stat.failed;
+                try n.confirm(ctx.io, cookie, ctx.from, stat);
+                return .none;
+            },
+            // Other results: nothing to do.
+            .test_res, .lock_res, .cancel_res, .unlock_res, .granted_msg => return .none,
             .granted => {
                 const e: xdr.Encoder = .init(results);
                 try e.opaque_(try d.opaque_(max_netobj));
@@ -349,6 +391,8 @@ pub const Nlm = struct {
                     else => try n.locks.acquire(ctx.io, located.file, lock.owner(from), exclusive, lock.range()),
                 };
                 if (taken) {
+                    // A client repeating a request it was granted knows now.
+                    if (n.takeGrant(ctx.io, located.file, lock.owner(from), lock.range())) |g| n.freeGrant(g);
                     try e.enumeration(Stat.granted);
                     // A downgrade or a shrink may free what others wait for.
                     return n.wake(ctx.io);
@@ -363,14 +407,16 @@ pub const Nlm = struct {
                 const lock: LockArgs = try .decode(d);
                 if (!n.nfs.admits(ctx.from)) return e.enumeration(Stat.denied);
                 const h = fh.Handle.decode(lock.fh) catch return e.enumeration(Stat.stale_fh);
-                n.cancel(ctx.io, .{ .fsid = h.fsid, .inode = h.inode }, lock.owner(from), lock) catch {};
+                try n.cancel(ctx.io, .{ .fsid = h.fsid, .inode = h.inode }, lock.owner(from), lock);
                 try e.enumeration(Stat.granted);
             },
             .unlock => {
                 const lock: LockArgs = try .decode(d);
                 if (!n.nfs.admits(ctx.from)) return e.enumeration(Stat.denied);
                 const h = fh.Handle.decode(lock.fh) catch return e.enumeration(Stat.stale_fh);
-                try n.locks.release(ctx.io, .{ .fsid = h.fsid, .inode = h.inode }, lock.owner(from), lock.range());
+                const file: locks_.File = .{ .fsid = h.fsid, .inode = h.inode };
+                try n.locks.release(ctx.io, file, lock.owner(from), lock.range());
+                try n.dropGrants(ctx.io, file, lock.owner(from), lock.range());
                 try n.unmonitorIdle(ctx.io, lock.caller_name);
                 try e.enumeration(Stat.granted);
                 try n.wake(ctx.io);
@@ -402,16 +448,81 @@ pub const Nlm = struct {
         try n.waiters.append(n.gpa, owned);
     }
 
+    /// Stops a request waiting; if it was granted unbeknownst to its
+    /// client, releases the lock.
     fn cancel(n: *Nlm, io: Io, file: locks_.File, owner: locks_.Owner, lock: LockArgs) !void {
-        try n.mutex.lock(io);
-        defer n.mutex.unlock(io);
-        for (n.waiters.items, 0..) |*w, i| {
-            var buf: [64]u8 = undefined;
-            if (std.meta.eql(w.file, file) and w.owner(&buf).eql(owner) and std.meta.eql(w.lock.range(), lock.range())) {
-                n.freeWaiter(n.waiters.orderedRemove(i));
-                return;
+        {
+            try n.mutex.lock(io);
+            defer n.mutex.unlock(io);
+            for (n.waiters.items, 0..) |*w, i| {
+                var buf: [64]u8 = undefined;
+                if (std.meta.eql(w.file, file) and w.owner(&buf).eql(owner) and std.meta.eql(w.lock.range(), lock.range())) {
+                    n.freeWaiter(n.waiters.orderedRemove(i));
+                    return;
+                }
             }
         }
+        const g = n.takeGrant(io, file, owner, lock.range()) orelse return;
+        defer n.freeGrant(g);
+        try n.releaseGranted(io, g);
+    }
+
+    /// Removes and returns the grant of `range` to `owner`, if pending.
+    fn takeGrant(n: *Nlm, io: Io, file: locks_.File, owner: locks_.Owner, range: locks_.Range) ?Grant {
+        n.mutex.lockUncancelable(io);
+        defer n.mutex.unlock(io);
+        for (n.grants.items, 0..) |*g, i| {
+            var buf: [64]u8 = undefined;
+            if (std.meta.eql(g.waiter.file, file) and g.waiter.owner(&buf).eql(owner) and std.meta.eql(g.waiter.lock.range(), range)) {
+                return n.grants.orderedRemove(i);
+            }
+        }
+        return null;
+    }
+
+    /// Forgets grants to `owner` overlapping `range`, as it unlocked them.
+    fn dropGrants(n: *Nlm, io: Io, file: locks_.File, owner: locks_.Owner, range: locks_.Range) !void {
+        try n.mutex.lock(io);
+        defer n.mutex.unlock(io);
+        var i: usize = 0;
+        while (i < n.grants.items.len) {
+            const w = &n.grants.items[i].waiter;
+            var buf: [64]u8 = undefined;
+            const r = w.lock.range();
+            if (std.meta.eql(w.file, file) and w.owner(&buf).eql(owner) and r.start < range.end and range.start < r.end) {
+                n.freeGrant(n.grants.orderedRemove(i));
+            } else i += 1;
+        }
+    }
+
+    /// Handles GRANTED_RES from `from`: a confirmed grant is done; a
+    /// refused one is released; one refused in the client's grace period
+    /// is sent again.
+    fn confirm(n: *Nlm, io: Io, cookie: []const u8, from: net.IpAddress, stat: Stat) !void {
+        var from_buf: [64]u8 = undefined;
+        const text = nsm_.addressText(from, &from_buf);
+        const g = found: {
+            try n.mutex.lock(io);
+            defer n.mutex.unlock(io);
+            for (n.grants.items, 0..) |*g, i| {
+                var buf: [64]u8 = undefined;
+                if (!std.mem.eql(u8, g.waiter.cookie, cookie) or !std.mem.eql(u8, nsm_.addressText(g.waiter.address, &buf), text)) continue;
+                if (stat == .denied_grace_period) return;
+                break :found n.grants.orderedRemove(i);
+            }
+            return;
+        };
+        defer n.freeGrant(g);
+        if (stat != .granted) try n.releaseGranted(io, g);
+    }
+
+    /// Releases a grant's lock, which its client doesn't hold, and grants
+    /// what can be.
+    fn releaseGranted(n: *Nlm, io: Io, g: Grant) !void {
+        var buf: [64]u8 = undefined;
+        try n.locks.release(io, g.waiter.file, g.waiter.owner(&buf), g.waiter.lock.range());
+        try n.unmonitorIdle(io, g.waiter.lock.caller_name);
+        try n.wake(io);
     }
 
     /// Grants what waiting requests can now have, in order, and tells
@@ -442,16 +553,77 @@ pub const Nlm = struct {
     }
 
     /// Tells a client its blocked request was granted: GRANTED_MSG, with
-    /// nlm4_testargs (cookie, exclusive, and the original lock).
+    /// nlm4_testargs (cookie, exclusive, and the original lock), sent again
+    /// until the client confirms it.
     fn grant(n: *Nlm, io: Io, w: Waiter) void {
-        defer n.freeWaiter(w);
         var buf: [max_netobj * 4 + 64]u8 = undefined;
         var bw: Io.Writer = .fixed(&buf);
         const e: xdr.Encoder = .init(&bw);
-        e.opaque_(w.cookie) catch return;
-        e.boolean(w.exclusive) catch return;
-        w.lock.encode(e) catch return;
+        e.opaque_(w.cookie) catch unreachable;
+        e.boolean(w.exclusive) catch unreachable;
+        w.lock.encode(e) catch unreachable;
         n.sendLater(io, w.address, .granted_msg, bw.buffered());
+        n.track(io, w, bw.buffered()) catch {
+            log.warn("nlm: granting to {s}: out of memory; not resending", .{w.lock.caller_name});
+            n.freeWaiter(w);
+        };
+    }
+
+    /// Keeps a grant, owning `w`, for `resend`, which it starts if need be.
+    fn track(n: *Nlm, io: Io, w: Waiter, args: []const u8) !void {
+        const owned = try n.gpa.dupe(u8, args);
+        errdefer n.gpa.free(owned);
+        n.mutex.lockUncancelable(io);
+        defer n.mutex.unlock(io);
+        try n.grants.append(n.gpa, .{ .waiter = w, .args = owned, .sent = 1, .due = .fromNow(io, n.grant_interval) });
+        if (n.resending) return;
+        // Without a task, the grant waits for the next one.
+        n.callbacks.concurrent(io, resend, .{ n, io }) catch return;
+        n.resending = true;
+    }
+
+    /// Resends grants as they come due, doubling the wait after each send,
+    /// and releases those still unconfirmed after `grant_sends`. Ends when
+    /// none are left.
+    fn resend(n: *Nlm, io: Io) Io.Cancelable!void {
+        while (true) {
+            try io.sleep(n.grant_interval.raw, n.grant_interval.clock);
+            var expired: std.ArrayList(Grant) = .empty;
+            defer expired.deinit(n.gpa);
+            const done = done: {
+                try n.mutex.lock(io);
+                defer n.mutex.unlock(io);
+                var i: usize = 0;
+                while (i < n.grants.items.len) {
+                    const g = &n.grants.items[i];
+                    if (g.due.durationFromNow(io).raw.nanoseconds > 0) {
+                        i += 1;
+                    } else if (g.sent < grant_sends) {
+                        const interval: Io.Clock.Duration = .{
+                            .raw = .fromNanoseconds(n.grant_interval.raw.nanoseconds << @intCast(g.sent)),
+                            .clock = n.grant_interval.clock,
+                        };
+                        g.sent += 1;
+                        g.due = .fromNow(io, interval);
+                        n.sendLater(io, g.waiter.address, .granted_msg, g.args);
+                        i += 1;
+                    } else if (expired.ensureUnusedCapacity(n.gpa, 1)) {
+                        expired.appendAssumeCapacity(n.grants.orderedRemove(i));
+                    } else |_| i += 1;
+                }
+                if (n.grants.items.len == 0) n.resending = false;
+                break :done n.grants.items.len == 0;
+            };
+            for (expired.items) |g| {
+                log.warn("nlm: {s} didn't confirm its lock; releasing it", .{g.waiter.lock.caller_name});
+                n.releaseGranted(io, g) catch |err| if (err == error.Canceled) {
+                    for (expired.items) |x| n.freeGrant(x);
+                    return error.Canceled;
+                };
+            }
+            for (expired.items) |g| n.freeGrant(g);
+            if (done) return;
+        }
     }
 
     /// Sends a callback in the background, with a copy of `args`, unless
@@ -483,6 +655,11 @@ pub const Nlm = struct {
         n.caller.send(io, host, prog, vers, @backingInt(proc), args) catch |err| {
             if (err != error.Canceled) log.warn("nlm: {t} to {f}: {t}", .{ proc, host, err });
         };
+    }
+
+    fn freeGrant(n: *Nlm, g: Grant) void {
+        n.gpa.free(g.args);
+        n.freeWaiter(g.waiter);
     }
 
     fn freeWaiter(n: *Nlm, w: Waiter) void {
@@ -698,7 +875,11 @@ const Client = struct {
 
     /// The next callback: its procedure and arguments, in `buf`.
     fn next(c: Client, buf: []u8) !struct { Proc, []const u8 } {
-        const in = try c.socket.receiveTimeout(testing.io, buf, .{ .duration = .{ .raw = .fromSeconds(2), .clock = .awake } });
+        return c.nextWithin(buf, .fromSeconds(2));
+    }
+
+    fn nextWithin(c: Client, buf: []u8, timeout: Io.Duration) !struct { Proc, []const u8 } {
+        const in = try c.socket.receiveTimeout(testing.io, buf, .{ .duration = .{ .raw = timeout, .clock = .awake } });
         const call = switch (rpc.decodeCall(in.data)) {
             .call => |c_| c_,
             else => return error.NotACall,
@@ -768,4 +949,90 @@ test "a failure granting leaves waiters waiting" {
     try f.nlm.wake(io);
     try testing.expectEqual(0, f.nlm.waiters.items.len);
     try testing.expectEqual(1, f.locks.held.items.len);
+}
+
+test "GRANTED_MSG goes again until confirmed, and its lock goes if never" {
+    const io = testing.io;
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    f.nlm.grant_interval = .{ .raw = .fromMilliseconds(10), .clock = .awake };
+    const client: Client = try .init(&f.nlm);
+    defer client.deinit();
+    const ctx: server.Context = .{ .io = io, .from = .{ .ip4 = .loopback(800) }, .protocol = .udp };
+    var a: [512]u8 = undefined;
+    var buf: [512]u8 = undefined;
+    const hal: Request = .{ .who = "hal", .svid = 2, .block = true, .cookie = "hal1" };
+
+    // Unconfirmed, it's sent `grant_sends` times, then released.
+    try testing.expectEqual(Stat.granted, try f.run(ctx, .lock, (Request{ .who = "art", .svid = 1 }).lockArgs(&a, &f.handle)));
+    try testing.expectEqual(Stat.blocked, try f.run(ctx, .lock, hal.lockArgs(&a, &f.handle)));
+    try testing.expectEqual(Stat.granted, try f.run(ctx, .unlock, (Request{ .who = "art", .svid = 1 }).unlockArgs(&a, &f.handle)));
+    for (0..grant_sends) |_| {
+        const proc, const args = try client.next(&buf);
+        try testing.expectEqual(Proc.granted_msg, proc);
+        var d: xdr.Decoder = .init(args);
+        try testing.expectEqualStrings("hal1", try d.opaque_(max_netobj));
+    }
+    for (0..200) |_| {
+        if (!try f.locks.hostHolds(io, "hal")) break;
+        try io.sleep(.fromMilliseconds(10), .awake);
+    } else return error.TestUnexpectedResult;
+    try testing.expect(!f.status.hosts.contains("hal"));
+
+    // Confirmed, it's sent no more, and kept.
+    try testing.expectEqual(Stat.granted, try f.run(ctx, .lock, (Request{ .who = "art", .svid = 1 }).lockArgs(&a, &f.handle)));
+    try testing.expectEqual(Stat.blocked, try f.run(ctx, .lock, hal.lockArgs(&a, &f.handle)));
+    try testing.expectEqual(Stat.granted, try f.run(ctx, .unlock, (Request{ .who = "art", .svid = 1 }).unlockArgs(&a, &f.handle)));
+    _ = try client.next(&buf);
+    var res: [64]u8 = undefined;
+    var w: Io.Writer = .fixed(&res);
+    try xdr.Encoder.init(&w).opaque_("hal1");
+    try xdr.Encoder.init(&w).enumeration(Stat.granted);
+    var out: [512]u8 = undefined;
+    // From elsewhere, it doesn't count.
+    const skynet: server.Context = .{ .io = io, .from = try .parse("127.0.0.66", 800), .protocol = .udp };
+    try testing.expectEqual(null, try f.dispatch(skynet, .granted_res, w.buffered(), &out));
+    try testing.expectEqual(1, f.nlm.grants.items.len);
+    try testing.expectEqual(null, try f.dispatch(ctx, .granted_res, w.buffered(), &out));
+    try testing.expectEqual(0, f.nlm.grants.items.len);
+    // At most one resend could have been on its way.
+    _ = client.nextWithin(&buf, .fromMilliseconds(100)) catch {};
+    try testing.expectError(error.Timeout, client.nextWithin(&buf, .fromMilliseconds(500)));
+    try testing.expect(try f.locks.hostHolds(io, "hal"));
+
+    // A refused grant is released.
+    try testing.expectEqual(Stat.blocked, try f.run(ctx, .lock, (Request{ .who = "art", .svid = 1, .block = true, .cookie = "art1" }).lockArgs(&a, &f.handle)));
+    try testing.expectEqual(Stat.granted, try f.run(ctx, .unlock, hal.unlockArgs(&a, &f.handle)));
+    _ = try client.next(&buf);
+    w = .fixed(&res);
+    try xdr.Encoder.init(&w).opaque_("art1");
+    try xdr.Encoder.init(&w).enumeration(Stat.denied);
+    try testing.expectEqual(null, try f.dispatch(ctx, .granted_res, w.buffered(), &out));
+    try testing.expect(!try f.locks.hostHolds(io, "art"));
+}
+
+test "a client cancelling a grant it never heard of releases it" {
+    const io = testing.io;
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const ctx: server.Context = .{ .io = io, .from = try .parse("127.0.0.1", 9), .protocol = .tcp };
+    var a: [512]u8 = undefined;
+    const hal: Request = .{ .who = "hal", .svid = 2, .block = true };
+    try testing.expectEqual(Stat.granted, try f.run(ctx, .lock, (Request{ .who = "art", .svid = 1 }).lockArgs(&a, &f.handle)));
+    try testing.expectEqual(Stat.blocked, try f.run(ctx, .lock, hal.lockArgs(&a, &f.handle)));
+    try testing.expectEqual(Stat.granted, try f.run(ctx, .unlock, (Request{ .who = "art", .svid = 1 }).unlockArgs(&a, &f.handle)));
+    try testing.expect(try f.locks.hostHolds(io, "hal"));
+    try testing.expectEqual(Stat.granted, try f.run(ctx, .cancel, hal.cancelArgs(&a, &f.handle)));
+    try testing.expect(!try f.locks.hostHolds(io, "hal"));
+    try testing.expectEqual(0, f.nlm.grants.items.len);
+
+    // Asking again for a lock it was granted confirms it.
+    try testing.expectEqual(Stat.granted, try f.run(ctx, .lock, (Request{ .who = "art", .svid = 1 }).lockArgs(&a, &f.handle)));
+    try testing.expectEqual(Stat.blocked, try f.run(ctx, .lock, hal.lockArgs(&a, &f.handle)));
+    try testing.expectEqual(Stat.granted, try f.run(ctx, .unlock, (Request{ .who = "art", .svid = 1 }).unlockArgs(&a, &f.handle)));
+    try testing.expectEqual(1, f.nlm.grants.items.len);
+    try testing.expectEqual(Stat.granted, try f.run(ctx, .lock, hal.lockArgs(&a, &f.handle)));
+    try testing.expectEqual(0, f.nlm.grants.items.len);
 }
