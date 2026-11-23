@@ -35,6 +35,15 @@ pub const max_callbacks = 64;
 /// GRANTED_MSG sends before an unconfirmed grant is released.
 pub const grant_sends = 5;
 
+/// How many blocked requests may wait, granted ones awaiting confirmation
+/// included, so no client can exhaust the server's memory.
+pub const Limits = struct {
+    /// From any one client address.
+    per_host: usize = 64,
+    /// In all.
+    total: usize = 1024,
+};
+
 pub const Proc = enum(u32) {
     null = 0,
     @"test" = 1,
@@ -141,6 +150,7 @@ pub const Nlm = struct {
     nfs: *Nfs,
     locks: *Locks,
     nsm: *nsm_.Nsm,
+    limits: Limits = .{},
     /// While set and not yet reached, only reclaims are granted.
     grace_end: ?Io.Clock.Timestamp = null,
     /// Held while taking locks and monitoring their hosts, and while
@@ -266,11 +276,12 @@ pub const Nlm = struct {
     }
 
     /// Takes a lock for LOCK, monitoring its host; returns whether it was
-    /// taken.
+    /// taken. Fails with `TooManyHosts` when the host can't be monitored.
     fn lockMonitored(n: *Nlm, io: Io, file: locks_.File, lock: LockArgs, exclusive: bool, address: net.IpAddress) !bool {
         var buf: [64]u8 = undefined;
         try n.monitoring.lock(io);
         defer n.monitoring.unlock(io);
+        if (!n.nsm.fits(io, lock.caller_name, address)) return error.TooManyHosts;
         if (!try n.locks.acquire(io, file, lock.owner(nsm_.addressText(address, &buf)), exclusive, lock.range())) return false;
         n.monitor(io, lock.caller_name, address);
         return true;
@@ -387,8 +398,11 @@ pub const Nlm = struct {
                 var located: Nfs.Located = undefined;
                 if (!n.nfs.locate(ctx.io, lock.fh, ctx.from, &located)) return e.enumeration(Stat.stale_fh);
                 const taken = switch (proc) {
-                    .lock => try n.lockMonitored(ctx.io, located.file, lock, exclusive, ctx.from),
-                    else => try n.locks.acquire(ctx.io, located.file, lock.owner(from), exclusive, lock.range()),
+                    .lock => n.lockMonitored(ctx.io, located.file, lock, exclusive, ctx.from),
+                    else => n.locks.acquire(ctx.io, located.file, lock.owner(from), exclusive, lock.range()),
+                } catch |err| switch (err) {
+                    error.TooManyLocks, error.TooManyHosts => return e.enumeration(Stat.denied_nolocks),
+                    else => |other| return other,
                 };
                 if (taken) {
                     // A client repeating a request it was granted knows now.
@@ -398,7 +412,10 @@ pub const Nlm = struct {
                     return n.wake(ctx.io);
                 }
                 if (!block) return e.enumeration(Stat.denied);
-                try n.wait(ctx.io, located.file, exclusive, cookie, lock, ctx.from);
+                n.wait(ctx.io, located.file, exclusive, cookie, lock, ctx.from) catch |err| switch (err) {
+                    error.TooManyWaiters => return e.enumeration(Stat.denied_nolocks),
+                    else => |other| return other,
+                };
                 try e.enumeration(Stat.blocked);
             },
             .cancel => {
@@ -426,14 +443,25 @@ pub const Nlm = struct {
     }
 
     /// Queues a blocked request, unless the client is just repeating one.
+    /// Fails with `TooManyWaiters` past the limits.
     fn wait(n: *Nlm, io: Io, file: locks_.File, exclusive: bool, cookie: []const u8, lock: LockArgs, address: net.IpAddress) !void {
+        var from_buf: [64]u8 = undefined;
+        const from = nsm_.addressText(address, &from_buf);
         try n.mutex.lock(io);
         defer n.mutex.unlock(io);
+        var from_host: usize = 0;
         for (n.waiters.items) |*w| {
             var buf: [64]u8 = undefined;
-            var from_buf: [64]u8 = undefined;
-            if (std.meta.eql(w.file, file) and w.owner(&buf).eql(lock.owner(nsm_.addressText(address, &from_buf))) and std.meta.eql(w.lock.range(), lock.range())) return;
+            const owner = w.owner(&buf);
+            if (std.meta.eql(w.file, file) and owner.eql(lock.owner(from)) and std.meta.eql(w.lock.range(), lock.range())) return;
+            if (std.mem.eql(u8, owner.address, from)) from_host += 1;
         }
+        for (n.grants.items) |*g| {
+            var buf: [64]u8 = undefined;
+            if (std.mem.eql(u8, g.waiter.owner(&buf).address, from)) from_host += 1;
+        }
+        if (from_host >= n.limits.per_host or n.waiters.items.len + n.grants.items.len >= n.limits.total) return error.TooManyWaiters;
+        try n.waiters.ensureUnusedCapacity(n.gpa, 1);
         var owned: Waiter = .{
             .file = file,
             .exclusive = exclusive,
@@ -443,9 +471,11 @@ pub const Nlm = struct {
         };
         errdefer n.gpa.free(owned.cookie);
         owned.lock.caller_name = try n.gpa.dupe(u8, lock.caller_name);
+        errdefer n.gpa.free(owned.lock.caller_name);
         owned.lock.fh = try n.gpa.dupe(u8, lock.fh);
+        errdefer n.gpa.free(owned.lock.fh);
         owned.lock.oh = try n.gpa.dupe(u8, lock.oh);
-        try n.waiters.append(n.gpa, owned);
+        n.waiters.appendAssumeCapacity(owned);
     }
 
     /// Stops a request waiting; if it was granted unbeknownst to its
@@ -541,7 +571,12 @@ pub const Nlm = struct {
                     const w = &n.waiters.items[i];
                     var buf: [64]u8 = undefined;
                     granted.ensureUnusedCapacity(n.gpa, 1) catch break;
-                    const taken = n.locks.acquire(io, w.file, w.owner(&buf), w.exclusive, w.lock.range()) catch break;
+                    // At a limit, it waits on for room.
+                    const taken = n.nsm.fits(io, w.lock.caller_name, w.address) and
+                        (n.locks.acquire(io, w.file, w.owner(&buf), w.exclusive, w.lock.range()) catch |err| switch (err) {
+                            error.TooManyLocks => false,
+                            else => break,
+                        });
                     if (taken) {
                         granted.appendAssumeCapacity(n.waiters.orderedRemove(i));
                     } else i += 1;
@@ -819,7 +854,7 @@ test "lock, test, block, unlock, and grace" {
     // and free art's locks with FREE_ALL.
     const skynet: server.Context = .{ .io = io, .from = try .parse("127.0.0.66", 9), .protocol = .tcp };
     try testing.expectEqual(Stat.granted, try f.run(skynet, .unlock, (Request{ .who = "art", .svid = 1 }).unlockArgs(&a, h)));
-    try testing.expectEqual(1, f.locks.held.items.len);
+    try testing.expectEqual(1, f.locks.count);
     try testing.expectEqualStrings("127.0.0.1", f.status.hosts.get("art").?);
     var free_all: [max_string + 16]u8 = undefined;
     var fw: Io.Writer = .fixed(&free_all);
@@ -827,7 +862,7 @@ test "lock, test, block, unlock, and grace" {
     try xdr.Encoder.init(&fw).i32_(3);
     var out: [512]u8 = undefined;
     _ = try f.dispatch(skynet, .free_all, fw.buffered(), &out);
-    try testing.expectEqual(1, f.locks.held.items.len);
+    try testing.expectEqual(1, f.locks.count);
 
     // FREE_ALL names are limited as other calls' are.
     fw = .fixed(&free_all);
@@ -928,7 +963,7 @@ test "a holder's downgrade grants what waits" {
     try testing.expectEqual(Stat.blocked, try f.run(ctx, .lock, (Request{ .who = "hal", .svid = 2, .block = true, .exclusive = false }).lockArgs(&a, &f.handle)));
     try testing.expectEqual(Stat.granted, try f.run(ctx, .lock, (Request{ .who = "art", .svid = 1, .exclusive = false }).lockArgs(&a, &f.handle)));
     try testing.expectEqual(0, f.nlm.waiters.items.len);
-    try testing.expectEqual(2, f.locks.held.items.len);
+    try testing.expectEqual(2, f.locks.count);
 }
 
 test "a failure granting leaves waiters waiting" {
@@ -945,12 +980,12 @@ test "a failure granting leaves waiters waiting" {
     f.nlm.gpa = failing.allocator();
     try testing.expectEqual(Stat.granted, try f.run(ctx, .unlock, (Request{ .who = "art", .svid = 1 }).unlockArgs(&a, &f.handle)));
     try testing.expectEqual(1, f.nlm.waiters.items.len);
-    try testing.expectEqual(0, f.locks.held.items.len);
+    try testing.expectEqual(0, f.locks.count);
 
     f.nlm.gpa = testing.allocator;
     try f.nlm.wake(io);
     try testing.expectEqual(0, f.nlm.waiters.items.len);
-    try testing.expectEqual(1, f.locks.held.items.len);
+    try testing.expectEqual(1, f.locks.count);
 }
 
 test "GRANTED_MSG goes again until confirmed, and its lock goes if never" {
@@ -1037,4 +1072,41 @@ test "a client cancelling a grant it never heard of releases it" {
     try testing.expectEqual(1, f.nlm.grants.items.len);
     try testing.expectEqual(Stat.granted, try f.run(ctx, .lock, hal.lockArgs(&a, &f.handle)));
     try testing.expectEqual(0, f.nlm.grants.items.len);
+}
+
+test "limits refuse with denied_nolocks" {
+    const io = testing.io;
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    f.locks.limits = .{ .per_host = 2, .total = 3 };
+    f.nlm.limits = .{ .per_host = 1, .total = 2 };
+    f.status.limits = .{ .per_address = 2, .total = 16 };
+    const skynet: server.Context = .{ .io = io, .from = try .parse("127.0.0.66", 9), .protocol = .tcp };
+    const hal: server.Context = .{ .io = io, .from = try .parse("127.0.0.12", 9), .protocol = .tcp };
+    const art: server.Context = .{ .io = io, .from = try .parse("127.0.0.11", 9), .protocol = .tcp };
+    var a: [512]u8 = undefined;
+
+    // Locks, per address and in all.
+    try testing.expectEqual(Stat.granted, try f.run(skynet, .lock, (Request{ .who = "skynet", .svid = 1, .len = 1 }).lockArgs(&a, &f.handle)));
+    try testing.expectEqual(Stat.granted, try f.run(skynet, .lock, (Request{ .who = "skynet", .svid = 1, .offset = 2, .len = 1 }).lockArgs(&a, &f.handle)));
+    try testing.expectEqual(Stat.denied_nolocks, try f.run(skynet, .lock, (Request{ .who = "skynet", .svid = 1, .offset = 4, .len = 1 }).lockArgs(&a, &f.handle)));
+    try testing.expectEqual(Stat.granted, try f.run(hal, .lock, (Request{ .who = "hal", .svid = 1, .offset = 10, .len = 1 }).lockArgs(&a, &f.handle)));
+    try testing.expectEqual(Stat.denied_nolocks, try f.run(art, .lock, (Request{ .who = "art", .svid = 1, .offset = 20, .len = 1 }).lockArgs(&a, &f.handle)));
+    try testing.expectEqual(3, f.locks.count);
+
+    // Waiters, per address and in all.
+    try testing.expectEqual(Stat.blocked, try f.run(art, .lock, (Request{ .who = "art", .svid = 1, .block = true, .len = 1 }).lockArgs(&a, &f.handle)));
+    try testing.expectEqual(Stat.denied_nolocks, try f.run(art, .lock, (Request{ .who = "art", .svid = 1, .block = true, .offset = 2, .len = 1 }).lockArgs(&a, &f.handle)));
+    try testing.expectEqual(Stat.blocked, try f.run(hal, .lock, (Request{ .who = "hal", .svid = 1, .block = true, .len = 1 }).lockArgs(&a, &f.handle)));
+    try testing.expectEqual(Stat.denied_nolocks, try f.run(skynet, .lock, (Request{ .who = "skynet", .svid = 2, .block = true, .offset = 10, .len = 1 }).lockArgs(&a, &f.handle)));
+    try testing.expectEqual(2, f.nlm.waiters.items.len);
+
+    // Monitored names, per address.
+    f.locks.limits = .{};
+    try testing.expectEqual(2, try f.nlm.releaseHost(io, "skynet", null));
+    try testing.expectEqual(Stat.granted, try f.run(skynet, .lock, (Request{ .who = "skynet1", .svid = 1, .offset = 30, .len = 1 }).lockArgs(&a, &f.handle)));
+    try testing.expectEqual(Stat.granted, try f.run(skynet, .lock, (Request{ .who = "skynet2", .svid = 1, .offset = 40, .len = 1 }).lockArgs(&a, &f.handle)));
+    try testing.expectEqual(Stat.denied_nolocks, try f.run(skynet, .lock, (Request{ .who = "skynet3", .svid = 1, .offset = 50, .len = 1 }).lockArgs(&a, &f.handle)));
+    try testing.expect(!try f.locks.hostHolds(io, "skynet3"));
 }

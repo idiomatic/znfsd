@@ -47,8 +47,17 @@ pub const Rebooted = struct {
     call: *const fn (ptr: *anyopaque, io: Io, name: []const u8, address: []const u8) void,
 };
 
+/// How many hosts may be monitored, as each is kept in the store too.
+pub const Limits = struct {
+    /// Names monitored at any one address.
+    per_address: usize = 16,
+    /// In all.
+    total: usize = 16384,
+};
+
 pub const Nsm = struct {
     gpa: std.mem.Allocator,
+    limits: Limits = .{},
     /// This server's state number: odd while up, advanced at each start.
     state: u32,
     store: ?Store = null,
@@ -74,13 +83,15 @@ pub const Nsm = struct {
         return .{ .prog = prog, .low = vers, .high = vers, .ptr = n, .handle = handle };
     }
 
-    /// Records that `name`, at `address`, holds locks.
+    /// Records that `name`, at `address`, holds locks. Fails with
+    /// `TooManyHosts` past the limits.
     pub fn monitor(n: *Nsm, io: Io, name: []const u8, address: net.IpAddress) !void {
         var buf: [64]u8 = undefined;
         const text = addressText(address, &buf);
         try n.mutex.lock(io);
         defer n.mutex.unlock(io);
         if (n.hosts.get(name)) |existing| if (std.mem.eql(u8, existing, text)) return;
+        if (!n.fitsLocked(name, text)) return error.TooManyHosts;
         const gop = try n.hosts.getOrPut(n.gpa, name);
         if (gop.found_existing) {
             n.gpa.free(gop.value_ptr.*);
@@ -92,6 +103,27 @@ pub const Nsm = struct {
         }
         gop.value_ptr.* = try n.gpa.dupe(u8, text);
         if (n.store) |s| s.monitor(s.ptr, .{ .name = name, .address = text });
+    }
+
+    /// Whether monitoring `name` at `address` stays within the limits.
+    pub fn fits(n: *Nsm, io: Io, name: []const u8, address: net.IpAddress) bool {
+        var buf: [64]u8 = undefined;
+        const text = addressText(address, &buf);
+        n.mutex.lock(io) catch return false;
+        defer n.mutex.unlock(io);
+        return n.fitsLocked(name, text);
+    }
+
+    fn fitsLocked(n: *const Nsm, name: []const u8, address: []const u8) bool {
+        const existing = n.hosts.get(name);
+        if (existing) |at| if (std.mem.eql(u8, at, address)) return true;
+        if (existing == null and n.hosts.count() >= n.limits.total) return false;
+        var at_address: usize = 0;
+        var it = n.hosts.valueIterator();
+        while (it.next()) |at| {
+            if (std.mem.eql(u8, at.*, address)) at_address += 1;
+        }
+        return at_address < n.limits.per_address;
     }
 
     /// Whether `name` is monitored at `address`, the only place requests
@@ -297,4 +329,21 @@ test "monitor, and release a host that reports a restart" {
     try testing.expectEqualStrings("art", seen.last[0..seen.last_len]);
     try testing.expect(!n.hosts.contains("art"));
     try testing.expect(n.hosts.contains("hal"));
+}
+
+test "monitor only so many hosts" {
+    const io = testing.io;
+    var n: Nsm = .init(testing.allocator, 3);
+    defer n.deinit();
+    n.limits = .{ .per_address = 2, .total = 3 };
+    const skynet: net.IpAddress = try .parse("192.168.213.66", 0);
+    try n.monitor(io, "skynet1", skynet);
+    try n.monitor(io, "skynet2", skynet);
+    try testing.expect(!n.fits(io, "skynet3", skynet));
+    try testing.expectError(error.TooManyHosts, n.monitor(io, "skynet3", skynet));
+    try n.monitor(io, "skynet2", skynet);
+    try n.monitor(io, "hal", try .parse("192.168.213.12", 0));
+    try testing.expectError(error.TooManyHosts, n.monitor(io, "art", try .parse("192.168.213.11", 0)));
+    try n.unmonitor(io, "skynet1");
+    try n.monitor(io, "art", try .parse("192.168.213.11", 0));
 }

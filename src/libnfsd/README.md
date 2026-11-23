@@ -185,6 +185,7 @@ File handles are 36 bytes: format version, export ID (a hash of the export path)
 * UDP replies: 65,535 bytes, so large reads need TCP.
 * Callers' supplementary groups: 16, as AUTH_SYS carries.
 * NLM callbacks: 64 in flight (`nlm.max_callbacks`); more are dropped, as lost datagrams would be.
+* Locks: 4096 per client address and 32768 in all (`Locks.limits`); blocked requests, with grants awaiting confirmation, 64 and 1024 (`Nlm.limits`); monitored hosts, 16 names per address and 16384 in all (`Nsm.limits`). Past any, NLM answers `denied_nolocks`. Set the fields before serving to change them.
 
 ## Not yet
 

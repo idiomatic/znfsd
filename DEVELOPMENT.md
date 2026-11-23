@@ -78,10 +78,6 @@ Each covers only what changed since the commit it last looked at.
 
 From the code review of `ee622cc`; each leaves this list when fixed or accepted as a limit.
 
-### Medium
-
-* **No limits on locks, waiters, or monitored hosts:** each grows per request ([locks.zig:59](src/libnfsd/locks.zig:59), [nlm.zig:125](src/libnfsd/nlm.zig:125), [nsm.zig:57](src/libnfsd/nsm.zig:57)), monitored hosts persist, and coalescing is quadratic. Cap them per host and overall (`denied_nolocks`); index locks by file.
-
 ### Low
 
 * **UMNT misses canonicalized records:** MNT stores the canonical path, UMNT matches the client's ([mount.zig:153](src/libnfsd/mount.zig:153)), so `/srv/share/` stays mounted. Canonicalize in UMNT.

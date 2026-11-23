@@ -69,32 +69,95 @@ pub const Lock = struct {
     range: Range,
 };
 
+/// How many locks may be held, so no client can exhaust the server's memory.
+pub const Limits = struct {
+    /// From any one client address.
+    per_host: usize = 4096,
+    /// In all.
+    total: usize = 32768,
+};
+
 pub const Locks = struct {
     gpa: std.mem.Allocator,
+    limits: Limits = .{},
     mutex: Io.Mutex = .init,
-    /// Every lock, owning its owner's strings.
-    held: std.ArrayList(Lock) = .empty,
+    /// Each file's locks, owning their owners' strings; no file's list is
+    /// empty. An owner's locks on a file never overlap.
+    files: std.AutoHashMapUnmanaged(File, std.ArrayList(Lock)) = .empty,
+    /// How many locks are held in all, under each host name, and from each
+    /// address; the maps own their keys, and hold no zeros.
+    count: usize = 0,
+    by_name: std.StringHashMapUnmanaged(usize) = .empty,
+    by_address: std.StringHashMapUnmanaged(usize) = .empty,
+
+    pub const Error = error{TooManyLocks} || std.mem.Allocator.Error || Io.Cancelable;
 
     pub fn init(gpa: std.mem.Allocator) Locks {
         return .{ .gpa = gpa };
     }
 
     pub fn deinit(l: *Locks) void {
-        for (l.held.items) |lock| l.free(lock);
-        l.held.deinit(l.gpa);
+        var it = l.files.valueIterator();
+        while (it.next()) |list| {
+            for (list.items) |lock| l.free(lock);
+            list.deinit(l.gpa);
+        }
+        l.files.deinit(l.gpa);
+        inline for (.{ &l.by_name, &l.by_address }) |counts| {
+            var keys = counts.keyIterator();
+            while (keys.next()) |k| l.gpa.free(k.*);
+            counts.deinit(l.gpa);
+        }
     }
 
     fn free(l: *Locks, lock: Lock) void {
-        l.gpa.free(lock.owner.host);
-        l.gpa.free(lock.owner.address);
-        l.gpa.free(lock.owner.oh);
+        l.freeOwner(lock.owner);
+    }
+
+    fn freeOwner(l: *Locks, o: Owner) void {
+        l.gpa.free(o.host);
+        l.gpa.free(o.address);
+        l.gpa.free(o.oh);
+    }
+
+    /// Makes room to count one more of `owner`'s locks.
+    fn reserve(l: *Locks, owner: Owner) std.mem.Allocator.Error!void {
+        try l.by_name.ensureUnusedCapacity(l.gpa, 1);
+        try l.by_address.ensureUnusedCapacity(l.gpa, 1);
+        const name = if (l.by_name.contains(owner.host)) null else try l.gpa.dupe(u8, owner.host);
+        errdefer if (name) |x| l.gpa.free(x);
+        const address = if (l.by_address.contains(owner.address)) null else try l.gpa.dupe(u8, owner.address);
+        if (name) |x| l.by_name.putAssumeCapacityNoClobber(x, 0);
+        if (address) |x| l.by_address.putAssumeCapacityNoClobber(x, 0);
+    }
+
+    /// Counts a lock added, after `reserve`.
+    fn counted(l: *Locks, owner: Owner) void {
+        l.count += 1;
+        l.by_name.getPtr(owner.host).?.* += 1;
+        l.by_address.getPtr(owner.address).?.* += 1;
+    }
+
+    /// Counts a lock removed, or none after `reserve`.
+    fn uncounted(l: *Locks, owner: Owner, n: usize) void {
+        l.count -= n;
+        inline for (.{ .{ &l.by_name, owner.host }, .{ &l.by_address, owner.address } }) |pair| {
+            const entry = pair[0].getEntry(pair[1]).?;
+            entry.value_ptr.* -= n;
+            if (entry.value_ptr.* == 0) {
+                const key = entry.key_ptr.*;
+                pair[0].removeByPtr(entry.key_ptr);
+                l.gpa.free(key);
+            }
+        }
     }
 
     /// The first lock another owner holds that conflicts with this request.
     /// The result's strings are valid until the next change.
     fn conflictLocked(l: *const Locks, file: File, owner: Owner, exclusive: bool, range: Range) ?Lock {
-        for (l.held.items) |h| {
-            if (!std.meta.eql(h.file, file) or h.owner.eql(owner) or !h.range.overlaps(range)) continue;
+        const list = l.files.get(file) orelse return null;
+        for (list.items) |h| {
+            if (h.owner.eql(owner) or !h.range.overlaps(range)) continue;
             if (exclusive or h.exclusive) return h;
         }
         return null;
@@ -110,21 +173,55 @@ pub const Locks = struct {
     }
 
     /// Takes the lock unless another owner's conflicts; returns whether it
-    /// was taken. The owner's own locks over the range are replaced.
-    pub fn acquire(l: *Locks, io: Io, file: File, owner: Owner, exclusive: bool, range: Range) !bool {
+    /// was taken. The owner's own locks over the range are replaced. Fails
+    /// with `TooManyLocks` at the owner's address's limit, or the total.
+    pub fn acquire(l: *Locks, io: Io, file: File, owner: Owner, exclusive: bool, range: Range) Error!bool {
         try l.mutex.lock(io);
         defer l.mutex.unlock(io);
         if (l.conflictLocked(file, owner, exclusive, range) != null) return false;
-        try l.removeLocked(file, owner, range);
-        const lock: Lock = .{
+        if (l.count >= l.limits.total or (l.by_address.get(owner.address) orelse 0) >= l.limits.per_host)
+            return error.TooManyLocks;
+
+        // Everything that can fail comes first: the new lock, and a spare
+        // for splitting one the range falls inside.
+        try l.reserve(owner);
+        errdefer l.uncounted(owner, 0);
+        const gop = try l.files.getOrPut(l.gpa, file);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        errdefer if (gop.value_ptr.items.len == 0) {
+            gop.value_ptr.deinit(l.gpa);
+            l.files.removeByPtr(gop.key_ptr);
+        };
+        const list = gop.value_ptr;
+        try list.ensureUnusedCapacity(l.gpa, 2);
+        var lock: Lock = .{
             .file = file,
             .owner = try owner.dupe(l.gpa),
             .exclusive = exclusive,
             .range = range,
         };
         errdefer l.free(lock);
-        try l.held.append(l.gpa, lock);
-        l.coalesceLocked(file, owner);
+        var spare: ?Owner = try owner.dupe(l.gpa);
+        defer if (spare) |o| l.freeOwner(o);
+
+        // Counted first, so removing the owner's others never drops its
+        // counts to zero.
+        l.counted(owner);
+        l.removeLocked(list, owner, range, &spare);
+        // Join neighbors of the same kind; the owner's locks don't overlap,
+        // so at most one ends where this starts, and one starts where it ends.
+        var i: usize = 0;
+        while (i < list.items.len) {
+            const h = list.items[i];
+            if (h.exclusive != exclusive or !h.owner.eql(owner) or (h.range.end != lock.range.start and h.range.start != lock.range.end)) {
+                i += 1;
+                continue;
+            }
+            lock.range = .{ .start = @min(h.range.start, lock.range.start), .end = @max(h.range.end, lock.range.end) };
+            l.free(list.swapRemove(i));
+            l.uncounted(owner, 1);
+        }
+        list.appendAssumeCapacity(lock);
         return true;
     }
 
@@ -133,14 +230,25 @@ pub const Locks = struct {
     pub fn release(l: *Locks, io: Io, file: File, owner: Owner, range: Range) !void {
         try l.mutex.lock(io);
         defer l.mutex.unlock(io);
-        try l.removeLocked(file, owner, range);
+        const list = l.files.getPtr(file) orelse return;
+        try list.ensureUnusedCapacity(l.gpa, 1);
+        var spare: ?Owner = try owner.dupe(l.gpa);
+        defer if (spare) |o| l.freeOwner(o);
+        l.removeLocked(list, owner, range, &spare);
+        if (list.items.len == 0) {
+            list.deinit(l.gpa);
+            _ = l.files.remove(file);
+        }
     }
 
-    fn removeLocked(l: *Locks, file: File, owner: Owner, range: Range) !void {
+    /// Removes the owner's locks over `range` from a file's `list`. A lock
+    /// the range falls inside splits in two, taking `spare` for the second
+    /// part's owner, with room for it in `list`.
+    fn removeLocked(l: *Locks, list: *std.ArrayList(Lock), owner: Owner, range: Range, spare: *?Owner) void {
         var i: usize = 0;
-        while (i < l.held.items.len) {
-            const h = l.held.items[i];
-            if (!std.meta.eql(h.file, file) or !h.owner.eql(owner) or !h.range.overlaps(range)) {
+        while (i < list.items.len) {
+            const h = list.items[i];
+            if (!h.owner.eql(owner) or !h.range.overlaps(range)) {
                 i += 1;
                 continue;
             }
@@ -150,40 +258,22 @@ pub const Locks = struct {
                 // Split: keep the part before here, add the part after.
                 var tail = h;
                 tail.range.start = range.end;
-                tail.owner = try h.owner.dupe(l.gpa);
-                l.held.items[i].range.end = range.start;
-                l.held.append(l.gpa, tail) catch |err| {
-                    l.free(tail);
-                    return err;
-                };
-                i += 1;
+                tail.owner = spare.*.?;
+                spare.* = null;
+                list.items[i].range.end = range.start;
+                list.appendAssumeCapacity(tail);
+                l.counted(owner);
+                // Only the owner's one lock can hold the whole range.
+                return;
             } else if (before) {
-                l.held.items[i].range.end = range.start;
+                list.items[i].range.end = range.start;
                 i += 1;
             } else if (after) {
-                l.held.items[i].range.start = range.end;
+                list.items[i].range.start = range.end;
                 i += 1;
             } else {
-                l.free(l.held.swapRemove(i));
-            }
-        }
-    }
-
-    /// Joins the owner's adjacent or overlapping locks of the same kind.
-    fn coalesceLocked(l: *Locks, file: File, owner: Owner) void {
-        var changed = true;
-        while (changed) {
-            changed = false;
-            outer: for (l.held.items, 0..) |a, i| {
-                if (!std.meta.eql(a.file, file) or !a.owner.eql(owner)) continue;
-                for (l.held.items[i + 1 ..], i + 1..) |b, j| {
-                    if (!std.meta.eql(b.file, file) or !b.owner.eql(owner) or a.exclusive != b.exclusive) continue;
-                    if (a.range.end < b.range.start or b.range.end < a.range.start) continue;
-                    l.held.items[i].range = .{ .start = @min(a.range.start, b.range.start), .end = @max(a.range.end, b.range.end) };
-                    l.free(l.held.swapRemove(j));
-                    changed = true;
-                    break :outer;
-                }
+                l.free(list.swapRemove(i));
+                l.uncounted(owner, 1);
             }
         }
     }
@@ -193,29 +283,61 @@ pub const Locks = struct {
     pub fn releaseHost(l: *Locks, io: Io, host: []const u8, file: ?File) !usize {
         try l.mutex.lock(io);
         defer l.mutex.unlock(io);
-        var n: usize = 0;
-        var i: usize = 0;
-        while (i < l.held.items.len) {
-            const h = l.held.items[i];
-            if (std.mem.eql(u8, h.owner.host, host) and (file == null or std.meta.eql(h.file, file.?))) {
-                l.free(l.held.swapRemove(i));
-                n += 1;
-            } else i += 1;
-        }
-        return n;
+        const Match = struct {
+            host: []const u8,
+            fn matches(m: @This(), o: Owner) bool {
+                return std.mem.eql(u8, o.host, m.host);
+            }
+        };
+        if (file) |f| return l.releaseWhereIn(f, Match{ .host = host });
+        return l.releaseWhere(Match{ .host = host });
     }
 
     /// Releases every lock `host` holds from `address`; returns how many.
     pub fn releaseHostAt(l: *Locks, io: Io, host: []const u8, address: []const u8) !usize {
         try l.mutex.lock(io);
         defer l.mutex.unlock(io);
+        const Match = struct {
+            host: []const u8,
+            address: []const u8,
+            fn matches(m: @This(), o: Owner) bool {
+                return o.of(m.host, m.address);
+            }
+        };
+        return l.releaseWhere(Match{ .host = host, .address = address });
+    }
+
+    /// Releases every lock whose owner `match.matches`; returns how many.
+    fn releaseWhere(l: *Locks, match: anytype) usize {
+        var n: usize = 0;
+        var it = l.files.iterator();
+        // Removing entries leaves the iterator valid.
+        while (it.next()) |e| n += l.releaseFrom(e.key_ptr, e.value_ptr, match);
+        return n;
+    }
+
+    /// Releases the locks on `file` whose owner `match.matches`; returns
+    /// how many.
+    fn releaseWhereIn(l: *Locks, file: File, match: anytype) usize {
+        const entry = l.files.getEntry(file) orelse return 0;
+        return l.releaseFrom(entry.key_ptr, entry.value_ptr, match);
+    }
+
+    /// Releases from one file's `list`, forgetting the file if none are left.
+    fn releaseFrom(l: *Locks, key: *File, list: *std.ArrayList(Lock), match: anytype) usize {
         var n: usize = 0;
         var i: usize = 0;
-        while (i < l.held.items.len) {
-            if (l.held.items[i].owner.of(host, address)) {
-                l.free(l.held.swapRemove(i));
+        while (i < list.items.len) {
+            if (match.matches(list.items[i].owner)) {
+                const lock = list.swapRemove(i);
+                l.uncounted(lock.owner, 1);
+                l.free(lock);
                 n += 1;
             } else i += 1;
+        }
+        if (list.items.len == 0) {
+            list.deinit(l.gpa);
+            l.files.removeByPtr(key);
         }
         return n;
     }
@@ -224,27 +346,38 @@ pub const Locks = struct {
     pub fn hostHolds(l: *Locks, io: Io, host: []const u8) !bool {
         try l.mutex.lock(io);
         defer l.mutex.unlock(io);
-        for (l.held.items) |h| if (std.mem.eql(u8, h.owner.host, host)) return true;
-        return false;
+        return l.by_name.contains(host);
     }
 
     /// Whether `host` holds any lock from `address`.
     pub fn hostHoldsAt(l: *Locks, io: Io, host: []const u8, address: []const u8) !bool {
         try l.mutex.lock(io);
         defer l.mutex.unlock(io);
-        for (l.held.items) |h| if (h.owner.of(host, address)) return true;
+        if (!l.by_name.contains(host) or !l.by_address.contains(address)) return false;
+        var it = l.files.valueIterator();
+        while (it.next()) |list| for (list.items) |h| if (h.owner.of(host, address)) return true;
         return false;
+    }
+
+    /// How many locks are held.
+    pub fn len(l: *Locks, io: Io) !usize {
+        try l.mutex.lock(io);
+        defer l.mutex.unlock(io);
+        return l.count;
     }
 
     /// A copy of every lock, in `arena`.
     pub fn snapshot(l: *Locks, io: Io, arena: std.mem.Allocator) ![]Lock {
         try l.mutex.lock(io);
         defer l.mutex.unlock(io);
-        const out = try arena.alloc(Lock, l.held.items.len);
-        for (l.held.items, out) |h, *o| {
-            o.* = h;
-            o.owner = try h.owner.dupe(arena);
-        }
+        const out = try arena.alloc(Lock, l.count);
+        var n: usize = 0;
+        var it = l.files.valueIterator();
+        while (it.next()) |list| for (list.items) |h| {
+            out[n] = h;
+            out[n].owner = try h.owner.dupe(arena);
+            n += 1;
+        };
         return out;
     }
 };
@@ -280,15 +413,15 @@ test "an owner's locks split, merge, and change kind" {
     try testing.expect(try l.acquire(io, file_a, hal, true, .fromLength(0, 100)));
     // Downgrading the middle leaves exclusive 0-40 and 60-100.
     try testing.expect(try l.acquire(io, file_a, hal, false, .fromLength(40, 20)));
-    try testing.expectEqual(3, l.held.items.len);
+    try testing.expectEqual(3, l.count);
     try testing.expect(try l.acquire(io, file_a, art, false, .fromLength(45, 10)));
     try testing.expect(!try l.acquire(io, file_a, art, false, .fromLength(30, 20)));
 
     try l.release(io, file_a, hal, .fromLength(0, 0));
-    try testing.expectEqual(1, l.held.items.len);
+    try testing.expectEqual(1, l.count);
     try testing.expect(try l.acquire(io, file_a, art, false, .fromLength(55, 10)));
-    try testing.expectEqual(1, l.held.items.len); // merged with 45-55
-    try testing.expectEqual(Range{ .start = 45, .end = 65 }, l.held.items[0].range);
+    try testing.expectEqual(1, l.count); // merged with 45-55
+    try testing.expectEqual(Range{ .start = 45, .end = 65 }, l.files.get(file_a).?.items[0].range);
 }
 
 test "release a host's locks" {
@@ -302,7 +435,7 @@ test "release a host's locks" {
     try testing.expect(try l.hostHolds(io, "hal"));
     try testing.expectEqual(1, try l.releaseHost(io, "hal", null));
     try testing.expect(!try l.hostHolds(io, "hal"));
-    try testing.expectEqual(1, l.held.items.len);
+    try testing.expectEqual(1, l.count);
 }
 
 test "only the owner's own address releases its locks" {
@@ -318,7 +451,41 @@ test "only the owner's own address releases its locks" {
     try testing.expect(try l.hostHoldsAt(io, "art", art.address));
     try testing.expect(!try l.hostHoldsAt(io, "art", skynet.address));
     try testing.expectEqual(1, try l.releaseHostAt(io, "art", art.address));
-    try testing.expectEqual(0, l.held.items.len);
+    try testing.expectEqual(0, l.count);
+}
+
+test "limits, per address and in all" {
+    const io = testing.io;
+    var l: Locks = .init(testing.allocator);
+    defer l.deinit();
+    l.limits = .{ .per_host = 2, .total = 3 };
+    try testing.expect(try l.acquire(io, file_a, hal, true, .fromLength(0, 10)));
+    try testing.expect(try l.acquire(io, file_b, hal, true, .fromLength(0, 10)));
+    try testing.expectError(error.TooManyLocks, l.acquire(io, file_a, hal, true, .fromLength(20, 10)));
+    // A host at its limit can still split its locks by releasing.
+    try l.release(io, file_a, hal, .fromLength(4, 2));
+    try testing.expectEqual(3, l.count);
+    try testing.expectError(error.TooManyLocks, l.acquire(io, file_a, art, true, .fromLength(20, 10)));
+    try testing.expectEqual(3, try l.releaseHost(io, "hal", null));
+    try testing.expectEqual(0, l.files.count());
+    try testing.expectEqual(0, l.by_name.count());
+    try testing.expectEqual(0, l.by_address.count());
+    try testing.expect(try l.acquire(io, file_a, art, true, .fromLength(20, 10)));
+}
+
+test "many locks on many files stay quick" {
+    const io = testing.io;
+    var l: Locks = .init(testing.allocator);
+    defer l.deinit();
+    l.limits = .{ .per_host = 1 << 20, .total = 1 << 20 };
+    // Each is its own file's; coalescing and lookups touch only that file's.
+    for (0..20000) |i| {
+        const f: File = .{ .fsid = @splat(1), .inode = i };
+        try testing.expect(try l.acquire(io, f, hal, true, .fromLength(0, 10)));
+        try testing.expect(try l.acquire(io, f, hal, true, .fromLength(10, 10)));
+    }
+    try testing.expectEqual(20000, l.count);
+    try testing.expect(try l.hostHolds(io, "hal"));
 }
 
 test "ranges from offsets and lengths" {
