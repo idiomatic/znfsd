@@ -133,16 +133,59 @@ pub fn serveUdp(io: Io, gpa: std.mem.Allocator, programs: []const Program, socke
 
 /// How TCP connections, accepted or adopted, are served.
 pub const ConnectionOptions = struct {
-    /// Largest record accepted.
+    /// Largest record accepted, and the room each reply gets.
     max_record: usize = 1024 * 1024 + 4096,
     /// Calls answered at once on one connection; their replies may go out
-    /// in any order, matched by XID. Each can hold two records' worth of
-    /// buffers.
+    /// in any order, matched by XID. Each holds up to two records' worth of
+    /// buffers while it runs.
     max_calls: usize = 16,
     /// Connections open at once on a listener; more are closed unserved.
     max_connections: usize = 1024,
+    /// How long a reply may take to write before the connection is closed,
+    /// as when the peer stops reading.
+    write_timeout: Io.Duration = .fromSeconds(120),
+    /// What the connection's calls take their buffers from.
+    pool: *Pool = &Pool.process,
     /// Told of every call answered.
     observer: ?*const Observer = null,
+};
+
+/// A budget for calls' buffers, shared by the connections that name it.
+pub const Pool = struct {
+    /// Bytes held at once by calls, beyond the small record buffers slots
+    /// keep; a call waits for room, though one alone may exceed it.
+    max_bytes: usize = 256 * 1024 * 1024,
+    mutex: Io.Mutex = .init,
+    room: Io.Condition = .init,
+    held: usize = 0,
+
+    /// Shared by connections whose options name no other pool.
+    pub var process: Pool = .{};
+
+    /// Waits for room for `bytes`, then holds them.
+    fn reserve(p: *Pool, io: Io, bytes: usize, timeout: Io.Timeout) (Io.Cancelable || Io.Timeout.Error)!void {
+        try p.mutex.lock(io);
+        defer p.mutex.unlock(io);
+        const deadline = timeout.toDeadline(io);
+        while (p.held != 0 and p.held + bytes > p.max_bytes) try p.room.waitTimeout(io, &p.mutex, deadline);
+        p.held += bytes;
+    }
+
+    /// Holds `bytes` without waiting, for a call already holding some, so
+    /// that calls part read can't wait on each other.
+    fn overdraw(p: *Pool, io: Io, bytes: usize) void {
+        p.mutex.lockUncancelable(io);
+        defer p.mutex.unlock(io);
+        p.held += bytes;
+    }
+
+    fn release(p: *Pool, io: Io, bytes: usize) void {
+        if (bytes == 0) return;
+        p.mutex.lockUncancelable(io);
+        defer p.mutex.unlock(io);
+        p.held -= bytes;
+        p.room.broadcast(io);
+    }
 };
 
 /// Serves RPC over TCP on `listener` until canceled, one task per connection.
@@ -184,24 +227,61 @@ fn counted(open: *std.atomic.Value(usize), io: Io, gpa: std.mem.Allocator, progr
     return serveConnection(io, gpa, programs, stream, options);
 }
 
-/// A call's buffers: its record, and room for its reply.
+/// Record buffers up to this size outlive their calls, for the next, and
+/// aren't counted against the pool.
+const kept_record = 4096;
+
+/// A call's buffers: its record, and room for its reply. Both are sized
+/// and reserved from the pool once the record's length is known, and
+/// freed when the call ends, but a small record buffer is kept.
 const Slot = struct {
     busy: std.atomic.Value(bool) = .init(false),
     message: std.ArrayList(u8) = .empty,
     out: []u8 = &.{},
+    /// Bytes reserved from the pool.
+    held: usize = 0,
 
-    /// Allocates both buffers whole, so reading a record never allocates.
-    /// An allocator may wait on a cancelable lock and drop the cancelation
-    /// (`DebugAllocator`'s stack traces do, on macOS), which would leave
-    /// the next read deaf to it, so cancelation is blocked meanwhile.
-    /// Needless from the Zig release after 0.17.1, which has
-    /// https://codeberg.org/ziglang/zig/pulls/36010.
-    fn allocate(slot: *Slot, io: Io, gpa: std.mem.Allocator, size: usize) std.mem.Allocator.Error!void {
+    // An allocator may wait on a cancelable lock and drop the cancelation
+    // (`DebugAllocator`'s stack traces do, on macOS), which would leave the
+    // next read or write deaf to it, so these allocate and free with
+    // cancelation blocked. Needless from the Zig release after 0.17.1,
+    // which has https://codeberg.org/ziglang/zig/pulls/36010.
+
+    /// Grows the record buffer to hold exactly `capacity` bytes, if smaller.
+    fn grow(slot: *Slot, io: Io, gpa: std.mem.Allocator, capacity: usize) std.mem.Allocator.Error!void {
         const protection = io.swapCancelProtection(.blocked);
         defer _ = io.swapCancelProtection(protection);
-        try slot.message.ensureTotalCapacityPrecise(gpa, size);
+        try slot.message.ensureTotalCapacityPrecise(gpa, capacity);
+    }
+
+    fn allocateReply(slot: *Slot, io: Io, gpa: std.mem.Allocator, size: usize) std.mem.Allocator.Error!void {
+        const protection = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(protection);
         slot.out = try gpa.alloc(u8, size);
     }
+
+    /// Frees the call's buffers but a small record buffer, and returns
+    /// what they held to the pool.
+    fn finish(slot: *Slot, io: Io, gpa: std.mem.Allocator, pool: *Pool) void {
+        const protection = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(protection);
+        gpa.free(slot.out);
+        slot.out = &.{};
+        if (slot.message.capacity > kept_record) slot.message.clearAndFree(gpa);
+        pool.release(io, slot.held);
+        slot.held = 0;
+    }
+};
+
+/// Pool bytes a record buffer of `capacity` holds.
+fn recordHeld(capacity: usize) usize {
+    return if (capacity > kept_record) capacity else 0;
+}
+
+/// Why a connection is closed while the peer is still there.
+const Stale = error{
+    /// A reply took longer than `write_timeout` to write.
+    ReplyStalled,
 };
 
 /// One connection's state, shared by its reader and its calls.
@@ -209,24 +289,63 @@ const Connection = struct {
     io: Io,
     gpa: std.mem.Allocator,
     programs: []const Program,
+    options: ConnectionOptions,
     ctx: Context,
     stream: net.Stream,
     writer: *Io.Writer,
     /// Keeps replies whole.
     write_lock: Io.Mutex = .init,
+    /// When the reply being written began, in awake-clock nanoseconds, or
+    /// 0 when none is.
+    writing_since: std.atomic.Value(i64) = .init(0),
     /// Slots not busy.
     free: Io.Semaphore,
     slots: []Slot,
 
+    /// Reads a record into `slot`, first reserving its buffers.
+    fn readRecord(c: *Connection, r: *Io.Reader, slot: *Slot) (Io.Reader.Error || error{ RecordTooLong, OutOfMemory } || Stale || Io.Cancelable)!void {
+        slot.message.clearRetainingCapacity();
+        const pool = c.options.pool;
+        var first = true;
+        while (true) : (first = false) {
+            const header = try r.takeInt(u32, .big);
+            const size = slot.message.items.len + (header & ~rpc.record.last_fragment);
+            if (size > c.options.max_record) return error.RecordTooLong;
+            if (first) {
+                // Room for the reply, and for a record of one fragment.
+                const held = c.options.max_record + recordHeld(@max(size, slot.message.capacity));
+                try c.reserve(held);
+                slot.held = held;
+                try slot.grow(c.io, c.gpa, size);
+            } else if (size > slot.message.capacity) {
+                // More fragments grow the buffer geometrically, so tiny ones
+                // can't make reading quadratic.
+                try slot.grow(c.io, c.gpa, @min(c.options.max_record, @max(size, slot.message.capacity * 2)));
+                const held = c.options.max_record + recordHeld(slot.message.capacity);
+                pool.overdraw(c.io, held - slot.held);
+                slot.held = held;
+            }
+            try r.readSliceAll(slot.message.addManyAsSliceAssumeCapacity(size - slot.message.items.len));
+            if (header & rpc.record.last_fragment != 0) return;
+        }
+    }
+
     /// Answers the call in `slot`, then frees the slot.
     fn answer(c: *Connection, slot: *Slot) Io.Cancelable!void {
         defer {
+            slot.finish(c.io, c.gpa, c.options.pool);
             slot.busy.store(false, .release);
             c.free.post(c.io);
         }
+        slot.allocateReply(c.io, c.gpa, c.options.max_record) catch {
+            log.warn("tcp: out of memory", .{});
+            return c.broken();
+        };
         const reply = dispatch(c.programs, c.ctx, slot.message.items, slot.out) orelse return;
         try c.write_lock.lock(c.io);
         defer c.write_lock.unlock(c.io);
+        c.writing_since.store(now(c.io), .monotonic);
+        defer c.writing_since.store(0, .monotonic);
         rpc.record.write(c.writer, reply) catch return c.broken();
         c.writer.flush() catch return c.broken();
     }
@@ -234,6 +353,122 @@ const Connection = struct {
     /// A reply can't be sent, so stop reading calls too.
     fn broken(c: *Connection) void {
         c.stream.shutdown(c.io, .both) catch {};
+    }
+
+    /// Fails when the connection should be closed.
+    fn watch(c: *Connection) Stale!void {
+        const since = c.writing_since.load(.monotonic);
+        if (since != 0 and now(c.io) - since > c.options.write_timeout.nanoseconds) return error.ReplyStalled;
+    }
+
+    /// How often a waiting reader checks the connection.
+    fn tick(c: *Connection) Io.Timeout {
+        const nanoseconds = @max(std.time.ns_per_ms, @divTrunc(c.options.write_timeout.nanoseconds, 4));
+        return .{ .duration = .{ .raw = .fromNanoseconds(nanoseconds), .clock = .awake } };
+    }
+
+    /// Waits for room in the pool, checking the connection meanwhile, as
+    /// its own calls may hold the room.
+    fn reserve(c: *Connection, bytes: usize) (Stale || Io.Cancelable)!void {
+        while (true) {
+            c.options.pool.reserve(c.io, bytes, c.tick()) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                error.Timeout => {
+                    try c.watch();
+                    continue;
+                },
+            };
+            return;
+        }
+    }
+
+    /// Waits for a free slot, checking the connection meanwhile.
+    fn takeSlot(c: *Connection) (Stale || Io.Cancelable)!*Slot {
+        while (true) {
+            c.free.waitTimeout(c.io, c.tick()) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                error.Timeout => {
+                    try c.watch();
+                    continue;
+                },
+            };
+            break;
+        }
+        for (c.slots) |*s| {
+            if (s.busy.cmpxchgStrong(false, true, .acquire, .monotonic) == null) return s;
+        } else unreachable; // a permit means a free slot
+    }
+};
+
+fn now(io: Io) i64 {
+    return @intCast(Io.Timestamp.now(io, .awake).nanoseconds);
+}
+
+/// Reads a connection's stream, checking the connection whenever no bytes
+/// come for a tick.
+const StreamReader = struct {
+    interface: Io.Reader,
+    c: *Connection,
+    err: ?Error = null,
+
+    const Error = net.Stream.Reader.Error || Stale;
+
+    fn init(c: *Connection, buffer: []u8) StreamReader {
+        return .{
+            .interface = .{
+                .vtable = &.{ .stream = stream, .readVec = readVec },
+                .buffer = buffer,
+                .seek = 0,
+                .end = 0,
+            },
+            .c = c,
+        };
+    }
+
+    fn stream(io_r: *Io.Reader, io_w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
+        const dest = limit.slice(try io_w.writableSliceGreedy(1));
+        var data: [1][]u8 = .{dest};
+        const n = try readVec(io_r, &data);
+        io_w.advance(n);
+        return n;
+    }
+
+    fn readVec(io_r: *Io.Reader, data: [][]u8) Io.Reader.Error!usize {
+        const r: *StreamReader = @alignCast(@fieldParentPtr("interface", io_r));
+        const c = r.c;
+        var iovecs_buffer: [8][]u8 = undefined;
+        const dest_n, const data_size = try io_r.writableVector(&iovecs_buffer, data);
+        const operation: Io.Operation = .{ .net_read = .{ .socket_handle = c.stream.socket.handle, .data = iovecs_buffer[0..dest_n] } };
+        const result = while (true) {
+            break c.io.operateTimeout(operation, c.tick()) catch |err| switch (err) {
+                error.Timeout => {
+                    c.watch() catch |e| {
+                        r.err = e;
+                        return error.ReadFailed;
+                    };
+                    continue;
+                },
+                // Without timeouts, the connection goes unchecked.
+                error.ConcurrencyUnavailable => c.io.operate(operation) catch |e| {
+                    r.err = e;
+                    return error.ReadFailed;
+                },
+                error.Canceled => |e| {
+                    r.err = e;
+                    return error.ReadFailed;
+                },
+            };
+        };
+        const n = (result.net_read catch |err| {
+            r.err = err;
+            return error.ReadFailed;
+        }).data_len;
+        if (n == 0) return error.EndOfStream;
+        if (n > data_size) {
+            io_r.end += n - data_size;
+            return data_size;
+        }
+        return n;
     }
 };
 
@@ -253,46 +488,69 @@ pub fn serveConnection(
     @memset(slots, .{});
     defer {
         for (slots) |*s| {
+            s.finish(io, gpa, options.pool);
             s.message.deinit(gpa);
-            gpa.free(s.out);
         }
         gpa.free(slots);
     }
     var read_buf: [16 * 1024]u8 = undefined;
     var write_buf: [16 * 1024]u8 = undefined;
-    var reader = stream.reader(io, &read_buf);
     var writer = stream.writer(io, &write_buf);
     var c: Connection = .{
         .io = io,
         .gpa = gpa,
         .programs = programs,
+        .options = options,
         .ctx = .{ .io = io, .from = stream.socket.address, .protocol = .tcp, .observer = options.observer },
         .stream = stream,
         .writer = &writer.interface,
         .free = .{ .permits = slots.len },
         .slots = slots,
     };
+    var reader: StreamReader = .init(&c, &read_buf);
     var calls: Io.Group = .init;
     defer calls.cancel(io);
 
     while (true) {
-        try c.free.wait(io);
-        const slot = for (slots) |*s| {
-            if (s.busy.cmpxchgStrong(false, true, .acquire, .monotonic) == null) break s;
-        } else unreachable; // a permit means a free slot
-        if (slot.out.len == 0) slot.allocate(io, gpa, options.max_record) catch {
-            log.warn("tcp: out of memory", .{});
-            break;
+        const slot = c.takeSlot() catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => {
+                log.warn("tcp: {f}: {t}", .{ c.ctx.from, err });
+                c.broken();
+                break;
+            },
         };
-        rpc.record.read(&reader.interface, gpa, &slot.message, options.max_record) catch |err| {
-            if (reader.err) |e| if (e == error.Canceled) return error.Canceled;
-            if (err != error.EndOfStream) log.warn("tcp read: {t}", .{err});
+        c.readRecord(&reader.interface, slot) catch |err| {
+            slot.finish(io, gpa, options.pool);
+            slot.busy.store(false, .release);
+            c.free.post(io);
+            const cause = switch (err) {
+                error.ReadFailed => reader.err.?,
+                else => |e| e,
+            };
+            switch (cause) {
+                error.Canceled => return error.Canceled,
+                error.EndOfStream => {},
+                error.ReplyStalled => {
+                    log.warn("tcp: {f}: {t}", .{ c.ctx.from, cause });
+                    c.broken();
+                },
+                else => log.warn("tcp read: {f}: {t}", .{ c.ctx.from, cause }),
+            }
             break;
         };
         // Without a task to spare, answer before reading on.
         calls.concurrent(io, Connection.answer, .{ &c, slot }) catch try c.answer(slot);
     }
-    // The peer is gone or misbehaved; let calls already read finish.
+    // The peer is gone or misbehaved; let calls already read finish, unless
+    // their replies stall.
+    for (slots) |_| _ = c.takeSlot() catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => {
+            c.broken();
+            break;
+        },
+    };
     try calls.await(io);
 }
 
@@ -487,6 +745,117 @@ test "a connection answers calls concurrently, replies matched by XID" {
         try testing.expectEqual(xid, std.mem.readInt(u32, reply.items[0..4], .big));
         try testing.expectEqual(0, acceptStat(reply.items));
     }
+}
+
+test "an idle connection holds no call buffers" {
+    const io = testing.io;
+    var echo: Echo = .{};
+    const programs = [_]Program{echo.program()};
+    var counting: testing.FailingAllocator = .init(testing.allocator, .{});
+    const pair = try testPair();
+    defer pair[1].close(io);
+    var pool: Pool = .{};
+    var group: Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, serveConnection, .{ io, counting.allocator(), &programs, pair[0], .{ .pool = &pool } });
+
+    try io.sleep(.fromMilliseconds(50), .awake);
+    try testing.expect(counting.allocated_bytes - counting.freed_bytes < 64 * 1024);
+
+    // A call takes buffers for its time only, but a small record buffer.
+    var write_buf: [128]u8 = undefined;
+    var writer = pair[1].writer(io, &write_buf);
+    var call_buf: [64]u8 = undefined;
+    try rpc.record.write(&writer.interface, encodeCall(&call_buf, 400000, 1, 1, "art\x00"));
+    try writer.interface.flush();
+    var read_buf: [128]u8 = undefined;
+    var reader = pair[1].reader(io, &read_buf);
+    var reply: std.ArrayList(u8) = .empty;
+    defer reply.deinit(testing.allocator);
+    try rpc.record.read(&reader.interface, testing.allocator, &reply, 4096);
+    try testing.expectEqualStrings("art\x00", reply.items[24..]);
+    for (0..100) |_| {
+        if (@atomicLoad(usize, &pool.held, .monotonic) == 0) break;
+        try io.sleep(.fromMilliseconds(10), .awake);
+    } else return error.StillHeld;
+    try testing.expect(counting.allocated_bytes - counting.freed_bytes < 64 * 1024);
+}
+
+test "calls wait for room in their pool" {
+    const io = testing.io;
+    // Procedure 1 waits briefly for procedure 2, which can't run until 1
+    // returns its buffers.
+    const Gate = struct {
+        open: Io.Event = .unset,
+
+        fn handle(ptr: *anyopaque, ctx: Context, call: rpc.Call, results: *Io.Writer) rpc.Reply {
+            _ = results;
+            const gate: *@This() = @ptrCast(@alignCast(ptr));
+            switch (call.proc) {
+                1 => gate.open.waitTimeout(ctx.io, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } }) catch return .system_err,
+                2 => gate.open.set(ctx.io),
+                else => return .proc_unavail,
+            }
+            return .success;
+        }
+    };
+    var gate: Gate = .{};
+    const programs = [_]Program{.{ .prog = 400000, .low = 1, .high = 1, .ptr = &gate, .handle = Gate.handle }};
+    const pair = try testPair();
+    defer pair[1].close(io);
+    var pool: Pool = .{ .max_bytes = 4096 };
+    var group: Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, serveConnection, .{ io, testing.allocator, &programs, pair[0], .{ .max_record = 4096, .pool = &pool } });
+
+    var write_buf: [128]u8 = undefined;
+    var writer = pair[1].writer(io, &write_buf);
+    for ([_]u32{ 1, 2 }) |proc| {
+        var call_buf: [64]u8 = undefined;
+        var w: Io.Writer = .fixed(&call_buf);
+        const call: rpc.Call = .{ .xid = 10 + proc, .prog = 400000, .vers = 1, .proc = proc, .cred = .none, .verf = .none, .args = &.{} };
+        try call.encode(.init(&w));
+        try rpc.record.write(&writer.interface, w.buffered());
+        try writer.interface.flush();
+    }
+    var read_buf: [128]u8 = undefined;
+    var reader = pair[1].reader(io, &read_buf);
+    var reply: std.ArrayList(u8) = .empty;
+    defer reply.deinit(testing.allocator);
+    try rpc.record.read(&reader.interface, testing.allocator, &reply, 4096);
+    try testing.expectEqual(11, std.mem.readInt(u32, reply.items[0..4], .big));
+    try testing.expectEqual(@backingInt(rpc.AcceptStat.system_err), acceptStat(reply.items));
+    try rpc.record.read(&reader.interface, testing.allocator, &reply, 4096);
+    try testing.expectEqual(12, std.mem.readInt(u32, reply.items[0..4], .big));
+}
+
+test "a peer that stops reading replies is closed" {
+    const io = testing.io;
+    testing.log_level = .err; // the closing is logged
+    var echo: Echo = .{};
+    const programs = [_]Program{echo.program()};
+    const pair = try testPair();
+    defer pair[1].close(io);
+    var pool: Pool = .{};
+    const options: ConnectionOptions = .{ .max_record = 64 * 1024, .write_timeout = .fromMilliseconds(200), .pool = &pool };
+    var served = try io.concurrent(serveConnection, .{ io, testing.allocator, &programs, pair[0], options });
+    defer served.cancel(io) catch {};
+
+    // Large echoes, never read, until the connection is closed.
+    const args = try testing.allocator.alloc(u8, 60 * 1024);
+    defer testing.allocator.free(args);
+    @memset(args, 'x');
+    const call_buf = try testing.allocator.alloc(u8, 61 * 1024);
+    defer testing.allocator.free(call_buf);
+    const call = encodeCall(call_buf, 400000, 1, 1, args);
+    var write_buf: [1024]u8 = undefined;
+    var writer = pair[1].writer(io, &write_buf);
+    while (true) {
+        rpc.record.write(&writer.interface, call) catch break;
+        writer.interface.flush() catch break;
+    }
+    try served.await(io);
+    try testing.expectEqual(0, pool.held);
 }
 
 test "a connection the embedder accepted carries MOUNT and NFS" {

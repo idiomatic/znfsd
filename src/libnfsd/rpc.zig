@@ -231,7 +231,7 @@ pub fn decodeCall(message: []const u8) Incoming {
 /// TCP record marking (RFC 5531, section 11): each record is one or more
 /// fragments, each preceded by a 4-byte header whose top bit marks the last.
 pub const record = struct {
-    const last_fragment: u32 = 0x8000_0000;
+    pub const last_fragment: u32 = 0x8000_0000;
 
     pub const ReadError = Io.Reader.Error || error{ RecordTooLong, OutOfMemory };
 

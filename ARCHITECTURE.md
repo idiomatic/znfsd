@@ -42,7 +42,7 @@ Embedders can also adopt connections they accepted themselves (vsock, say): `ser
 
 ## Requests
 
-1. A record arrives: a datagram, or a record-marked TCP fragment sequence. A TCP connection's reader takes one of 16 slots per record and answers it in a task of its own, so a slow call doesn't hold up the rest; each reply is written whole, under a lock, as its call finishes, so replies may go out of order, matched by XID. With every slot busy, the reader waits.
+1. A record arrives: a datagram, or a record-marked TCP fragment sequence. A TCP connection's reader takes one of 16 slots per record and answers it in a task of its own, so a slow call doesn't hold up the rest; each reply is written whole, under a lock, as its call finishes, so replies may go out of order, matched by XID. With every slot busy, the reader waits. Once a record's length is known, its call reserves buffers for the record and its reply from a process-wide budget, waiting for room, and frees them when it ends; only record buffers of 4 KiB or less are kept for the next. A reply that takes over `write_timeout` (2 minutes) to write, as when the peer stops reading, closes the connection.
 2. XDR decodes the RPC call header; the program, version, and procedure select a handler.
 3. AUTH_SYS credentials pass through squash and the matching rule's map, yielding host IDs.
 4. The handler resolves file handles, checks access against the export rule, performs the operation, and encodes the reply, mapping host IDs back to client IDs.
