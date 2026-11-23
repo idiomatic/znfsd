@@ -13,6 +13,15 @@ pub const Context = struct {
     arena: std.mem.Allocator,
     out: *Io.Writer,
     err: *Io.Writer,
+    /// What a running daemon serves beyond the database.
+    ephemera: Ephemera = .{},
+};
+
+/// A running daemon's ephemeral maps and rules, which stored rules may
+/// name and which may name stored maps.
+pub const Ephemera = struct {
+    maps: []const []const u8 = &.{},
+    rules: []const exports.Rule = &.{},
 };
 
 pub fn run(c: Context, noun: cli.Noun, verb: cli.Verb, args: []const []const u8) !u8 {
@@ -79,6 +88,10 @@ fn exportCommand(c: Context, verb: cli.Verb, args: []const []const u8) !u8 {
             for (args[2..]) |word| options.apply(word) catch {
                 try c.err.print("znfsd: {s}: not rw, ro, squash=root|all|none, or map=MAP\n", .{word});
                 return 2;
+            };
+            if (options.map) |m| if (!try mapExists(c, m)) {
+                try c.err.print("znfsd: map={s}: no such map; add it with map add\n", .{m});
+                return 1;
             };
             var w: Io.Writer.Allocating = .init(c.arena);
             try dbm.formatOptions(options, &w.writer);
@@ -171,17 +184,29 @@ fn mapCommand(c: Context, verb: cli.Verb, args: []const []const u8) !u8 {
         },
         .del => {
             if (args.len < 1) return usage(c, "map del MAP [REMOTE ...]");
-            var removed: usize = 0;
-            if (args.len == 1) {
-                removed = try c.db.deleteMapEntries(args[0], null);
-            } else for (args[1..]) |text| {
+            var remotes: std.ArrayList([]const u8) = .empty;
+            for (args[1..]) |text| {
                 const remote = exports.Ids.parse(text) catch {
                     try c.err.print("znfsd: {s}: not [UID][:GID] in numbers\n", .{text});
                     return 2;
                 };
                 var rw: Io.Writer.Allocating = .init(c.arena);
                 try remote.format(&rw.writer);
-                removed += try c.db.deleteMapEntries(args[0], rw.written());
+                try remotes.append(c.arena, rw.written());
+            }
+            // A map with no entries left is gone, so rules mustn't name it.
+            const left = for (try c.db.mapEntries(c.arena, args[0])) |e| {
+                if (args.len > 1 and !contains(remotes.items, e.remote)) break true;
+            } else false;
+            if (!left) if (try mapUser(c, args[0])) |path| {
+                try c.err.print("znfsd: map {s}: {s} uses it; change or delete its rules first\n", .{ args[0], path });
+                return 1;
+            };
+            var removed: usize = 0;
+            if (args.len == 1) {
+                removed = try c.db.deleteMapEntries(args[0], null);
+            } else for (remotes.items) |r| {
+                removed += try c.db.deleteMapEntries(args[0], r);
             }
             if (removed == 0) {
                 try c.err.print("znfsd: no such map or entry\n", .{});
@@ -191,6 +216,31 @@ fn mapCommand(c: Context, verb: cli.Verb, args: []const []const u8) !u8 {
         .set => unreachable,
     }
     return 0;
+}
+
+fn contains(list: []const []const u8, item: []const u8) bool {
+    for (list) |x| if (std.mem.eql(u8, x, item)) return true;
+    return false;
+}
+
+/// Whether map `name` exists: stored, or the running daemon's own.
+fn mapExists(c: Context, name: []const u8) !bool {
+    if (contains(c.ephemera.maps, name)) return true;
+    return (try c.db.mapEntries(c.arena, name)).len > 0;
+}
+
+/// The path of a rule that needs stored map `name`: any stored rule naming
+/// it, or a running daemon's ephemeral one unless its own map shadows it.
+fn mapUser(c: Context, name: []const u8) !?[]const u8 {
+    for (try c.db.rules(c.arena, null)) |r| {
+        const options = dbm.parseOptions(r.options) catch continue;
+        if (options.map) |m| if (std.mem.eql(u8, m, name)) return r.path;
+    }
+    if (contains(c.ephemera.maps, name)) return null;
+    for (c.ephemera.rules) |r| if (r.options.map) |m| {
+        if (std.mem.eql(u8, m, name)) return r.path;
+    };
+    return null;
 }
 
 /// `[UID|USER][:GID|:GROUP]`, with names looked up now.
@@ -252,4 +302,62 @@ pub fn table(out: *Io.Writer, comptime n: usize, rows: []const [n][]const u8) !v
         }
         try out.writeByte('\n');
     }
+}
+
+const testing = std.testing;
+
+/// A scratch database and a context writing to discarded buffers.
+const Scratch = struct {
+    tmp: testing.TmpDir,
+    arena: std.heap.ArenaAllocator,
+    db: Db,
+    dir: []const u8,
+    out: Io.Writer.Allocating,
+    err: Io.Writer.Allocating,
+
+    fn init(s: *Scratch) !void {
+        s.tmp = testing.tmpDir(.{});
+        s.arena = .init(testing.allocator);
+        const arena = s.arena.allocator();
+        var buf: [libnfsd.sys.max_path]u8 = undefined;
+        s.dir = try arena.dupe(u8, buf[0..try s.tmp.dir.realPath(testing.io, &buf)]);
+        s.db = try .open(try std.fmt.allocPrintSentinel(arena, "{s}/znfsd.db", .{s.dir}, 0));
+        s.out = .init(arena);
+        s.err = .init(arena);
+    }
+
+    fn deinit(s: *Scratch) void {
+        s.db.close();
+        s.arena.deinit();
+        s.tmp.cleanup();
+    }
+
+    fn context(s: *Scratch) Context {
+        return .{ .db = &s.db, .arena = s.arena.allocator(), .out = &s.out.writer, .err = &s.err.writer };
+    }
+};
+
+test "rules name only maps that exist, and maps in use stay" {
+    var s: Scratch = undefined;
+    try s.init();
+    defer s.deinit();
+    const c = s.context();
+    try testing.expectEqual(1, try run(c, .@"export", .add, &.{ s.dir, "*", "map=art" }));
+    try testing.expectEqual(0, try run(c, .map, .add, &.{ "art", "501", "1000" }));
+    try testing.expectEqual(0, try run(c, .@"export", .add, &.{ s.dir, "*", "map=art" }));
+    try testing.expectEqual(1, try run(c, .map, .del, &.{"art"}));
+    // Deleting its last entry would delete the map.
+    try testing.expectEqual(1, try run(c, .map, .del, &.{ "art", "1000" }));
+    try testing.expectEqual(0, try run(c, .map, .add, &.{ "art", "501", "1001" }));
+    try testing.expectEqual(0, try run(c, .map, .del, &.{ "art", "1000" }));
+    try testing.expectEqual(0, try run(c, .@"export", .del, &.{s.dir}));
+    try testing.expectEqual(0, try run(c, .map, .del, &.{"art"}));
+
+    // A running daemon's own maps count, and its rules keep stored maps.
+    var live = c;
+    const rule: exports.Rule = .{ .path = "/srv", .client = .any, .options = .{ .map = "hal" } };
+    live.ephemera = .{ .maps = &.{"perihelion"}, .rules = &.{rule} };
+    try testing.expectEqual(0, try run(live, .@"export", .add, &.{ s.dir, "*", "map=perihelion" }));
+    try testing.expectEqual(0, try run(live, .map, .add, &.{ "hal", "501" }));
+    try testing.expectEqual(1, try run(live, .map, .del, &.{"hal"}));
 }

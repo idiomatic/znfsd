@@ -367,7 +367,13 @@ const Daemon = struct {
             },
             .lock => return d.lockCommand(arena, c.verb.?, c.args, out, err),
             .@"export", .group, .mount, .map => {
-                const ctx: commands.Context = .{ .db = d.db, .arena = arena, .out = out, .err = err };
+                const ctx: commands.Context = .{
+                    .db = d.db,
+                    .arena = arena,
+                    .out = out,
+                    .err = err,
+                    .ephemera = .{ .maps = d.ephemeral_maps.keys(), .rules = d.ephemeral_rules },
+                };
                 const status = try commands.run(ctx, c.noun, c.verb.?, c.args);
                 if (status != 0 or c.verb.? == .list) return status;
                 switch (c.noun) {

@@ -91,7 +91,7 @@ znfsd map add art nobody           # anon: everything else acts as nobody
 znfsd export add /srv/home/art perihelion.example.com map=art
 ```
 
-Replies translate back: files owned by `art` appear to the client as owned by UID 501, the first listed. Without an anon entry, unmapped IDs pass through unchanged, and squashed users become the host's `nobody`.
+Replies translate back: files owned by `art` appear to the client as owned by UID 501, the first listed. Without an anon entry, unmapped IDs pass through unchanged, and squashed users become the host's `nobody`. Add a map before the rules that name it: `export add` refuses `map=` for a map that doesn't exist, and `map del` refuses to delete a map, or its last entry, while rules name it.
 
 `--run-as` disables maps, because an unprivileged server can't act as other users.
 
