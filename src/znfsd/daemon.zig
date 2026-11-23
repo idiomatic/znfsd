@@ -131,6 +131,20 @@ pub fn serve(
         }
     };
 
+    // Before anything stored changes, so a second `serve` leaves the
+    // running daemon's state alone.
+    var socket = control.listen(io, socket_path) catch |err| {
+        switch (err) {
+            error.InUse => try stderr.print("znfsd: another znfsd is running, with control socket {s}\n", .{socket_path}),
+            else => try stderr.print("znfsd: control socket {s}: {t}\n", .{ socket_path, err }),
+        }
+        return 1;
+    };
+    defer {
+        socket.deinit(io);
+        control.remove(socket_path);
+    }
+
     var mount: libnfsd.mount.Mount = .init(gpa, table);
     defer mount.deinit();
     for (try db.mounts(arena, null)) |m| try mount.restore(io, m.host, m.path);
@@ -173,18 +187,6 @@ pub fn serve(
         .{ .program = nlm.program(), .service = .lock },
         .{ .program = status.program(), .service = .stat },
     });
-
-    var socket = control.listen(io, socket_path) catch |err| {
-        switch (err) {
-            error.InUse => try stderr.print("znfsd: another znfsd is running, with control socket {s}\n", .{socket_path}),
-            else => try stderr.print("znfsd: control socket {s}: {t}\n", .{ socket_path, err }),
-        }
-        return 1;
-    };
-    defer {
-        socket.deinit(io);
-        control.remove(socket_path);
-    }
 
     // Signals are taken by `sigwait` below, so block them before any thread
     // starts; threads inherit the mask.
@@ -603,4 +605,37 @@ fn runService(
     };
     result.* = .canceled;
     _ = std.c.kill(std.c.getpid(), .TERM);
+}
+
+const testing = std.testing;
+
+test "a second serve leaves the running daemon's state alone" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [libnfsd.sys.max_path]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const db_path = try std.fmt.allocPrintSentinel(arena, "{s}/znfsd.db", .{dir}, 0);
+    const socket_path = try std.fmt.allocPrint(arena, "{s}/znfsd.sock", .{dir});
+
+    var db: dbm.Db = try .open(db_path);
+    defer db.close();
+    try testing.expectEqual(1, try db.advanceNsmState());
+    const store = db.nsmStore();
+    store.monitor(store.ptr, .{ .name = "art", .address = "192.168.213.11" });
+
+    // The running daemon's control socket.
+    var running = try control.listen(io, socket_path);
+    defer running.deinit(io);
+
+    var err_buf: [256]u8 = undefined;
+    var err: Io.Writer = .fixed(&err_buf);
+    const invocation = try cli.parse(arena, &.{ "serve", "--no-portmap" });
+    try testing.expectEqual(1, try serve(io, testing.allocator, arena, invocation, &db, socket_path, &err));
+    try testing.expectStringStartsWith(err.buffered(), "znfsd: another znfsd is running");
+    try testing.expectEqual(3, try db.advanceNsmState());
+    try testing.expectEqual(1, (try db.monitors(arena)).len);
 }
