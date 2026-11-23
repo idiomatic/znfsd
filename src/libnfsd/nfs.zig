@@ -1514,7 +1514,9 @@ test "look up, get attributes, read, and read links" {
     d = .init(try f.call(f.nfs.program(), @backingInt(Proc.getattr), handleArgs(&args, bogus, "")));
     try testing.expectEqual(Status.badhandle, try d.enumeration(Status));
     bogus = hal;
-    bogus[31] ^= 0xff;
+    // Flipping the inode's top bit, not its low byte: that could make
+    // the export root's, which is always found.
+    bogus[24] ^= 0x80;
     d = .init(try f.call(f.nfs.program(), @backingInt(Proc.getattr), handleArgs(&args, bogus, "")));
     try testing.expectEqual(Status.stale, try d.enumeration(Status));
 }
