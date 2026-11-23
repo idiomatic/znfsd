@@ -95,8 +95,9 @@ const LockArgs = struct {
         try e.u64_(l.len);
     }
 
-    fn owner(l: LockArgs) locks_.Owner {
-        return .{ .host = l.caller_name, .svid = l.svid, .oh = l.oh };
+    /// The lock's owner, calling from `address` (`nsm.addressText`).
+    fn owner(l: LockArgs, address: []const u8) locks_.Owner {
+        return .{ .host = l.caller_name, .address = address, .svid = l.svid, .oh = l.oh };
     }
 
     fn range(l: LockArgs) locks_.Range {
@@ -112,6 +113,10 @@ const Waiter = struct {
     /// The request's nlm4_lock, owned.
     lock: LockArgs,
     address: net.IpAddress,
+
+    fn owner(w: *const Waiter, buf: []u8) locks_.Owner {
+        return w.lock.owner(nsm_.addressText(w.address, buf));
+    }
 };
 
 pub const Nlm = struct {
@@ -153,9 +158,9 @@ pub const Nlm = struct {
     /// For NSM: a client host restarted, so its locks and waits go.
     pub fn rebooted(n: *Nlm) nsm_.Rebooted {
         const S = struct {
-            fn call(ptr: *anyopaque, io: Io, name: []const u8) void {
+            fn call(ptr: *anyopaque, io: Io, name: []const u8, address: []const u8) void {
                 const self: *Nlm = @ptrCast(@alignCast(ptr));
-                _ = self.releaseHost(io, name, null) catch {};
+                _ = self.releaseHostAt(io, name, address) catch {};
             }
         };
         return .{ .ptr = n, .call = S.call };
@@ -176,9 +181,47 @@ pub const Nlm = struct {
                 } else i += 1;
             }
         }
+        return n.afterRelease(io, host, released);
+    }
+
+    /// Releases the locks and waits `host` holds from `address`, as when it
+    /// says it restarted, then grants what waited on them. Returns how many
+    /// locks went.
+    fn releaseHostAt(n: *Nlm, io: Io, host: []const u8, address: []const u8) !usize {
+        const released = try n.locks.releaseHostAt(io, host, address);
+        {
+            try n.mutex.lock(io);
+            defer n.mutex.unlock(io);
+            var i: usize = 0;
+            while (i < n.waiters.items.len) {
+                const w = n.waiters.items[i];
+                var buf: [64]u8 = undefined;
+                if (w.owner(&buf).of(host, address)) {
+                    n.freeWaiter(n.waiters.orderedRemove(i));
+                } else i += 1;
+            }
+        }
+        return n.afterRelease(io, host, released);
+    }
+
+    /// Unmonitors `host` if it holds no more locks, and grants what can be.
+    fn afterRelease(n: *Nlm, io: Io, host: []const u8, count: usize) !usize {
         if (!try n.locks.hostHolds(io, host)) n.nsm.unmonitor(io, host) catch {};
         try n.wake(io);
-        return released;
+        return count;
+    }
+
+    /// Monitors `host` at `address`, unless it still holds locks from where
+    /// it's monitored now: a caller can't move another host's restart
+    /// notices, or its FREE_ALL, to itself by giving its name.
+    fn monitor(n: *Nlm, io: Io, host: []const u8, address: net.IpAddress) void {
+        var buf: [64]u8 = undefined;
+        var at_buf: [64]u8 = undefined;
+        if (n.nsm.addressOf(io, host, &at_buf)) |at| {
+            if (!std.mem.eql(u8, at, nsm_.addressText(address, &buf)) and
+                (n.locks.hostHoldsAt(io, host, at) catch true)) return;
+        }
+        n.nsm.monitor(io, host, address) catch {};
     }
 
     fn handle(ptr: *anyopaque, ctx: server.Context, call: rpc.Call, results: *Io.Writer) rpc.Reply {
@@ -231,7 +274,8 @@ pub const Nlm = struct {
                 const name = try d.string(max_string + 1);
                 _ = try d.i32_();
                 // A host frees its own locks, from where it holds them.
-                if (n.nsm.monitoredAt(ctx.io, name, ctx.from)) _ = try n.releaseHost(ctx.io, name, null);
+                var buf: [64]u8 = undefined;
+                if (n.nsm.monitoredAt(ctx.io, name, ctx.from)) _ = try n.releaseHostAt(ctx.io, name, nsm_.addressText(ctx.from, &buf));
                 return .success;
             },
             _ => return .proc_unavail,
@@ -243,6 +287,8 @@ pub const Nlm = struct {
     fn answer(n: *Nlm, ctx: server.Context, proc: Proc, d: *xdr.Decoder, e: xdr.Encoder) !void {
         const cookie = try d.opaque_(max_netobj);
         try e.opaque_(cookie);
+        var from_buf: [64]u8 = undefined;
+        const from = nsm_.addressText(ctx.from, &from_buf);
         switch (proc) {
             .@"test" => {
                 const exclusive = try d.boolean();
@@ -252,7 +298,7 @@ pub const Nlm = struct {
                 if (!n.nfs.locate(ctx.io, lock.fh, ctx.from, &located)) return e.enumeration(Stat.stale_fh);
                 var arena_state: std.heap.ArenaAllocator = .init(n.gpa);
                 defer arena_state.deinit();
-                const holder = try n.locks.conflict(ctx.io, arena_state.allocator(), located.file, lock.owner(), exclusive, lock.range()) orelse
+                const holder = try n.locks.conflict(ctx.io, arena_state.allocator(), located.file, lock.owner(from), exclusive, lock.range()) orelse
                     return e.enumeration(Stat.granted);
                 try e.enumeration(Stat.denied);
                 try e.boolean(holder.exclusive);
@@ -270,8 +316,8 @@ pub const Nlm = struct {
                 if (n.inGrace(ctx.io) and !reclaim) return e.enumeration(Stat.denied_grace_period);
                 var located: Nfs.Located = undefined;
                 if (!n.nfs.locate(ctx.io, lock.fh, ctx.from, &located)) return e.enumeration(Stat.stale_fh);
-                if (try n.locks.acquire(ctx.io, located.file, lock.owner(), exclusive, lock.range())) {
-                    if (proc == .lock) n.nsm.monitor(ctx.io, lock.caller_name, ctx.from) catch {};
+                if (try n.locks.acquire(ctx.io, located.file, lock.owner(from), exclusive, lock.range())) {
+                    if (proc == .lock) n.monitor(ctx.io, lock.caller_name, ctx.from);
                     return e.enumeration(Stat.granted);
                 }
                 if (!block) return e.enumeration(Stat.denied);
@@ -284,14 +330,14 @@ pub const Nlm = struct {
                 const lock: LockArgs = try .decode(d);
                 if (!n.nfs.admits(ctx.from)) return e.enumeration(Stat.denied);
                 const h = fh.Handle.decode(lock.fh) catch return e.enumeration(Stat.stale_fh);
-                n.cancel(ctx.io, .{ .fsid = h.fsid, .inode = h.inode }, lock) catch {};
+                n.cancel(ctx.io, .{ .fsid = h.fsid, .inode = h.inode }, lock.owner(from), lock) catch {};
                 try e.enumeration(Stat.granted);
             },
             .unlock => {
                 const lock: LockArgs = try .decode(d);
                 if (!n.nfs.admits(ctx.from)) return e.enumeration(Stat.denied);
                 const h = fh.Handle.decode(lock.fh) catch return e.enumeration(Stat.stale_fh);
-                try n.locks.release(ctx.io, .{ .fsid = h.fsid, .inode = h.inode }, lock.owner(), lock.range());
+                try n.locks.release(ctx.io, .{ .fsid = h.fsid, .inode = h.inode }, lock.owner(from), lock.range());
                 if (!try n.locks.hostHolds(ctx.io, lock.caller_name)) n.nsm.unmonitor(ctx.io, lock.caller_name) catch {};
                 try e.enumeration(Stat.granted);
                 try n.wake(ctx.io);
@@ -304,8 +350,10 @@ pub const Nlm = struct {
     fn wait(n: *Nlm, io: Io, file: locks_.File, exclusive: bool, cookie: []const u8, lock: LockArgs, address: net.IpAddress) !void {
         try n.mutex.lock(io);
         defer n.mutex.unlock(io);
-        for (n.waiters.items) |w| {
-            if (std.meta.eql(w.file, file) and w.lock.owner().eql(lock.owner()) and std.meta.eql(w.lock.range(), lock.range())) return;
+        for (n.waiters.items) |*w| {
+            var buf: [64]u8 = undefined;
+            var from_buf: [64]u8 = undefined;
+            if (std.meta.eql(w.file, file) and w.owner(&buf).eql(lock.owner(nsm_.addressText(address, &from_buf))) and std.meta.eql(w.lock.range(), lock.range())) return;
         }
         var owned: Waiter = .{
             .file = file,
@@ -321,11 +369,12 @@ pub const Nlm = struct {
         try n.waiters.append(n.gpa, owned);
     }
 
-    fn cancel(n: *Nlm, io: Io, file: locks_.File, lock: LockArgs) !void {
+    fn cancel(n: *Nlm, io: Io, file: locks_.File, owner: locks_.Owner, lock: LockArgs) !void {
         try n.mutex.lock(io);
         defer n.mutex.unlock(io);
-        for (n.waiters.items, 0..) |w, i| {
-            if (std.meta.eql(w.file, file) and w.lock.owner().eql(lock.owner()) and std.meta.eql(w.lock.range(), lock.range())) {
+        for (n.waiters.items, 0..) |*w, i| {
+            var buf: [64]u8 = undefined;
+            if (std.meta.eql(w.file, file) and w.owner(&buf).eql(owner) and std.meta.eql(w.lock.range(), lock.range())) {
                 n.freeWaiter(n.waiters.orderedRemove(i));
                 return;
             }
@@ -342,14 +391,15 @@ pub const Nlm = struct {
             defer n.mutex.unlock(io);
             var i: usize = 0;
             while (i < n.waiters.items.len) {
-                const w = n.waiters.items[i];
-                if (try n.locks.acquire(io, w.file, w.lock.owner(), w.exclusive, w.lock.range())) {
+                const w = &n.waiters.items[i];
+                var buf: [64]u8 = undefined;
+                if (try n.locks.acquire(io, w.file, w.owner(&buf), w.exclusive, w.lock.range())) {
                     try granted.append(n.gpa, n.waiters.orderedRemove(i));
                 } else i += 1;
             }
         }
         for (granted.items) |w| {
-            n.nsm.monitor(io, w.lock.caller_name, w.address) catch {};
+            n.monitor(io, w.lock.caller_name, w.address);
             // The task owns the waiter from here.
             n.callbacks.concurrent(io, grant, .{ n, io, w }) catch grant(n, io, w);
         }
@@ -453,6 +503,25 @@ test "lock, test, block, unlock, and grace" {
 
     try testing.expectEqual(Stat.granted, try Call.run(&programs, ctx, .lock, Args.lockArgs(&a, "art", 1, false, true, &handle_bytes, false), &out));
     try testing.expect(status.hosts.contains("art"));
+
+    // Another address giving art's name and process can't unlock art's
+    // lock, nor, by locking another range as art, take over art's monitor
+    // and free art's locks with FREE_ALL.
+    const skynet: server.Context = .{ .io = io, .from = try .parse("127.0.0.66", 9), .protocol = .tcp };
+    try testing.expectEqual(Stat.granted, try Call.run(&programs, skynet, .unlock, Args.unlockArgs(&a, "art", 1, &handle_bytes), &out));
+    try testing.expectEqual(1, locks.held.items.len);
+    try testing.expectEqualStrings("127.0.0.1", status.hosts.get("art").?);
+    var free_all: [64]u8 = undefined;
+    var fw: Io.Writer = .fixed(&free_all);
+    try xdr.Encoder.init(&fw).string("art");
+    try xdr.Encoder.init(&fw).i32_(3);
+    var b: [512]u8 = undefined;
+    var w: Io.Writer = .fixed(&b);
+    const m: rpc.Call = .{ .xid = 1, .prog = prog, .vers = vers, .proc = @backingInt(Proc.free_all), .cred = .none, .verf = .none, .args = fw.buffered() };
+    try m.encode(.init(&w));
+    _ = server.dispatch(&programs, skynet, w.buffered(), &out);
+    try testing.expectEqual(1, locks.held.items.len);
+
     try testing.expectEqual(Stat.denied, try Call.run(&programs, ctx, .lock, Args.lockArgs(&a, "hal", 2, false, true, &handle_bytes, false), &out));
     try testing.expectEqual(Stat.blocked, try Call.run(&programs, ctx, .lock, Args.lockArgs(&a, "hal", 2, true, true, &handle_bytes, false), &out));
     try testing.expectEqual(Stat.blocked, try Call.run(&programs, ctx, .lock, Args.lockArgs(&a, "hal", 2, true, true, &handle_bytes, false), &out));

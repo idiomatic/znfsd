@@ -43,7 +43,8 @@ pub const Store = struct {
 /// Called when a client host reports it restarted, so its locks go.
 pub const Rebooted = struct {
     ptr: *anyopaque,
-    call: *const fn (ptr: *anyopaque, io: Io, name: []const u8) void,
+    /// `address`: where it called from, as `addressText` writes it.
+    call: *const fn (ptr: *anyopaque, io: Io, name: []const u8, address: []const u8) void,
 };
 
 pub const Nsm = struct {
@@ -102,6 +103,16 @@ pub const Nsm = struct {
         defer n.mutex.unlock(io);
         const at = n.hosts.get(name) orelse return false;
         return std.mem.eql(u8, at, text);
+    }
+
+    /// Where `name` is monitored, copied into `buf`.
+    pub fn addressOf(n: *Nsm, io: Io, name: []const u8, buf: []u8) ?[]const u8 {
+        n.mutex.lock(io) catch return null;
+        defer n.mutex.unlock(io);
+        const at = n.hosts.get(name) orelse return null;
+        if (at.len > buf.len) return null;
+        @memcpy(buf[0..at.len], at);
+        return buf[0..at.len];
     }
 
     /// Stops monitoring `name`, which holds no more locks.
@@ -187,7 +198,7 @@ pub const Nsm = struct {
                     }
                 }
                 for (names.items) |host| {
-                    if (n.rebooted) |r| r.call(r.ptr, ctx.io, host);
+                    if (n.rebooted) |r| r.call(r.ptr, ctx.io, host, from);
                     try n.unmonitor(ctx.io, host);
                 }
             },
@@ -259,7 +270,7 @@ test "monitor, and release a host that reports a restart" {
         last: [32]u8 = undefined,
         last_len: usize = 0,
         count: usize = 0,
-        fn call(ptr: *anyopaque, _: Io, name: []const u8) void {
+        fn call(ptr: *anyopaque, _: Io, name: []const u8, _: []const u8) void {
             const s: *@This() = @ptrCast(@alignCast(ptr));
             @memcpy(s.last[0..name.len], name);
             s.last_len = name.len;

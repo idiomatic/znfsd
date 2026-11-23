@@ -12,14 +12,31 @@ pub const File = struct {
     inode: u64,
 };
 
-/// Who holds a lock: a client host and one of its processes.
+/// Who holds a lock: a client host, by the name it gives and the address
+/// it calls from, and one of its processes. The address keeps a host from
+/// passing for another by sending its name and process.
 pub const Owner = struct {
     host: []const u8,
+    /// The caller's address as text (`nsm.addressText`).
+    address: []const u8,
     svid: i32,
     oh: []const u8,
 
     pub fn eql(a: Owner, b: Owner) bool {
-        return a.svid == b.svid and std.mem.eql(u8, a.host, b.host) and std.mem.eql(u8, a.oh, b.oh);
+        return a.svid == b.svid and std.mem.eql(u8, a.host, b.host) and std.mem.eql(u8, a.address, b.address) and std.mem.eql(u8, a.oh, b.oh);
+    }
+
+    /// Whether this is `host` calling from `address`.
+    pub fn of(o: Owner, host: []const u8, address: []const u8) bool {
+        return std.mem.eql(u8, o.host, host) and std.mem.eql(u8, o.address, address);
+    }
+
+    fn dupe(o: Owner, gpa: std.mem.Allocator) std.mem.Allocator.Error!Owner {
+        const host = try gpa.dupe(u8, o.host);
+        errdefer gpa.free(host);
+        const address = try gpa.dupe(u8, o.address);
+        errdefer gpa.free(address);
+        return .{ .host = host, .address = address, .svid = o.svid, .oh = try gpa.dupe(u8, o.oh) };
     }
 };
 
@@ -69,6 +86,7 @@ pub const Locks = struct {
 
     fn free(l: *Locks, lock: Lock) void {
         l.gpa.free(lock.owner.host);
+        l.gpa.free(lock.owner.address);
         l.gpa.free(lock.owner.oh);
     }
 
@@ -87,8 +105,7 @@ pub const Locks = struct {
         try l.mutex.lock(io);
         defer l.mutex.unlock(io);
         var c = l.conflictLocked(file, owner, exclusive, range) orelse return null;
-        c.owner.host = try arena.dupe(u8, c.owner.host);
-        c.owner.oh = try arena.dupe(u8, c.owner.oh);
+        c.owner = try c.owner.dupe(arena);
         return c;
     }
 
@@ -101,7 +118,7 @@ pub const Locks = struct {
         try l.removeLocked(file, owner, range);
         const lock: Lock = .{
             .file = file,
-            .owner = .{ .host = try l.gpa.dupe(u8, owner.host), .svid = owner.svid, .oh = try l.gpa.dupe(u8, owner.oh) },
+            .owner = try owner.dupe(l.gpa),
             .exclusive = exclusive,
             .range = range,
         };
@@ -133,8 +150,7 @@ pub const Locks = struct {
                 // Split: keep the part before here, add the part after.
                 var tail = h;
                 tail.range.start = range.end;
-                tail.owner.host = try l.gpa.dupe(u8, h.owner.host);
-                tail.owner.oh = try l.gpa.dupe(u8, h.owner.oh);
+                tail.owner = try h.owner.dupe(l.gpa);
                 l.held.items[i].range.end = range.start;
                 l.held.append(l.gpa, tail) catch |err| {
                     l.free(tail);
@@ -189,11 +205,34 @@ pub const Locks = struct {
         return n;
     }
 
+    /// Releases every lock `host` holds from `address`; returns how many.
+    pub fn releaseHostAt(l: *Locks, io: Io, host: []const u8, address: []const u8) !usize {
+        try l.mutex.lock(io);
+        defer l.mutex.unlock(io);
+        var n: usize = 0;
+        var i: usize = 0;
+        while (i < l.held.items.len) {
+            if (l.held.items[i].owner.of(host, address)) {
+                l.free(l.held.swapRemove(i));
+                n += 1;
+            } else i += 1;
+        }
+        return n;
+    }
+
     /// Whether `host` holds any lock.
     pub fn hostHolds(l: *Locks, io: Io, host: []const u8) !bool {
         try l.mutex.lock(io);
         defer l.mutex.unlock(io);
         for (l.held.items) |h| if (std.mem.eql(u8, h.owner.host, host)) return true;
+        return false;
+    }
+
+    /// Whether `host` holds any lock from `address`.
+    pub fn hostHoldsAt(l: *Locks, io: Io, host: []const u8, address: []const u8) !bool {
+        try l.mutex.lock(io);
+        defer l.mutex.unlock(io);
+        for (l.held.items) |h| if (h.owner.of(host, address)) return true;
         return false;
     }
 
@@ -204,8 +243,7 @@ pub const Locks = struct {
         const out = try arena.alloc(Lock, l.held.items.len);
         for (l.held.items, out) |h, *o| {
             o.* = h;
-            o.owner.host = try arena.dupe(u8, h.owner.host);
-            o.owner.oh = try arena.dupe(u8, h.owner.oh);
+            o.owner = try h.owner.dupe(arena);
         }
         return out;
     }
@@ -215,8 +253,8 @@ const testing = std.testing;
 
 const file_a: File = .{ .fsid = @splat(1), .inode = 7 };
 const file_b: File = .{ .fsid = @splat(1), .inode = 8 };
-const hal: Owner = .{ .host = "hal", .svid = 1, .oh = "x" };
-const art: Owner = .{ .host = "art", .svid = 2, .oh = "y" };
+const hal: Owner = .{ .host = "hal", .address = "192.168.213.12", .svid = 1, .oh = "x" };
+const art: Owner = .{ .host = "art", .address = "192.168.213.11", .svid = 2, .oh = "y" };
 
 test "shared locks coexist; exclusive ones conflict" {
     const io = testing.io;
@@ -265,6 +303,22 @@ test "release a host's locks" {
     try testing.expectEqual(1, try l.releaseHost(io, "hal", null));
     try testing.expect(!try l.hostHolds(io, "hal"));
     try testing.expectEqual(1, l.held.items.len);
+}
+
+test "only the owner's own address releases its locks" {
+    const io = testing.io;
+    var l: Locks = .init(testing.allocator);
+    defer l.deinit();
+    try testing.expect(try l.acquire(io, file_a, art, true, .fromLength(0, 10)));
+    var skynet = art;
+    skynet.address = "192.168.213.66";
+    try l.release(io, file_a, skynet, .fromLength(0, 0));
+    try testing.expect(!try l.acquire(io, file_a, skynet, true, .fromLength(0, 10)));
+    try testing.expectEqual(0, try l.releaseHostAt(io, "art", skynet.address));
+    try testing.expect(try l.hostHoldsAt(io, "art", art.address));
+    try testing.expect(!try l.hostHoldsAt(io, "art", skynet.address));
+    try testing.expectEqual(1, try l.releaseHostAt(io, "art", art.address));
+    try testing.expectEqual(0, l.held.items.len);
 }
 
 test "ranges from offsets and lengths" {

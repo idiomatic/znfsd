@@ -13,6 +13,7 @@ All notable changes to znfsd are documented here. The format follows [Keep a Cha
 
 ### Fixed
 
+* Lock owners include the caller's address, so a client giving another's name and process can't release its locks, and can't take over its monitoring or its FREE_ALL
 * Renaming a directory forgets cached paths it grows past the path limit, rather than crashing the daemon when they're next used
 * An IPv4-mapped CLIENT (`::ffff:10.1.2.3`, or a CIDR of at least `/96`) is IPv4; one no longer crashes the daemon at the next IPv4 request
 * TCP listeners serve at most 1024 connections (`ConnectionOptions.max_connections`), and the web monitor drops requests with over 100 header lines
