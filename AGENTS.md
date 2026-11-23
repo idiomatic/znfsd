@@ -33,7 +33,7 @@ NFS v3 server daemon with few options and sensible defaults.
 * Ports: fixed; nfs 2049, mount 20048, stat 32765, lock 32803
 * TCP connections: up to 1024 per listener, each up to 16 calls at once; replies in any order, matched by XID
 * `--socket` default: root `/var/run/znfsd.sock`; else `$XDG_RUNTIME_DIR/znfsd.sock` (Linux), `$TMPDIR/znfsd.sock` (macOS)
-* `--db` default: root `/var/lib/znfsd/znfsd.db` (Linux), `/var/db/znfsd/znfsd.db` (macOS); else `~/.local/state/znfsd/znfsd.db` (Linux), `~/Library/Application Support/znfsd/znfsd.db` (macOS)
+* `--db` default: root `/var/lib/znfsd/znfsd.db` (Linux), `/var/db/znfsd/znfsd.db` (macOS); else `$XDG_STATE_HOME/znfsd/znfsd.db`, `$XDG_STATE_HOME` defaulting to `~/.local/state` (Linux), `~/Library/Application Support/znfsd/znfsd.db` (macOS)
 * `--run-as USER`: drops root after binding low ports, then accesses the host as USER; disables maps; gives USER the database's files, and its directory only if it holds nothing else
 * Database files: each a file of its own (no symbolic or hard links), so none aims znfsd's writes elsewhere
 * Maps: at most one per export rule, via `map=MAP`; translate UIDs and GIDs independently; requests map REMOTE to LOCAL, replies map LOCAL to its first REMOTE; local names resolve to numbers on `add`; a rule must name an existing map (stored, or the running daemon's), and `map del` refuses to leave a map that stored rules, or the daemon's, name with no entries
