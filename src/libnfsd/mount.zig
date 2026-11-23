@@ -172,8 +172,15 @@ pub const Mount = struct {
                 try e.boolean(false);
             },
             .umnt => {
+                // Records hold MNT's canonical paths.
                 const path = try d.string(max_path);
-                try m.unmount(ctx.io, host, path);
+                var canonical_buf: [sys.max_path]u8 = undefined;
+                var canonical: []const u8 = undefined;
+                if (sys.canonical(path, &canonical_buf, &canonical) != .SUCCESS) {
+                    const trimmed = std.mem.trimEnd(u8, path, "/");
+                    canonical = if (trimmed.len == 0 and path.len > 0) "/" else trimmed;
+                }
+                try m.unmount(ctx.io, host, canonical);
             },
             .umntall => try m.unmountAll(ctx.io, host),
             .@"export" => {
@@ -381,7 +388,19 @@ test "mount, list, and unmount" {
     }
     try testing.expectEqual(2, count);
 
-    _ = try callMount(&m, 3, .umnt, pathArg(&args_buf, share), lab, &out);
+    // UMNT finds MNT's canonical records by any spelling of their paths,
+    // even once they're gone.
+    const spelled = try std.fmt.allocPrint(testing.allocator, "{s}/sub/../", .{share});
+    defer testing.allocator.free(spelled);
+    _ = try callMount(&m, 3, .umnt, pathArg(&args_buf, spelled), lab, &out);
+    try testing.expectEqual(1, m.records.items.len);
+    try tmp.dir.deleteDir(testing.io, "share/sub");
+    const gone = try std.fmt.allocPrint(testing.allocator, "{s}/sub//", .{share});
+    defer testing.allocator.free(gone);
+    _ = try callMount(&m, 3, .umnt, pathArg(&args_buf, gone), lab, &out);
+    try testing.expectEqual(0, m.records.items.len);
+    r = try callMount(&m, 3, .mnt, pathArg(&args_buf, share), lab, &out);
+    try testing.expectEqual(0, std.mem.readInt(u32, r[0..4], .big));
     try testing.expectEqual(1, m.records.items.len);
     _ = try callMount(&m, 3, .umntall, "", lab, &out);
     try testing.expectEqual(0, m.records.items.len);

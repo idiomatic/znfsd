@@ -19,6 +19,7 @@ NFS v3 server daemon with few options and sensible defaults.
 * Host NFS services (e.g., macOS `nfsd`, Linux kernel `nfsd`/`lockd`): fail on any port or RPC registration collision
 * Exports: always sync, crossmnt, no subtree check, AUTH_SYS
 * MNT: ACCES unless the path lies, reached without links, inside an export admitting the caller, so it tells nothing of other paths
+* Mount records: MNT's canonical paths; UMNT canonicalizes too, else trims trailing slashes
 * READDIR and READDIRPLUS: `NFS3ERR_TOOSMALL` when no entry fits `maxcount`; `dircount` is a hint the first entry may exceed
 * Writes: UNSTABLE ones reach storage by COMMIT, others before the reply
 * fileid: the inode on the export root's file system; elsewhere, the inode with the filesystem ID folded in
