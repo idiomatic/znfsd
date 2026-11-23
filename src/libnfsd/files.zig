@@ -33,6 +33,10 @@ pub const Files = struct {
 
     const Key = struct { fsid: [16]u8, inode: u64 };
 
+    /// `ResumeFailed`: the thread couldn't act as the caller again after
+    /// using the store, so the request must go no further.
+    pub const Error = std.mem.Allocator.Error || Io.Cancelable || sys.ResumeError;
+
     pub fn init(gpa: std.mem.Allocator) Files {
         return .{ .gpa = gpa };
     }
@@ -48,7 +52,7 @@ pub const Files = struct {
     }
 
     /// Records `path` as where `h`'s file is.
-    pub fn remember(f: *Files, io: Io, h: fh.Handle, path: []const u8) (std.mem.Allocator.Error || Io.Cancelable)!void {
+    pub fn remember(f: *Files, io: Io, h: fh.Handle, path: []const u8) Error!void {
         {
             // The store can be slow, so the lock isn't held across it.
             try f.mutex.lock(io);
@@ -66,14 +70,14 @@ pub const Files = struct {
         if (f.store) |s| {
             // The store is the server's own: never touched as a caller.
             const caller = sys.pause();
-            defer sys.@"resume"(caller);
             s.remember(s.ptr, h.fsid, h.inode, path);
+            try sys.@"resume"(caller);
         }
     }
 
     /// Records many paths, storing only those new or changed, all at once.
     /// `entries` must stay valid during the call.
-    pub fn rememberAll(f: *Files, io: Io, entries: []const Entry) (std.mem.Allocator.Error || Io.Cancelable)!void {
+    pub fn rememberAll(f: *Files, io: Io, entries: []const Entry) Error!void {
         var changed: std.ArrayList(Entry) = .empty;
         defer changed.deinit(f.gpa);
         {
@@ -95,10 +99,10 @@ pub const Files = struct {
         if (changed.items.len == 0) return;
         const s = f.store orelse return;
         const caller = sys.pause();
-        defer sys.@"resume"(caller);
         if (s.rememberMany) |many| {
             many(s.ptr, changed.items);
         } else for (changed.items) |e| s.remember(s.ptr, e.fsid, e.inode, e.path);
+        try sys.@"resume"(caller);
     }
 
     pub fn forget(f: *Files, io: Io, h: fh.Handle) Io.Cancelable!void {
@@ -109,7 +113,7 @@ pub const Files = struct {
 
     /// After a directory moves from `old` to `new`, moves the cached paths
     /// of everything beneath it too, forgetting those grown too long to use.
-    pub fn renamePrefix(f: *Files, io: Io, old: []const u8, new: []const u8) (std.mem.Allocator.Error || Io.Cancelable)!void {
+    pub fn renamePrefix(f: *Files, io: Io, old: []const u8, new: []const u8) Error!void {
         try f.mutex.lock(io);
         defer f.mutex.unlock(io);
         var too_long: std.ArrayList(Key) = .empty;
@@ -129,8 +133,8 @@ pub const Files = struct {
         for (too_long.items) |k| if (f.paths.fetchRemove(k)) |kv| f.gpa.free(kv.value);
         if (f.store) |s| {
             const caller = sys.pause();
-            defer sys.@"resume"(caller);
             s.renamePrefix(s.ptr, old, new);
+            try sys.@"resume"(caller);
         }
     }
 
@@ -142,7 +146,7 @@ pub const Files = struct {
         return try arena.dupe(u8, p);
     }
 
-    pub const ResolveError = error{Stale} || Io.Cancelable;
+    pub const ResolveError = error{Stale} || Io.Cancelable || sys.ResumeError;
 
     /// Copies `h`'s path into `out`, NUL-terminated, and stats it without
     /// following links; the file there must still be `h`'s.
@@ -160,14 +164,18 @@ pub const Files = struct {
             std.mem.indexOfScalar(u8, out, 0).?
         else if (f.store) |s| lookup: {
             const caller = sys.pause();
-            defer sys.@"resume"(caller);
-            break :lookup s.lookup(s.ptr, h.fsid, h.inode, out[0..sys.max_path]) orelse return error.Stale;
+            const found = s.lookup(s.ptr, h.fsid, h.inode, out[0..sys.max_path]);
+            try sys.@"resume"(caller);
+            break :lookup found orelse return error.Stale;
         } else return error.Stale;
         out[len] = 0;
         const path = out[0..len :0];
         if (sys.lstatSafe(path, attr) != .SUCCESS) return error.Stale;
         if (attr.ino != h.inode or !h.eql(fh.Handle.fromAttr(h.export_id, attr.*))) return error.Stale;
-        if (!cached) f.remember(io, h, path) catch {};
+        if (!cached) f.remember(io, h, path) catch |err| switch (err) {
+            error.ResumeFailed => |e| return e,
+            error.OutOfMemory, error.Canceled => {},
+        };
         return path;
     }
 };

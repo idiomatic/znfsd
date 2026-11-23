@@ -511,8 +511,12 @@ pub fn pause() ?Identity {
 
 threadlocal var paused_gids: [max_groups]u32 = undefined;
 
-pub fn @"resume"(id: ?Identity) void {
-    if (id) |i| _ = become(i);
+pub const ResumeError = error{ResumeFailed};
+
+/// Acts as the paused caller again. On failure the thread is left as the
+/// server, so the request must go no further: callers return the error.
+pub fn @"resume"(id: ?Identity) ResumeError!void {
+    if (id) |i| if (become(i) != .SUCCESS) return error.ResumeFailed;
 }
 
 pub fn isRoot() bool {
@@ -802,7 +806,7 @@ test "act as another user, then revert" {
     const paused = pause();
     try testing.expectEqual(E.SUCCESS, createIn(dir, "server", true, 0o600, &fd));
     closeFd(fd);
-    @"resume"(paused);
+    try @"resume"(paused);
     // Root's override is gone: root's private file can't be opened.
     try testing.expectEqual(E.ACCES, createIn(dir, "server", false, 0o600, &fd));
     revert();
@@ -812,6 +816,12 @@ test "act as another user, then revert" {
     try testing.expectEqual(4242, attr.uid);
     try testing.expectEqual(E.SUCCESS, statIn(dir, "server", &attr));
     try testing.expectEqual(0, attr.uid);
+}
+
+test "a failed resume is an error" {
+    if (isRoot()) return error.SkipZigTest; // root can become anyone
+    try testing.expectError(error.ResumeFailed, @"resume"(.{ .uid = 4242, .gid = 4242 }));
+    try @"resume"(null);
 }
 
 test "an owner opens their own file whatever its mode" {

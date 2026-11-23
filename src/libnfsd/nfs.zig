@@ -201,7 +201,7 @@ pub const Nfs = struct {
         var attr: sys.Attr = undefined;
         const path = n.files.resolve(io, h, &out.path_buf, &attr) catch |err| switch (err) {
             error.Stale => exportRootPath(n.files, table, io, h, &attr, &out.path_buf) orelse return false,
-            error.Canceled => return false,
+            error.Canceled, error.ResumeFailed => return false,
         };
         if (table.match(path, from, null) == null) return false;
         out.file = .{ .fsid = h.fsid, .inode = h.inode };
@@ -226,7 +226,7 @@ pub const Nfs = struct {
         defer if (n.root) sys.revert();
         r.dispatch(@fromBackingInt(@intCast(call.proc))) catch |err| return switch (err) {
             error.Truncated, error.TooLong, error.Invalid => .garbage_args,
-            error.WriteFailed, error.OutOfMemory, error.Canceled => .system_err,
+            error.WriteFailed, error.OutOfMemory, error.Canceled, error.ResumeFailed => .system_err,
         };
         return .success;
     }
@@ -241,7 +241,7 @@ const Found = struct {
     match: exports.Table.Match,
 };
 
-const Error = xdr.DecodeError || Io.Writer.Error || std.mem.Allocator.Error || Io.Cancelable;
+const Error = xdr.DecodeError || Io.Writer.Error || std.mem.Allocator.Error || Io.Cancelable || sys.ResumeError;
 
 const Request = struct {
     n: *Nfs,
@@ -382,7 +382,7 @@ const Request = struct {
         var attr: sys.Attr = undefined;
         const path = r.n.files.resolve(r.ctx.io, h, buf, &attr) catch |err| switch (err) {
             error.Stale => r.exportRoot(h, &attr, buf) orelse return .{ .failed = .stale },
-            error.Canceled => return error.Canceled,
+            error.Canceled, error.ResumeFailed => |e| return e,
         };
         const match = r.table.match(path, r.ctx.from, null) orelse return .{ .failed = .acces };
         r.map = r.mapOf(match.rule);
@@ -1302,7 +1302,11 @@ fn exportRootPath(files: *Files, table: *const exports.Table, io: Io, h: fh.Hand
         const path = copyZ(buf, rule.path);
         if (sys.lstatSafe(path, attr) != .SUCCESS) continue;
         if (!h.eql(fh.Handle.fromAttr(h.export_id, attr.*))) continue;
-        files.remember(io, h, path) catch {};
+        // Not acting as a caller again, it can't go on.
+        files.remember(io, h, path) catch |err| switch (err) {
+            error.ResumeFailed => return null,
+            error.OutOfMemory, error.Canceled => {},
+        };
         return path;
     }
     return null;
