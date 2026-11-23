@@ -129,8 +129,8 @@ pub fn run(io: Io, gpa: std.mem.Allocator, config: Config, registrations: []cons
             for (listeners.items) |l| for (l.programs) |p| {
                 var v = p.low;
                 while (v <= p.high) : (v += 1) {
-                    _ = pmap.set(io, .{ .prog = p.prog, .vers = v, .prot = .udp, .port = l.port }) catch |err| return mapSetError(err);
-                    _ = pmap.set(io, .{ .prog = p.prog, .vers = v, .prot = .tcp, .port = l.port }) catch |err| return mapSetError(err);
+                    _ = try pmap.set(io, .{ .prog = p.prog, .vers = v, .prot = .udp, .port = l.port });
+                    _ = try pmap.set(io, .{ .prog = p.prog, .vers = v, .prot = .tcp, .port = l.port });
                 }
             };
             log.info("started a portmapper on port {d}", .{config.portmap_port});
@@ -153,13 +153,6 @@ pub fn run(io: Io, gpa: std.mem.Allocator, config: Config, registrations: []cons
         } });
     }
     try group.await(io);
-}
-
-fn mapSetError(err: anytype) Error {
-    return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.Canceled => error.RegistrationRefused,
-    };
 }
 
 /// Both unspecified addresses become one dual-stack `::`, since a TCP
@@ -243,6 +236,8 @@ fn register(io: Io, config: Config, registrations: []const Registration, listene
             }
         }
     }
+    // None was registered, so any registered from here on is ours.
+    errdefer unregister(io, config, registrations);
     for (listeners) |l| for (l.programs) |p| {
         var v = p.low;
         while (v <= p.high) : (v += 1) {
@@ -339,6 +334,58 @@ test "register with an existing portmapper, serve, and unregister" {
 
     _ = service.cancel(io) catch {};
     try testing.expectEqual(0, try client.getport(100005, 3, .udp));
+}
+
+test "a refused registration undoes the others" {
+    const io = testing.io;
+
+    // A portmapper that refuses to register one program.
+    const Refusing = struct {
+        pmap: portmap.Server,
+        refused: u32,
+
+        fn handle(ptr: *anyopaque, ctx: server.Context, call: rpc.Call, results: *Io.Writer) rpc.Reply {
+            const r: *@This() = @ptrCast(@alignCast(ptr));
+            if (call.proc == @backingInt(portmap.Proc.set)) {
+                var d: @import("xdr.zig").Decoder = .init(call.args);
+                const m = portmap.Mapping.decode(&d) catch return .garbage_args;
+                if (m.prog == r.refused) {
+                    @import("xdr.zig").Encoder.init(results).boolean(false) catch return .system_err;
+                    return .success;
+                }
+            }
+            var program = r.pmap.program();
+            return program.handle(program.ptr, ctx, call, results);
+        }
+    };
+    var refusing: Refusing = .{ .pmap = .init(testing.allocator), .refused = 400001 };
+    defer refusing.pmap.deinit();
+    const pmap_programs = [_]server.Program{.{ .prog = portmap.prog, .low = 2, .high = 2, .ptr = &refusing, .handle = Refusing.handle }};
+    const loopback: net.IpAddress = .{ .ip4 = .loopback(0) };
+    const pmap_udp = try loopback.bind(io, .{ .mode = .dgram, .protocol = .udp });
+    defer pmap_udp.close(io);
+    var pmap_group: Io.Group = .init;
+    defer pmap_group.cancel(io);
+    try pmap_group.concurrent(io, server.serveUdp, .{ io, testing.allocator, &pmap_programs, pmap_udp, null });
+
+    // NFS's listeners come first, so program 400002 is registered before
+    // 400001 is refused.
+    var dummy: u8 = 0;
+    const registrations = [_]Registration{
+        .{ .program = .{ .prog = 400001, .low = 1, .high = 1, .ptr = &dummy, .handle = nullHandler }, .service = .mount },
+        .{ .program = .{ .prog = 400002, .low = 1, .high = 1, .ptr = &dummy, .handle = nullHandler }, .service = .nfs },
+    };
+    const config: Config = .{
+        .binds = &.{loopback},
+        .ports = .{ .nfs = 0, .mount = 0, .stat = 0, .lock = 0 },
+        .portmap_address = pmap_udp.address,
+    };
+    var diag: Diagnostic = .{};
+    try testing.expectError(error.RegistrationRefused, run(io, testing.allocator, config, &registrations, &diag));
+    var client: portmap.Client = try .init(io, pmap_udp.address, .{ .raw = .fromSeconds(1), .clock = .awake });
+    defer client.deinit();
+    try testing.expectEqual(0, try client.getport(400002, 1, .udp));
+    try testing.expectEqual(0, try client.getport(400002, 1, .tcp));
 }
 
 test "both unspecified addresses become one dual-stack address" {
