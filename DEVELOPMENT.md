@@ -78,10 +78,6 @@ Each covers only what changed since the commit it last looked at.
 
 From the code review of `ee622cc`; each leaves this list when fixed or accepted as a limit.
 
-### High
-
-* **`--run-as` gives away files:** it changes the owner of `--db`'s parent directory, whatever it is, and follows symbolic links doing so ([daemon.zig:453](src/znfsd/daemon.zig:453), [daemon.zig:471](src/znfsd/daemon.zig:471)); a link planted at `znfsd.db-shm` hands its target to USER at the next start. Use `AT_SYMLINK_NOFOLLOW`, and change only directories znfsd created.
-
 ### Medium
 
 * **Symbolic links mid-path escape the export for metadata:** path-based `lstat` and `readLink` ([sys.zig:40](src/libnfsd/sys.zig:40), [sys.zig:550](src/libnfsd/sys.zig:550)) follow links in every component but the last. In `Files.resolve`, LOOKUP, and READDIRPLUS, a client racing a RENAME and SYMLINK gets and keeps a handle whose GETATTR, ACCESS, READLINK, and LOOKUP reach outside the export (reads and writes still fail in `openSafe`). Stat and read links through descriptors from `openSafe`.

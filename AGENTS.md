@@ -31,7 +31,8 @@ NFS v3 server daemon with few options and sensible defaults.
 * TCP connections: up to 1024 per listener, each up to 16 calls at once; replies in any order, matched by XID
 * `--socket` default: root `/var/run/znfsd.sock`; else `$XDG_RUNTIME_DIR/znfsd.sock` (Linux), `$TMPDIR/znfsd.sock` (macOS)
 * `--db` default: root `/var/lib/znfsd/znfsd.db` (Linux), `/var/db/znfsd/znfsd.db` (macOS); else `~/.local/state/znfsd/znfsd.db` (Linux), `~/Library/Application Support/znfsd/znfsd.db` (macOS)
-* `--run-as USER`: drops root after binding low ports, then accesses the host as USER; disables maps
+* `--run-as USER`: drops root after binding low ports, then accesses the host as USER; disables maps; gives USER the database's files, and its directory only if it holds nothing else
+* Database files: each a file of its own (no symbolic or hard links), so none aims znfsd's writes elsewhere
 * Maps: at most one per export rule, via `map=MAP`; translate UIDs and GIDs independently; requests map REMOTE to LOCAL, replies map LOCAL to its first REMOTE; local names resolve to numbers on `add`
 * Anon: a map's REMOTE-less entry; unmapped IDs and squash use it; without one, unmapped IDs pass through and squash uses the host's `nobody`
 * `serve` ephemera: exports, `--group`, and `--map` shadow stored rules, groups, and maps of the same key while serving, without being stored; `--group` and `--map` repeat, one entry each

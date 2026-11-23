@@ -100,6 +100,16 @@ fn openDb(io: Io, arena: std.mem.Allocator, globals: cli.Globals, environ: *cons
         try stderr.print("znfsd: {s}: {t}\n", .{ dir, err });
         return null;
     };
+    // Each a file of its own, so a link can't aim writes at another file.
+    for ([_][]const u8{ "", "-wal", "-shm" }) |suffix| {
+        const file = try std.fmt.allocPrintSentinel(arena, "{s}{s}", .{ path, suffix }, 0);
+        var attr: libnfsd.sys.Attr = undefined;
+        if (libnfsd.sys.lstat(file, &attr) != .SUCCESS) continue;
+        if (attr.mode & std.c.S.IFMT != std.c.S.IFREG or attr.nlink != 1) {
+            try stderr.print("znfsd: {s}: not a file of its own\n", .{file});
+            return null;
+        }
+    }
     return dbm.Db.open(path) catch {
         try stderr.print("znfsd: {s}: can't open the database\n", .{path});
         return null;

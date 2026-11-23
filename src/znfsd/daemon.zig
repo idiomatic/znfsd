@@ -449,10 +449,11 @@ const Drop = struct {
     fn call(ptr: *anyopaque, diag: *libnfsd.service.Diagnostic) bool {
         const d: *Drop = @ptrCast(@alignCast(ptr));
         // The database's directory and files, and the control socket.
-        var buf: [libnfsd.sys.max_path + 8]u8 = undefined;
-        if (std.fs.path.dirname(d.db_path)) |dir| chown(&buf, dir, "", d);
-        for ([_][]const u8{ "", "-wal", "-shm" }) |suffix| chown(&buf, d.db_path, suffix, d);
-        chown(&buf, d.socket_path, "", d);
+        if (!d.giveDatabase(diag)) return false;
+        var buf: [libnfsd.sys.max_path + 1]u8 = undefined;
+        if (std.fmt.bufPrintSentinel(&buf, "{s}", .{d.socket_path}, 0)) |z| {
+            _ = std.c.fchownat(std.c.AT.FDCWD, z, d.uid, d.gid, std.c.AT.SYMLINK_NOFOLLOW);
+        } else |_| {}
         if (initgroups(d.name, @bitCast(d.gid)) != 0 or std.c.setgid(d.gid) != 0 or std.c.setuid(d.uid) != 0) {
             diag.set("--run-as {s}: can't drop root", .{d.name});
             return false;
@@ -466,9 +467,63 @@ const Drop = struct {
         return true;
     }
 
-    fn chown(buf: []u8, path: []const u8, suffix: []const u8, d: *const Drop) void {
-        const z = std.fmt.bufPrintSentinel(buf, "{s}{s}", .{ path, suffix }, 0) catch return;
-        _ = std.c.fchownat(std.c.AT.FDCWD, z, d.uid, d.gid, 0);
+    /// Gives the user the database's files, and its directory unless it
+    /// holds anything else, refusing links, so no other file is given
+    /// away, whatever the directory holds.
+    fn giveDatabase(d: *const Drop, diag: *libnfsd.service.Diagnostic) bool {
+        const sys = libnfsd.sys;
+        const dir_path = std.fs.path.dirname(d.db_path) orelse ".";
+        const base = std.fs.path.basename(d.db_path);
+        var buf: [sys.max_path + 1]u8 = undefined;
+        const dir_z = std.fmt.bufPrintSentinel(&buf, "{s}", .{dir_path}, 0) catch return d.refuse(diag, dir_path, "too long");
+        var dir: sys.Fd = undefined;
+        if (sys.openSafe(dir_z, .{ .DIRECTORY = true }, 0, &dir) != .SUCCESS) return d.refuse(diag, dir_path, "can't be opened without following links");
+        defer sys.closeFd(dir);
+        var attr: sys.Attr = undefined;
+        if (sys.fstat(dir, &attr) != .SUCCESS) return d.refuse(diag, dir_path, "can't be read");
+        if (attr.uid != d.uid) {
+            if (!onlyDatabase(dir, base)) return d.refuse(diag, dir_path, "holds more than the database; give --db a directory of its own");
+            if (sys.chownFd(dir, d.uid, d.gid) != .SUCCESS) return d.refuse(diag, dir_path, "can't be given to the user");
+        }
+        for ([_][]const u8{ "", "-wal", "-shm" }) |suffix| {
+            const path = std.fmt.bufPrintSentinel(&buf, "{s}{s}", .{ d.db_path, suffix }, 0) catch return d.refuse(diag, d.db_path, "too long");
+            var fd: sys.Fd = undefined;
+            switch (sys.openSafe(path, .{ .NONBLOCK = true }, 0, &fd)) {
+                .SUCCESS => {},
+                .NOENT => continue,
+                else => return d.refuse(diag, path, "can't be opened without following links"),
+            }
+            defer sys.closeFd(fd);
+            if (sys.fstat(fd, &attr) != .SUCCESS or attr.mode & std.c.S.IFMT != std.c.S.IFREG or attr.nlink != 1)
+                return d.refuse(diag, path, "isn't a file of its own");
+            if (sys.chownFd(fd, d.uid, d.gid) != .SUCCESS) return d.refuse(diag, path, "can't be given to the user");
+        }
+        return true;
+    }
+
+    /// Whether the directory at `dir` holds only the database `base`.
+    fn onlyDatabase(dir: libnfsd.sys.Fd, base: []const u8) bool {
+        const sys = libnfsd.sys;
+        const copy = std.c.dup(dir);
+        if (copy < 0) return false;
+        var reader: sys.DirReader = undefined;
+        if (sys.DirReader.fromFd(copy, &reader) != .SUCCESS) return false;
+        defer reader.close();
+        while (reader.next()) |entry| {
+            const name = entry.name;
+            if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+            if (!std.mem.startsWith(u8, name, base)) return false;
+            const suffix = name[base.len..];
+            for ([_][]const u8{ "", "-wal", "-shm", "-journal" }) |s| {
+                if (std.mem.eql(u8, suffix, s)) break;
+            } else return false;
+        }
+        return true;
+    }
+
+    fn refuse(d: *const Drop, diag: *libnfsd.service.Diagnostic, path: []const u8, why: []const u8) bool {
+        diag.set("--run-as {s}: {s} {s}", .{ d.name, path, why });
+        return false;
     }
 };
 

@@ -109,7 +109,7 @@ An export argument is `PATH[:OPTIONS[:CLIENTS]]`. Clients come last so IPv6 addr
 
 ## Running unprivileged
 
-As root, znfsd can start its own portmapper. With `--run-as USER`, it binds its ports and then drops to USER, accessing files as that user. Without root at all, it needs an existing portmapper to register with. Linux distributions' `rpcbind` accepts registrations from ordinary users, and on macOS, znfsd wakes the system's on-demand `rpcbind` itself, so an unprivileged znfsd normally registers, locking included. Its fixed ports (nfs 2049, mount 20048, stat 32765, lock 32803) are all unprivileged, which also keeps firewall rules stable.
+As root, znfsd can start its own portmapper. With `--run-as USER`, it binds its ports and then drops to USER, accessing files as that user. USER gets the database's files first, and its directory if that holds nothing else (the default does), so give `--db` a directory of its own. znfsd refuses database files that are symbolic or hard links, which USER could otherwise aim at files root owns. Without root at all, it needs an existing portmapper to register with. Linux distributions' `rpcbind` accepts registrations from ordinary users, and on macOS, znfsd wakes the system's on-demand `rpcbind` itself, so an unprivileged znfsd normally registers, locking included. Its fixed ports (nfs 2049, mount 20048, stat 32765, lock 32803) are all unprivileged, which also keeps firewall rules stable.
 
 On hosts with no portmapper at all, `--no-portmap` skips registration altogether. Clients must then name the ports, and file locking is off:
 
