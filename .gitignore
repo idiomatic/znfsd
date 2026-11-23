@@ -13,9 +13,8 @@ _*.md
 ,*.md
 *.egress/
 
-# Coordination among agents (shared from the main worktree)
-.coordination/locks/
-.coordination/sessions/
+# Coordination among agents, local only
+.coordination/
 
 # Editors and OS
 *~
