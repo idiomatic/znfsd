@@ -265,8 +265,8 @@ const Daemon = struct {
     table: *const exports.Table,
     activity: activity_.Activity,
 
-    /// Builds the table: stored rules and groups, with ephemeral ones laid
-    /// over them by path and client, and by name.
+    /// Builds the table: stored rules, groups, and maps, with ephemeral ones
+    /// laid over them by path and client, and by name.
     fn build(d: *Daemon, err: *Io.Writer) !*const exports.Table {
         const arena = d.tables.allocator();
         const stored = d.db.table(arena) catch |e| {

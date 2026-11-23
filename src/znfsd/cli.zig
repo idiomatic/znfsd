@@ -16,7 +16,7 @@ pub const Verb = enum { list, add, set, del };
 
 pub const Command = struct {
     noun: Noun,
-    /// Null for `serve`, `stop`, and `help`.
+    /// Null for `serve`, `stop`, `activity`, and `help`.
     verb: ?Verb = null,
     /// Arguments after the command, unparsed.
     args: []const []const u8 = &.{},

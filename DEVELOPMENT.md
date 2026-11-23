@@ -99,7 +99,7 @@ From the code review of `ee622cc`; each leaves this list when fixed or accepted 
 * **Callbacks:** a `GRANTED_MSG` argument can exceed `callback.zig`'s 2048-byte buffer ([callback.zig:49](src/libnfsd/callback.zig:49)); replies aren't checked against the address called; FREE_ALL decodes `max_string + 1` ([nlm.zig:231](src/libnfsd/nlm.zig:231)).
 * **`mapSetError` reports cancellation as a refusal** ([service.zig:158](src/libnfsd/service.zig:158)); `dispatch` asserts 24 bytes of `out` but may write 32 ([server.zig:60](src/libnfsd/server.zig:60)).
 * **Anti-patterns:** control flags in `readdir(plus)`, `remove(directory)`, `make(kind)`, `unlinkIn(directory)`, `createIn(exclusive)`, `callback.call(reply: ?…)`, and nullable-means-all in `releaseHost(?File)`, `unmount(?path)`, and `forget(?path)`; boolean blindness in CREATE's raw `how`, WRITE's stability as a bool, and `server_groups_state` as 0/1/2.
-* **Clarity:** `statIn` duplicates `statAt`; `if (kind == .lnk) .lnk else kind` ([nfs.zig:1096](src/libnfsd/nfs.zig:1096)); comments in [commands.zig](src/znfsd/commands.zig:1), [db.zig](src/znfsd/db.zig:1), and `Command.verb` ([cli.zig:19](src/znfsd/cli.zig:19)) omit maps and `activity`.
+* **Clarity:** `statIn` duplicates `statAt`, and `if (kind == .lnk) .lnk else kind` ([nfs.zig:1096](src/libnfsd/nfs.zig:1096)).
 * **Spec ahead of code:** [AGENTS.md](AGENTS.md) states handle resolution by `open_by_handle_at` and `fsgetpath`, and volume UUIDs in handles, which aren't built; mark them unbuilt there until they ship.
 
 ## To do

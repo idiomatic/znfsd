@@ -1,4 +1,5 @@
-//! znfsd's state in SQLite: export rules, groups, and mount records.
+//! znfsd's state in SQLite: export rules, groups, maps, mount records,
+//! file handles' paths, and the status monitor's hosts and state number.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -467,7 +468,7 @@ pub const Db = struct {
         return .{ .ptr = db, .monitor = S.monitor, .unmonitor = S.unmonitor };
     }
 
-    /// Builds an export table from the stored rules and groups.
+    /// Builds an export table from the stored rules, groups, and maps.
     pub fn table(db: *Db, arena: std.mem.Allocator) (Error || exports.Client.ParseError || exports.Options.ParseError || error{BadMap})!Loaded {
         var loaded: Loaded = .{};
         for (try db.members(arena, null)) |m| {
@@ -494,7 +495,7 @@ pub const Db = struct {
     }
 };
 
-/// Stored rules and groups, before ephemeral ones are laid over them.
+/// Stored rules, groups, and maps, before ephemeral ones are laid over them.
 pub const Loaded = struct {
     rules: std.ArrayList(exports.Rule) = .empty,
     groups: std.StringHashMapUnmanaged(std.ArrayList(exports.Client)) = .empty,

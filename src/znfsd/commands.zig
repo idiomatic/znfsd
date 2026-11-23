@@ -1,4 +1,4 @@
-//! The `export`, `group`, and `mount` commands, on the database.
+//! The `export`, `group`, `map`, and `mount` commands, on the database.
 
 const std = @import("std");
 const Io = std.Io;
