@@ -181,36 +181,36 @@ pub const Mount = struct {
 
     /// Checks access to `path` and makes its handle.
     fn mnt(m: *Mount, ctx: server.Context, host: []const u8, path: []const u8, out: *[fh.size]u8) !Status {
+        // Callers learn what exists only inside exports that admit them,
+        // reached without following links, as NFS reaches files.
         var canonical_buf: [sys.max_path]u8 = undefined;
         var canonical: []const u8 = undefined;
-        const resolved = sys.canonical(path, &canonical_buf, &canonical);
-        if (resolved != .SUCCESS) {
-            // Callers the path's export doesn't admit learn nothing about
-            // what exists.
+        var z: [sys.max_path + 1]u8 = undefined;
+        var attr: sys.Attr = undefined;
+        if (sys.canonical(path, &canonical_buf, &canonical) != .SUCCESS) {
             var parts = std.mem.splitScalar(u8, path, '/');
             const dotdot = while (parts.next()) |p| {
                 if (std.mem.eql(u8, p, "..")) break true;
             } else false;
-            if (dotdot or m.currentTable().match(path, ctx.from, null) == null) return .acces;
-            return switch (resolved) {
+            if (dotdot or path.len > sys.max_path or m.currentTable().match(path, ctx.from, null) == null) return .acces;
+            @memcpy(z[0..path.len], path);
+            z[path.len] = 0;
+            return switch (sys.lstatSafe(z[0..path.len :0], &attr)) {
+                .SUCCESS => .io, // there now: changed since resolving
                 .NOENT => .noent,
                 .NOTDIR => .notdir,
                 .NAMETOOLONG => .nametoolong,
-                .ACCES => .acces,
-                else => .io,
+                else => .acces,
             };
         }
         const match = m.currentTable().match(canonical, ctx.from, null) orelse return .acces;
 
-        var attr: sys.Attr = undefined;
-        var z: [sys.max_path + 1]u8 = undefined;
         @memcpy(z[0..canonical.len], canonical);
         z[canonical.len] = 0;
-        switch (sys.lstat(z[0..canonical.len :0], &attr)) {
+        switch (sys.lstatSafe(z[0..canonical.len :0], &attr)) {
             .SUCCESS => {},
             .NOENT => return .noent,
-            .ACCES => return .acces,
-            else => return .io,
+            else => return .acces,
         }
         if (attr.mode & std.posix.S.IFMT != std.posix.S.IFDIR) return .notdir;
         out.* = fh.Handle.fromAttr(exportId(match.path), attr).encode();
@@ -334,6 +334,23 @@ test "mount, list, and unmount" {
 
     r = try callMount(&m, 1, .mnt, pathArg(&args_buf, share), lab, &out);
     try testing.expectEqual(@backingInt(Status.notsupp), std.mem.readInt(u32, r[0..4], .big));
+
+    // What's missing inside is missing; through a link out, nothing is
+    // told, whether or not it exists.
+    try tmp.dir.createDirPath(testing.io, "outside/present");
+    try tmp.dir.symLink(testing.io, "../outside", "share/out", .{});
+    for ([_]struct { []const u8, Status }{
+        .{ "missing", .noent },
+        .{ "file/sub", .notdir },
+        .{ "out/present", .acces },
+        .{ "out/missing", .acces },
+        .{ "out/present/missing", .acces },
+    }) |c| {
+        const p = try std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ share, c[0] });
+        defer testing.allocator.free(p);
+        r = try callMount(&m, 3, .mnt, pathArg(&args_buf, p), lab, &out);
+        try testing.expectEqual(@backingInt(c[1]), std.mem.readInt(u32, r[0..4], .big));
+    }
 
     // Two records, for the export and its subdirectory.
     r = try callMount(&m, 3, .dump, "", lab, &out);
