@@ -54,10 +54,15 @@ pub const Program = struct {
 /// and SUCCESS. Results are written after it, so they needn't be copied.
 const success_header = 24;
 
-/// Answers `message`, writing the reply into `out`. Returns the reply, or
-/// null when the message gets none.
+/// Size of the largest status reply, PROG_MISMATCH's: a success header
+/// whose status is followed by a version range.
+pub const max_status_reply = success_header + 8;
+
+/// Answers `message`, writing the reply into `out`, which must hold at
+/// least `max_status_reply` bytes. Returns the reply, or null when the
+/// message gets none.
 pub fn dispatch(programs: []const Program, ctx: Context, message: []const u8, out: []u8) ?[]const u8 {
-    std.debug.assert(out.len >= success_header);
+    std.debug.assert(out.len >= max_status_reply);
     const call, const reply: rpc.Reply = switch (rpc.decodeCall(message)) {
         .ignore => return null,
         .reject => |r| return encodeStatus(out, r.xid, r.reply),
@@ -100,7 +105,7 @@ pub fn dispatch(programs: []const Program, ctx: Context, message: []const u8, ou
 
 fn encodeStatus(out: []u8, xid: u32, reply: rpc.Reply) []const u8 {
     var w: Io.Writer = .fixed(out);
-    reply.encode(.init(&w), xid) catch unreachable; // a status header fits in `success_header` bytes plus a range
+    reply.encode(.init(&w), xid) catch unreachable; // fits in `max_status_reply`
     return w.buffered();
 }
 
@@ -664,7 +669,11 @@ test "dispatch to programs, versions, and procedures" {
     reply = dispatch(&programs, ctx, encodeCall(&call_buf, 400000, 2, 7, ""), &out).?;
     try testing.expectEqual(@backingInt(rpc.AcceptStat.proc_unavail), acceptStat(reply));
 
-    var too_small: [26]u8 = undefined;
+    // The smallest `out` holds every status reply, but not these results.
+    var too_small: [max_status_reply]u8 = undefined;
+    reply = dispatch(&programs, ctx, encodeCall(&call_buf, 400000, 3, 0, ""), &too_small).?;
+    try testing.expectEqual(@backingInt(rpc.AcceptStat.prog_mismatch), acceptStat(reply));
+    try testing.expectEqual(max_status_reply, reply.len);
     reply = dispatch(&programs, ctx, encodeCall(&call_buf, 400000, 1, 1, "perihelion\x00\x00"), &too_small).?;
     try testing.expectEqual(@backingInt(rpc.AcceptStat.system_err), acceptStat(reply));
     try testing.expectEqual(3, echo.calls);

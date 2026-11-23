@@ -177,7 +177,7 @@ File handles are 36 bytes: format version, export ID (a hash of the export path)
 
 ## Other transports
 
-`server.dispatch(programs, ctx, message, out)` answers one RPC message, writing into `out`, or returns null when none is due; `rpc.record` frames TCP records. These serve RPC over anything, or test without sockets.
+`server.dispatch(programs, ctx, message, out)` answers one RPC message, writing into `out` (at least `server.max_status_reply` bytes), or returns null when none is due; `rpc.record` frames TCP records. These serve RPC over anything, or test without sockets.
 
 ## Limits
 
