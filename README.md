@@ -124,7 +124,7 @@ If the host's own NFS server or kernel lock manager already holds a port or RPC 
 
 znfsd keeps exports, groups, maps, file handles, mount records, and statd's monitor list in SQLite. Locks live only in memory: after a restart, znfsd notifies its clients, which reclaim their locks during a grace period of about 90 seconds. Locks coordinate NFS clients with each other; processes on the server itself don't see them.
 
-File handles identify a file by filesystem and inode rather than path, so they survive renames, including ones made directly on the host. Exports cross into file systems mounted inside them; since a client sees the whole mount as one device, files there get inode numbers with their file system's ID folded in, so tools that spot hard links by device and inode (`tar`, `rsync -H`, backups) don't mistake files in two file systems for one.
+File handles identify a file by filesystem and inode rather than path, so they survive renames made through NFS. They find the file through its last-known path, so one renamed directly on the host goes stale until opening by handle, planned in [DEVELOPMENT.md](DEVELOPMENT.md), is built. Exports cross into file systems mounted inside them; since a client sees the whole mount as one device, files there get inode numbers with their file system's ID folded in, so tools that spot hard links by device and inode (`tar`, `rsync -H`, backups) don't mistake files in two file systems for one.
 
 Writes reach storage before the reply, except those a client sends as unstable, which reach it by the client's next COMMIT (on `fsync` or close), as Linux's kernel server does for `sync` exports. If znfsd restarts in between, clients see that and send those writes again.
 

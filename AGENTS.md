@@ -47,9 +47,9 @@ NFS v3 server daemon with few options and sensible defaults.
 * Lock limits: locks 4096 per client address and 32768 in all; blocked requests, granted ones awaiting confirmation included, 64 per address and 1024 in all; monitored hosts 16 names per address and 16384 in all; past any, `denied_nolocks`
 * Restart: increment the NSM state number; once every service is bound and registered, send SM_NOTIFY to monitored hosts and grant only lock reclaims during a ~90 s grace period
 * `mount del` and `lock del`: also drop the host from the statd monitor list
-* File handles: ≤64 bytes: format version, export ID, filesystem ID (volume UUID where available), inode, and generation (0 when unreadable)
+* File handles: ≤64 bytes: format version, export ID, filesystem ID (the device number), inode, and generation (0 when unreadable)
 * Paths from clients or handles: opened, stated, read as links, and queried for capacity through descriptors that follow no symbolic link in any component, so none reaches outside its export
-* Handle resolution: `open_by_handle_at` (Linux), `fsgetpath` (macOS), else the stored last-known path if its inode matches; else `NFS3ERR_STALE`; NFS renames update stored paths
+* Handle resolution: the stored last-known path if its device and inode match; else `NFS3ERR_STALE`; NFS renames update stored paths
 * Control: Unix socket at `--socket`, mode 0600; `serve` claims it before changing stored state, so a second `serve` changes nothing; replaces only a stale socket, nothing else; a peer has 5 s to send its request, and 5 s to take the reply
 * Admin web server: `--web`, default `127.0.0.1:8049`; live activity monitor only, no auth; at most 64 connections at once, each closed after 10 s
 * `activity`: the monitor's snapshot as JSON, from the running daemon

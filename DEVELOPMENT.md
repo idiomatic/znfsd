@@ -87,12 +87,11 @@ From the code review of `ee622cc`; each leaves this list when fixed or accepted 
 * **Server groups past 32 are dropped** by `saveServerGroups`, and `restoreLinux` restores fsgid 0, not the process's own ([sys.zig:391](src/libnfsd/sys.zig:391)).
 * **Anti-patterns:** control flags in `readdir(plus)`, `remove(directory)`, `make(kind)`, `unlinkIn(directory)`, and `createIn(exclusive)`; boolean blindness in CREATE's raw `how`, WRITE's stability as a bool, and `server_groups_state` as 0/1/2.
 * **Clarity:** `statIn` duplicates `statAt`, and `if (kind == .lnk) .lnk else kind` ([nfs.zig:1096](src/libnfsd/nfs.zig:1096)).
-* **Spec ahead of code:** [AGENTS.md](AGENTS.md) states handle resolution by `open_by_handle_at` and `fsgetpath`, and volume UUIDs in handles, which aren't built; mark them unbuilt there until they ship.
 
 ## To do
 
 * Host-name matching: forward-confirmed reverse DNS, cached and resolved asynchronously, for `host` and `*.domain` clients
-* Handle resolution: `open_by_handle_at` (Linux) and `fsgetpath` (macOS) before the last-known path; volume UUIDs as file-system IDs
+* Handle resolution: `open_by_handle_at` (Linux) and `fsgetpath` (macOS) before the last-known path, so handles outlive changes made on the server itself; volume UUIDs, where available, as file-system IDs in place of device numbers
 
 ## File-system backends
 
