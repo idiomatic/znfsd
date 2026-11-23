@@ -17,6 +17,7 @@ All notable changes to znfsd are documented here. The format follows [Keep a Cha
 * UMNT canonicalizes its path as MNT does, so unmounting `/srv/share/` or a since-removed directory forgets its mount record
 * On Linux, a thread done acting as a caller gets back all the server's supplementary groups, not just the first 32, and file-system IDs that follow its effective ones rather than root's
 * A request whose thread can't act as its caller again after a path-cache database write fails, rather than going on as the server
+* FSSTAT reports files available to unprivileged users (`f_favail`) as `afiles` on Linux, not the free count; macOS, which has no such count, still reports the free one
 * READLINK and SYMLINK take link targets up to the host's `PATH_MAX`, not 1024 bytes, and answer NAMETOOLONG past it, rather than READLINK truncating the target and SYMLINK answering GARBAGE_ARGS
 * CREATE UNCHECKED of an existing file applies only the size, as Linux's server does, rather than reapplying the mode (and, on macOS, the group), which refused non-owners with PERM
 * READDIR and READDIRPLUS answer `NFS3ERR_TOOSMALL` when no entry fits `maxcount`, and send one entry even past `dircount`, so a client is never sent an empty, unfinished listing to ask for again forever

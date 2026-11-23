@@ -540,6 +540,8 @@ pub const FsStat = struct {
     blocks_avail: u64,
     files: u64,
     files_free: u64,
+    /// Free to unprivileged users; on macOS, which doesn't say, the free count.
+    files_avail: u64,
 };
 
 const MacStatfs = extern struct {
@@ -601,11 +603,11 @@ pub fn fsStat(path: [*:0]const u8, out: *FsStat) E {
     if (builtin.os.tag.isDarwin()) {
         var s: MacStatfs = undefined;
         if (macFstatfs(fd, &s) != 0) return errno();
-        out.* = .{ .block_size = s.bsize, .blocks = s.blocks, .blocks_free = s.bfree, .blocks_avail = s.bavail, .files = s.files, .files_free = s.ffree };
+        out.* = .{ .block_size = s.bsize, .blocks = s.blocks, .blocks_free = s.bfree, .blocks_avail = s.bavail, .files = s.files, .files_free = s.ffree, .files_avail = s.ffree };
     } else {
         var s: LinuxStatvfs = undefined;
         if (fstatvfs(fd, &s) != 0) return errno();
-        out.* = .{ .block_size = s.frsize, .blocks = s.blocks, .blocks_free = s.bfree, .blocks_avail = s.bavail, .files = s.files, .files_free = s.ffree };
+        out.* = .{ .block_size = s.frsize, .blocks = s.blocks, .blocks_free = s.bfree, .blocks_avail = s.bavail, .files = s.files, .files_free = s.ffree, .files_avail = s.favail };
     }
     return .SUCCESS;
 }
@@ -771,6 +773,7 @@ test "safe stats and link reads refuse links before the last component" {
     try testing.expectEqual(E.SUCCESS, readLinkSafe(path, &out, &target));
     try testing.expectEqualStrings("hal", target);
     try testing.expectEqual(E.SUCCESS, fsStat(path, &s));
+    try testing.expect(s.files_avail <= s.files_free);
     path = try std.fmt.bufPrintSentinel(&buf, "{s}/real", .{root}, 0);
     try testing.expectEqual(E.SUCCESS, fsStat(path, &s));
     try testing.expectEqual(E.SUCCESS, lstatSafe("/", &attr));

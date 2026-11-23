@@ -80,7 +80,6 @@ From the code review of `ee622cc`; each leaves this list when fixed or accepted 
 
 ### Low
 
-* **FSSTAT's `afiles` is the free count, not the available count** ([nfs.zig:666](src/libnfsd/nfs.zig:666)); report `f_favail` on Linux.
 
 ## To do
 

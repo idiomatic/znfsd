@@ -749,7 +749,7 @@ const Request = struct {
         try r.e.u64_(s.blocks_avail *| s.block_size);
         try r.e.u64_(s.files);
         try r.e.u64_(s.files_free);
-        try r.e.u64_(s.files_free);
+        try r.e.u64_(s.files_avail);
         try r.e.u32_(0);
     }
 
