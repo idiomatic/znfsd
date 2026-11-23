@@ -13,6 +13,10 @@ _*.md
 ,*.md
 *.egress/
 
+# Coordination among agents (shared from the main worktree)
+.coordination/locks/
+.coordination/sessions/
+
 # Editors and OS
 *~
 .DS_Store
