@@ -16,6 +16,7 @@ All notable changes to znfsd are documented here. The format follows [Keep a Cha
 * READDIR and READDIRPLUS answer `NFS3ERR_TOOSMALL` when no entry fits `maxcount`, and send one entry even past `dircount`, so a client is never sent an empty, unfinished listing to ask for again forever
 * MNT answers ACCES for any path not inside an export admitting the caller without links, so it no longer tells which paths exist elsewhere
 * Handles' stats, link reads, and file-system queries refuse symbolic links mid-path, as opens do, so a client racing a RENAME and SYMLINK can't read metadata outside its export
+* The web monitor serves at most 64 connections at once and closes each after 10 seconds, so idle connections can't pile up when it listens beyond loopback
 * The control socket replaces only a stale socket, not whatever file is at `--socket`, and drops a peer that doesn't send its request or take its reply within 5 seconds, rather than letting it block every command
 * Repeated `--group` for one group merges its clients, as `--map` does, rather than keeping only the last
 * Rules and group members are keyed by the client's canonical form, so `10.0.0.1`, `10.0.0.1/32`, and `::ffff:10.0.0.1` are one rule; existing rows are rekeyed, the already canonical one kept where two meet

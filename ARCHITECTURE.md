@@ -91,7 +91,7 @@ All other I/O goes through `std.Io`, so libnfsd runs on whatever implementation 
 
 ## Activity monitor
 
-libnfsd's dispatcher tells an optional observer (`Config.observer`) of every answered call: client, program, procedure, outcome, result size, and time taken. znfsd's observer keeps calls by procedure and by client and a ring of the latest 200. A small HTTP/1.1 server, GET only, serves a page, its script and style, and a JSON snapshot that adds exports, mounts, and locks; the page polls it each second. Bound to loopback, it refuses requests whose `Host` isn't loopback, against DNS rebinding, and every response forbids caching and sets `Content-Security-Policy: default-src 'self'`. `znfsd activity` returns the same snapshot over the control socket. A taken web port only warns. Plans for web administration are in [DEVELOPMENT.md](DEVELOPMENT.md).
+libnfsd's dispatcher tells an optional observer (`Config.observer`) of every answered call: client, program, procedure, outcome, result size, and time taken. znfsd's observer keeps calls by procedure and by client and a ring of the latest 200. A small HTTP/1.1 server, GET only, serves a page, its script and style, and a JSON snapshot that adds exports, mounts, and locks; the page polls it each second. Bound to loopback, it refuses requests whose `Host` isn't loopback, against DNS rebinding, and every response forbids caching and sets `Content-Security-Policy: default-src 'self'`. `znfsd activity` returns the same snapshot over the control socket. It serves at most 64 connections at once, closing more at once, and shuts each down after 10 seconds. A taken web port only warns. Plans for web administration are in [DEVELOPMENT.md](DEVELOPMENT.md).
 
 ## Privileges
 

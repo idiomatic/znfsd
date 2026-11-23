@@ -16,6 +16,12 @@ const style = @embedFile("web/style.css");
 
 pub const default_port = 8049;
 
+/// Connections served at once; more are closed at once.
+const max_connections = 64;
+
+/// How long a connection may take, request and response together.
+const deadline: Io.Duration = .fromSeconds(10);
+
 /// Writes the JSON snapshot.
 pub const Provider = struct {
     ptr: *anyopaque,
@@ -45,6 +51,7 @@ pub fn serve(io: Io, gpa: std.mem.Allocator, server: *net.Server, provider: Prov
     var connections: Io.Group = .init;
     defer connections.cancel(io);
     const loopback_only = isLoopback(server.socket.address);
+    var open: std.atomic.Value(usize) = .init(0);
     while (true) {
         const stream = server.accept(io) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
@@ -53,12 +60,30 @@ pub fn serve(io: Io, gpa: std.mem.Allocator, server: *net.Server, provider: Prov
                 continue;
             },
         };
-        connections.concurrent(io, answer, .{ io, gpa, stream, provider, loopback_only }) catch stream.close(io);
+        if (open.fetchAdd(1, .monotonic) >= max_connections) {
+            _ = open.fetchSub(1, .monotonic);
+            stream.close(io);
+            continue;
+        }
+        connections.concurrent(io, answer, .{ io, gpa, stream, provider, loopback_only, &open }) catch {
+            _ = open.fetchSub(1, .monotonic);
+            stream.close(io);
+        };
     }
 }
 
-fn answer(io: Io, gpa: std.mem.Allocator, stream: net.Stream, provider: Provider, loopback_only: bool) void {
+/// Shuts `stream` down once `deadline` passes, unless canceled first,
+/// ending any read or write waiting on it.
+fn watchdog(io: Io, stream: net.Stream) Io.Cancelable!void {
+    try io.sleep(deadline, .awake);
+    stream.shutdown(io, .both) catch {};
+}
+
+fn answer(io: Io, gpa: std.mem.Allocator, stream: net.Stream, provider: Provider, loopback_only: bool, open: *std.atomic.Value(usize)) void {
+    defer _ = open.fetchSub(1, .monotonic);
     defer stream.close(io);
+    var timer = io.concurrent(watchdog, .{ io, stream }) catch return;
+    defer timer.cancel(io) catch {};
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -188,4 +213,33 @@ test "serve the page and snapshot, and refuse other hosts" {
     try testing.expectStringStartsWith(r, "HTTP/1.1 405");
     r = try Get.run(addr, "GET /etc/passwd HTTP/1.1\r\nHost: localhost\r\n\r\n", &out);
     try testing.expectStringStartsWith(r, "HTTP/1.1 404");
+}
+
+test "connections past the limit are closed" {
+    const io = testing.io;
+    var server = try net.IpAddress.listen(&.{ .ip4 = .loopback(0) }, io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const P = struct {
+        fn write(_: *anyopaque, _: std.mem.Allocator, w: *Io.Writer) anyerror!void {
+            try w.writeAll("{}");
+        }
+    };
+    var dummy: u8 = 0;
+    var group: Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, serve, .{ io, testing.allocator, &server, Provider{ .ptr = &dummy, .write = P.write } });
+
+    var idle: [max_connections]net.Stream = undefined;
+    for (&idle) |*s| s.* = try server.socket.address.connect(io, .{ .mode = .stream });
+    defer for (idle) |s| s.close(io);
+    try io.sleep(.fromMilliseconds(100), .awake);
+    const start: Io.Clock.Timestamp = .now(io, .awake);
+    const extra = try server.socket.address.connect(io, .{ .mode = .stream });
+    defer extra.close(io);
+    var rb: [64]u8 = undefined;
+    var reader = extra.reader(io, &rb);
+    var out: [64]u8 = undefined;
+    try testing.expectEqual(0, try reader.interface.readSliceShort(&out));
+    // Closed at once, not at the deadline.
+    try testing.expect(start.untilNow(io).raw.toSeconds() < 2);
 }
